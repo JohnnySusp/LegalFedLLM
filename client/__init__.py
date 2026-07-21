@@ -1,0 +1,1 @@
+"""Client service for LegalFedLLM."""
