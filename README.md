@@ -1,14 +1,16 @@
 # LegalFedLLM
 
-LegalFedLLM is a mock-first implementation of the FedMKT-centered architecture
+LegalFedLLM is a protocol-first implementation of a FedMKT-centered architecture
 for bidirectional knowledge transfer between heterogeneous language models.
-This milestone replaces the obsolete direct LoRA-delta exchange with signed
-Client and Host Knowledge Packages, a separate Federated Coordinator, bounded
-asynchronous rounds, filesystem persistence, candidate Host-adapter validation,
-and an Ollama serving boundary.
+Step 0 of the proof of concept is complete: the obsolete direct LoRA-delta
+exchange has been replaced by signed Client and Host Knowledge Packages, a
+separate Federated Coordinator, bounded asynchronous rounds, filesystem
+persistence, Host-adapter validation and rollback, hardened replay protection,
+transactional Client knowledge caching, and an Ollama serving boundary.
 
-No model download, GPU, Ollama installation, FATE-Flow deployment, or live
-public server is required to test this milestone.
+The current default path remains deterministic and mock-first. No model download,
+GPU, Ollama installation, FATE-Flow deployment, or live public server is required
+to test the control plane.
 
 ## Implemented milestone
 
@@ -83,6 +85,11 @@ protocol-first workflow can be tested before any model integration:
 - Host Knowledge Package publication;
 - Client-side package verification and mock reverse distillation;
 - persistence across Coordinator restart;
+- authenticated Client administrative endpoints;
+- immutable accepted Client package and adapter-snapshot binding;
+- replay detection for authenticated packages that were rejected later;
+- strict Host-package identity, round, dataset and adapter-version verification;
+- explicit rejection of real training/alignment backends that are not integrated yet;
 - Ollama list, inspect and generation API boundaries through mocks.
 
 Run the tests locally:
@@ -94,11 +101,19 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
+The current Step-0 suite contains 13 tests and is expected to finish with:
+
+```text
+Ran 13 tests
+
+OK
+```
+
 The test suite does not import PyTorch or Transformers.
 
 ## Run with Docker Compose or Podman Compose
 
-Create the environment file and replace the three development tokens:
+Create the environment file and replace the four development tokens:
 
 ```bash
 cp .env.example .env
@@ -198,6 +213,11 @@ The Client agent owns local state:
 | `GET` | `/v1/ollama/models` | List installed Ollama models |
 | `POST` | `/v1/ollama/inspect` | Inspect one Ollama model |
 
+The Client administrative endpoints (`/v1/register`, `/v1/local-train`,
+`/v1/participate`, `/v1/rounds/{id}/sync`, `/v1/ollama/models`, and
+`/v1/ollama/inspect`) require `X-Client-Admin-Token`. `/health` and
+`/v1/generate` remain outside that administrative gate.
+
 Raw local examples passed to `/v1/local-train` remain inside the Client service.
 Only a local content hash and example count are persisted. The Coordinator
 receives only the signed Knowledge Package.
@@ -243,11 +263,24 @@ Host data
 Client data
 ├── identity/
 ├── state.json
-└── knowledge_cache/
+├── knowledge_cache/
+│   ├── pending/
+│   ├── accepted/
+│   └── receipts/
+└── adapter_snapshots/
+    ├── pending/
+    └── accepted/
 ```
 
-Writes use temporary files followed by atomic replacement. The same design is
-portable to Windows filesystems, Linux, Docker volumes and Podman volumes.
+A Client package is first written as pending state. Only after a matching
+Coordinator receipt is returned is the exact package and its round-bound adapter
+snapshot committed as accepted state. Accepted package/snapshot pairs are treated
+as immutable for that round.
+
+Writes use temporary files followed by atomic replacement. Direct local execution
+defaults to `./data/...`; Compose overrides these paths with `/data/...` volume
+mounts. The same design is portable to Windows filesystems, Linux, Docker volumes
+and Podman volumes.
 
 ## Security included now
 
@@ -263,10 +296,15 @@ The protocol-first milestone implements:
 - round-bound manifest hashes;
 - nonces and timestamp skew checks;
 - duplicate Client submission rejection;
-- repeated package-hash rejection;
+- replay tracking for seen nonces and package hashes, including authenticated
+  packages later rejected by policy or safety checks;
 - package-size limits;
 - exact model-profile verification;
 - exact dataset, sample-order, top-k and alignment-profile verification;
+- strict Host identity, signature, manifest, dataset and accepted-adapter-version
+  verification before Client synchronization;
+- authenticated Client administrative endpoints;
+- immutable accepted Client package and adapter-snapshot binding;
 - finite-number and shape validation;
 - a minimal Knowledge Package Safety Probe;
 - append-only JSONL audit events.
@@ -364,24 +402,71 @@ basic deterministic gate, not the final Safe-FedLLM-inspired detector.
 
 ## Next implementation milestone
 
-The next stage can retain this protocol and replace only the runtime operations:
+Step 0 is complete. The next work should preserve the protocol-first control plane
+and connect the real FedMKT path in measured stages rather than replacing all mock
+operations at once.
+
+### Stage 1 — real shared reference dataset (`D^P`)
+
+Introduce a versioned reference-dataset boundary with:
+
+- an explicit sample schema and stable sample IDs;
+- deterministic ordering;
+- legal questions/inputs and gold labels;
+- deterministic prompt/label formatting;
+- dataset version and cryptographic hash;
+- reference/training and held-out validation separation where appropriate;
+- independent Host/Client verification that they loaded the same dataset.
+
+The first dataset integration should prove that the manifest's dataset ID, hash and
+sample ordering correspond to real loaded content.
+
+### Stage 2 — scalable Knowledge Package artifacts
+
+The current protocol keeps deterministic numerical arrays directly in signed JSON.
+Before real-model scale, move large tensors behind a signed metadata envelope and
+a constrained binary artifact such as `safetensors` or strictly validated NumPy
+`.npz`. Do not accept arbitrary pickle/PyTorch object deserialization from Clients.
+
+### Stage 3 — first real Client model
+
+Connect one small Client runtime using pinned Transformers/tokenizer revisions and
+PEFT LoRA. Replace mock local training and mock reference inference with:
 
 ```text
-mock Client local training
-    → Transformers/PEFT Client LoRA training
-
-mock knowledge generation
-    → FATE-derived top-k logits and CE-loss generation
-
-mock identity alignment
-    → FATE-derived DTW/MinED token and vocabulary alignment
-
-mock Host candidate
-    → FedMKTTrainer Host LoRA distillation
-
-mock Client sync
-    → FedMKTTrainer reverse Client distillation
+private Client examples
+    → PEFT LoRA training
+    → real D^P inference
+    → top-k token/logit extraction
+    → real cross-entropy losses
+    → signed Client Knowledge Package
 ```
 
-The first real-model verification should use a model pair tested by FedMKT before
-adding the Windows/Ollama model-profile family.
+### Stages 4–6 — FedMKT parity, Host distillation and reverse distillation
+
+After one Client can generate real knowledge:
+
+```text
+mock identity alignment
+    → FATE-derived Client↔Host token/vocabulary alignment
+
+protocol-level DualMinCE
+    → parity checks against the extracted FedMKT implementation
+
+mock Host candidate
+    → FedMKTTrainer Host LoRA distillation + held-out validation
+
+mock Client sync
+    → Host-to-Client alignment + selective reverse distillation
+```
+
+The first heterogeneous real-model verification should prioritize a model pair that
+can be compared with the published FedMKT implementation before moving to larger
+or production-oriented Host/Client configurations.
+
+## Current project claim
+
+The repository currently demonstrates a working protocol-first control plane for
+FedMKT-style heterogeneous knowledge transfer. It does **not** yet demonstrate a
+completed real-model FedMKT round, formal differential privacy, a complete
+Safe-FedLLM defense, or production-ready deployment.
