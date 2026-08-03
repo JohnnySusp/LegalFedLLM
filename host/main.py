@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from host.runtime import HostRuntime, create_mock_host_runtime
-from shared.adapter import AdapterCompatibilityError, AdapterSnapshot, AdapterUpdate
+from host.runtime import HostRuntime, HostRuntimeError
+from shared.protocol import (
+    DistillationJob,
+    DistillationResult,
+    KnowledgePackage,
+    RoundManifest,
+    ServiceIdentity,
+)
 
 
 class ApiModel(BaseModel):
@@ -15,7 +21,7 @@ class ApiModel(BaseModel):
 
 class GenerateRequest(ApiModel):
     prompt: str = Field(min_length=1, max_length=20_000)
-    max_new_tokens: int = Field(default=256, ge=1, le=4_096)
+    max_new_tokens: int = Field(default=256, ge=1, le=4096)
 
     @field_validator("prompt")
     @classmethod
@@ -32,59 +38,81 @@ class GenerateResponse(ApiModel):
 
 
 def runtime_from_environment() -> HostRuntime:
-    backend = os.getenv("MODEL_BACKEND", "mock").strip().lower()
-    if backend != "mock":
-        raise RuntimeError("this milestone supports MODEL_BACKEND=mock only")
-
-    target_modules = tuple(
-        item.strip()
-        for item in os.getenv("LORA_TARGET_MODULES", "q_proj,v_proj").split(",")
-        if item.strip()
-    )
-    return create_mock_host_runtime(
-        base_model=os.getenv("HOST_MODEL_ID", "legal-poc-mock"),
-        rank=int(os.getenv("LORA_RANK", "2")),
-        target_modules=target_modules,
+    return HostRuntime(
+        data_dir=os.getenv("HOST_DATA_DIR", "data/host"),
+        host_id=os.getenv("HOST_ID", "legalfedllm-host"),
+        force_validation_failure=os.getenv(
+            "MOCK_FORCE_VALIDATION_FAILURE", "false"
+        ).lower()
+        in {"1", "true", "yes"},
     )
 
 
-def create_app(runtime: HostRuntime | None = None) -> FastAPI:
+def create_app(
+    runtime: HostRuntime | None = None, internal_token_override: str | None = None
+) -> FastAPI:
     host_runtime = runtime or runtime_from_environment()
-    app = FastAPI(title="LegalFedLLM Host", version="0.1.0")
+    internal_token = internal_token_override or os.getenv(
+        "INTERNAL_API_TOKEN", "development-internal-token"
+    )
+    app = FastAPI(title="LegalFedLLM Host Runtime", version="0.2.0")
     app.state.runtime = host_runtime
+
+    def require_internal_token(
+        x_internal_token: str | None = Header(default=None),
+    ) -> None:
+        if x_internal_token != internal_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid internal API token",
+            )
 
     @app.get("/health")
     async def health() -> dict[str, str | int]:
-        adapter = host_runtime.get_global_adapter()
         return {
             "status": "ok",
-            "service": "legal-fed-llm-host",
-            "backend": host_runtime.backend_name,
-            "adapter_version": adapter.version,
+            "service": "legalfedllm-host-runtime",
+            "adapter_version": host_runtime.adapter_version,
+            "training_backend": host_runtime.model_profile.training_backend,
+            "serving_backend": host_runtime.model_profile.serving_backend,
         }
 
-    @app.get("/v1/adapters/global", response_model=AdapterSnapshot)
-    async def global_adapter() -> AdapterSnapshot:
-        return host_runtime.get_global_adapter()
+    @app.get(
+        "/internal/v1/identity",
+        response_model=ServiceIdentity,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def identity() -> ServiceIdentity:
+        return ServiceIdentity.model_validate(host_runtime.service_identity())
 
     @app.post(
-        "/v1/adapter-updates",
-        response_model=AdapterSnapshot,
-        status_code=status.HTTP_201_CREATED,
+        "/internal/v1/reference-knowledge",
+        response_model=KnowledgePackage,
+        dependencies=[Depends(require_internal_token)],
     )
-    async def submit_update(update: AdapterUpdate) -> AdapterSnapshot:
+    async def reference_knowledge(manifest: RoundManifest) -> KnowledgePackage:
         try:
-            return host_runtime.submit_update(update)
-        except AdapterCompatibilityError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            return host_runtime.generate_reference_knowledge(manifest)
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/internal/v1/distill",
+        response_model=DistillationResult,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def distill(job: DistillationJob) -> DistillationResult:
+        try:
+            return host_runtime.distill(job)
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/generate", response_model=GenerateResponse)
     async def generate(request: GenerateRequest) -> GenerateResponse:
-        adapter = host_runtime.get_global_adapter()
         return GenerateResponse(
-            text=host_runtime.generate(request.prompt, request.max_new_tokens),
-            model=adapter.spec.base_model,
-            adapter_version=adapter.version,
+            text=await host_runtime.generate(request.prompt, request.max_new_tokens),
+            model=host_runtime.model_profile.model_id,
+            adapter_version=host_runtime.adapter_version,
         )
 
     return app
