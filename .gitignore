@@ -1,8 +1,29 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Python environments and caches
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
 .coverage
 htmlcov/
+
+# Runtime/generated data
+data/
 artifacts/
+*.log
+
+# Keys / certificates
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

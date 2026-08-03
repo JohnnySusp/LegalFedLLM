@@ -1,45 +1,37 @@
 from __future__ import annotations
 
+import hmac
 import os
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from client.runtime import ClientRuntime, create_mock_client_runtime
-from shared.adapter import AdapterSnapshot, AdapterUpdate
+from client.runtime import ClientRuntime, ClientRuntimeError
+from shared.ollama import OllamaError
+from shared.protocol import (
+    ClientRegistrationRequest,
+    KnowledgePackage,
+    RegistrationRecord,
+    RoundManifest,
+    RoundState,
+    ServiceIdentity,
+    SubmissionReceipt,
+)
 
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class RoundRequest(ApiModel):
-    examples: list[str] = Field(min_length=1, max_length=1_000)
-
-    @field_validator("examples")
-    @classmethod
-    def examples_not_blank(cls, values: list[str]) -> list[str]:
-        if any(not value.strip() for value in values):
-            raise ValueError("examples must not contain blank text")
-        if any(len(value) > 100_000 for value in values):
-            raise ValueError("an example exceeds the 100000 character limit")
-        return values
-
-
-class RoundResponse(ApiModel):
-    client_id: str
-    round_id: int
-    examples_used: int
-    parent_adapter_hash: str
-    update_hash: str
-    global_adapter_hash: str
-    global_adapter_version: int
+class LocalTrainRequest(ApiModel):
+    examples: list[str] = Field(min_length=1, max_length=100_000)
 
 
 class GenerateRequest(ApiModel):
     prompt: str = Field(min_length=1, max_length=20_000)
-    max_new_tokens: int = Field(default=256, ge=1, le=4_096)
+    max_new_tokens: int = Field(default=256, ge=1, le=4096)
 
     @field_validator("prompt")
     @classmethod
@@ -49,131 +41,296 @@ class GenerateRequest(ApiModel):
         return value
 
 
-class GenerateResponse(ApiModel):
-    text: str
-    model: str
-    adapter_version: int
+class OllamaInspectRequest(ApiModel):
+    model: str = Field(min_length=1, max_length=256)
 
 
-class HostGateway:
+class CoordinatorGateway:
     def __init__(
         self,
         base_url: str,
-        timeout_seconds: float = 10.0,
+        registration_token: str,
+        *,
+        timeout_seconds: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
+    ):
         self.base_url = base_url.rstrip("/")
+        self.registration_token = registration_token
         self.timeout_seconds = timeout_seconds
         self.transport = transport
 
-    async def fetch_global_adapter(self) -> AdapterSnapshot:
-        async with self._client() as client:
-            response = await client.get("/v1/adapters/global")
-            response.raise_for_status()
-            return AdapterSnapshot.model_validate(response.json())
-
-    async def submit_update(self, update: AdapterUpdate) -> AdapterSnapshot:
-        async with self._client() as client:
-            response = await client.post(
-                "/v1/adapter-updates",
-                json=update.model_dump(mode="json"),
-            )
-            response.raise_for_status()
-            return AdapterSnapshot.model_validate(response.json())
-
-    def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout_seconds,
             transport=self.transport,
+        ) as client:
+            response = await client.request(method, path, json=json, headers=headers)
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Coordinator returned {response.status_code}: {response.text[:500]}",
+            )
+        return response.json()
+
+    async def identity(self) -> ServiceIdentity:
+        return ServiceIdentity.model_validate(await self._request("GET", "/v1/identity"))
+
+    async def register(self, request: ClientRegistrationRequest) -> RegistrationRecord:
+        payload = await self._request(
+            "POST",
+            "/v1/clients/register",
+            json=request.model_dump(mode="json"),
+            headers={"X-Registration-Token": self.registration_token},
+        )
+        return RegistrationRecord.model_validate(payload)
+
+    async def current_manifest(self) -> RoundManifest:
+        return RoundManifest.model_validate(
+            await self._request("GET", "/v1/rounds/current")
+        )
+
+    async def manifest(self, round_id: str) -> RoundManifest:
+        return RoundManifest.model_validate(
+            await self._request(
+                "GET",
+                f"/v1/rounds/{round_id}/manifest",
+            )
+        )
+
+    async def submit(self, package: KnowledgePackage) -> SubmissionReceipt:
+        payload = await self._request(
+            "POST",
+            f"/v1/rounds/{package.round_id}/knowledge",
+            json=package.model_dump(mode="json"),
+        )
+        return SubmissionReceipt.model_validate(payload)
+
+    async def status(self, round_id: str) -> RoundState:
+        return RoundState.model_validate(
+            await self._request("GET", f"/v1/rounds/{round_id}/status")
+        )
+
+    async def host_knowledge(self, round_id: str) -> KnowledgePackage:
+        return KnowledgePackage.model_validate(
+            await self._request(
+                "GET", f"/v1/rounds/{round_id}/host-knowledge"
+            )
         )
 
 
 def runtime_from_environment() -> ClientRuntime:
-    backend = os.getenv("MODEL_BACKEND", "mock").strip().lower()
-    if backend != "mock":
-        raise RuntimeError("this milestone supports MODEL_BACKEND=mock only")
-
-    target_modules = tuple(
-        item.strip()
-        for item in os.getenv("LORA_TARGET_MODULES", "q_proj,v_proj").split(",")
-        if item.strip()
-    )
-    return create_mock_client_runtime(
+    return ClientRuntime(
+        data_dir=os.getenv("CLIENT_DATA_DIR", "data/client"),
         client_id=os.getenv("CLIENT_ID", "legal-client-1"),
-        base_model=os.getenv("CLIENT_MODEL_ID", "legal-poc-mock"),
-        rank=int(os.getenv("LORA_RANK", "2")),
-        target_modules=target_modules,
-        integration_policy=os.getenv("CLIENT_ADAPTER_POLICY", "replace").strip().lower(),
+        maximum_clock_skew_seconds=int(
+            os.getenv("MAXIMUM_CLOCK_SKEW_SECONDS", "900")
+        ),
     )
 
 
-def gateway_from_environment() -> HostGateway:
-    return HostGateway(
-        base_url=os.getenv("HOST_URL", "http://host:8000"),
-        timeout_seconds=float(os.getenv("HOST_TIMEOUT_SECONDS", "10")),
+def gateway_from_environment() -> CoordinatorGateway:
+    return CoordinatorGateway(
+        os.getenv("COORDINATOR_URL", "http://coordinator:8000"),
+        os.getenv("REGISTRATION_TOKEN", "development-registration-token"),
+        timeout_seconds=float(os.getenv("COORDINATOR_TIMEOUT_SECONDS", "60")),
     )
 
 
 def create_app(
     runtime: ClientRuntime | None = None,
-    gateway: HostGateway | None = None,
+    gateway: CoordinatorGateway | None = None,
+    admin_token_override: str | None = None,
 ) -> FastAPI:
     client_runtime = runtime or runtime_from_environment()
-    host_gateway = gateway or gateway_from_environment()
-    app = FastAPI(title="LegalFedLLM Client", version="0.1.0")
+    coordinator = gateway or gateway_from_environment()
+
+    admin_token = admin_token_override or os.getenv(
+        "CLIENT_ADMIN_TOKEN",
+        "development-client-admin-token",
+    )
+
+    app = FastAPI(title="LegalFedLLM Client Agent", version="0.2.0")
     app.state.runtime = client_runtime
-    app.state.host_gateway = host_gateway
+    app.state.gateway = coordinator
+
+    def require_client_admin_token(
+        x_client_admin_token: str | None = Header(default=None),
+    ) -> None:
+        if x_client_admin_token is None or not hmac.compare_digest(
+            x_client_admin_token,
+            admin_token,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid Client admin token",
+            )
 
     @app.get("/health")
-    async def health() -> dict[str, str | int]:
-        adapter = client_runtime.get_local_adapter()
+    async def health() -> dict[str, Any]:
+        state = client_runtime.state()
         return {
             "status": "ok",
-            "service": "legal-fed-llm-client",
-            "backend": client_runtime.backend_name,
+            "service": "legalfedllm-client-agent",
             "client_id": client_runtime.client_id,
-            "adapter_version": adapter.version,
+            "training_backend": client_runtime.model_profile.training_backend,
+            "serving_backend": client_runtime.model_profile.serving_backend,
+            **state,
         }
 
-    @app.post("/v1/rounds", response_model=RoundResponse)
-    async def run_round(request: RoundRequest) -> RoundResponse:
+    @app.post(
+        "/v1/register",
+        response_model=RegistrationRecord,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def register() -> RegistrationRecord:
+        return await coordinator.register(
+            ClientRegistrationRequest(
+                client_id=client_runtime.client_id,
+                public_key=client_runtime.identity.public_key_b64,
+                model_profile=client_runtime.model_profile,
+            )
+        )
+
+    @app.post(
+        "/v1/local-train",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def local_train(request: LocalTrainRequest) -> dict[str, Any]:
         try:
-            global_adapter = await host_gateway.fetch_global_adapter()
-            update = client_runtime.prepare_update(global_adapter, request.examples)
-            updated_global = await host_gateway.submit_update(update)
-            client_runtime.install_global_adapter(updated_global)
-        except httpx.HTTPStatusError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Host rejected the round with HTTP {exc.response.status_code}",
-            ) from exc
-        except (httpx.RequestError, ValidationError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Host is unavailable or returned an invalid adapter",
-            ) from exc
+            return client_runtime.local_train(request.examples)
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        return RoundResponse(
-            client_id=client_runtime.client_id,
-            round_id=update.round_id,
-            examples_used=update.num_examples,
-            parent_adapter_hash=update.parent_adapter_hash,
-            update_hash=update.update_hash,
-            global_adapter_hash=updated_global.adapter_hash,
-            global_adapter_version=updated_global.version,
-        )
+    @app.post(
+        "/v1/participate",
+        response_model=SubmissionReceipt,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def participate() -> SubmissionReceipt:
+        identity = await coordinator.identity()
+        manifest = await coordinator.current_manifest()
 
-    @app.post("/v1/generate", response_model=GenerateResponse)
-    async def generate(request: GenerateRequest) -> GenerateResponse:
-        adapter = client_runtime.get_local_adapter()
-        return GenerateResponse(
-            text=client_runtime.generate(request.prompt, request.max_new_tokens),
-            model=adapter.spec.base_model,
-            adapter_version=adapter.version,
-        )
+        if not manifest.verify_signature(identity.public_key):
+            raise HTTPException(
+                status_code=401,
+                detail="round manifest signature is invalid",
+            )
+
+        try:
+            package = client_runtime.create_knowledge_package(manifest)
+
+            receipt = await coordinator.submit(package)
+
+            client_runtime.commit_knowledge_submission(
+                manifest=manifest,
+                package=package,
+                receipt=receipt,
+            )
+
+            return receipt
+
+        except ClientRuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+            ) from exc
+
+    @app.post(
+        "/v1/rounds/{round_id}/sync",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def sync(round_id: str) -> dict[str, Any]:
+        identity = await coordinator.identity()
+
+        manifest = await coordinator.manifest(round_id)
+
+        if not manifest.verify_signature(identity.public_key):
+            raise HTTPException(
+                status_code=401,
+                detail="round manifest signature is invalid",
+            )
+
+        status_record = await coordinator.status(round_id)
+
+        if status_record.state != "COMPLETED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"round is not completed: {status_record.state}",
+            )
+
+        if (
+            identity.host_public_key is None
+            or identity.host_service_id is None
+            or status_record.host_adapter_after is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Host identity or accepted adapter version is missing",
+            )
+
+        package = await coordinator.host_knowledge(round_id)
+
+        try:
+            return client_runtime.apply_host_knowledge(
+                manifest=manifest,
+                host_package=package,
+                host_public_key=identity.host_public_key,
+                expected_host_id=identity.host_service_id,
+                accepted_host_adapter_version=(
+                    status_record.host_adapter_after
+                ),
+                adapter_promoted=bool(status_record.adapter_promoted),
+            )
+
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+            ) from exc
+
+    @app.post("/v1/generate")
+    async def generate(request: GenerateRequest) -> dict[str, Any]:
+        return {
+            "text": await client_runtime.generate(
+                request.prompt, request.max_new_tokens
+            ),
+            "model": client_runtime.model_profile.model_id,
+            "adapter_version": client_runtime.state()["serving_adapter_version"],
+        }
+
+    @app.get(
+        "/v1/ollama/models",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def ollama_models() -> list[dict[str, Any]]:
+        if client_runtime.ollama is None:
+            raise HTTPException(status_code=409, detail="Ollama serving is not enabled")
+        try:
+            return await client_runtime.ollama.list_models()
+        except OllamaError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/ollama/inspect",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def ollama_inspect(request: OllamaInspectRequest) -> dict[str, Any]:
+        if client_runtime.ollama is None:
+            raise HTTPException(status_code=409, detail="Ollama serving is not enabled")
+        try:
+            return await client_runtime.ollama.show_model(request.model)
+        except OllamaError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 

@@ -4,37 +4,81 @@ services:
       context: .
       dockerfile: host/Dockerfile
     environment:
-      MODEL_BACKEND: ${MODEL_BACKEND:-mock}
-      HOST_MODEL_ID: ${HOST_MODEL_ID:-legal-poc-mock}
-      LORA_RANK: ${LORA_RANK:-2}
-      LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-q_proj,v_proj}
+      HOST_DATA_DIR: /data/host
+      HOST_ID: ${HOST_ID:-legalfedllm-host}
+      HOST_TRAINING_BACKEND: ${HOST_TRAINING_BACKEND:-mock}
+      HOST_SERVING_BACKEND: ${HOST_SERVING_BACKEND:-mock}
+      HOST_MODEL_ID: ${HOST_MODEL_ID:-legalfedllm/mock-host}
+      HOST_OLLAMA_MODEL: ${HOST_OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-development-internal-token}
+    expose:
+      - "8002"
+    volumes:
+      - host_data:/data/host
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    environment:
+      COORDINATOR_DATA_DIR: /data/coordinator
+      COORDINATOR_ID: ${COORDINATOR_ID:-legalfedllm-coordinator}
+      HOST_RUNTIME_URL: http://host:8002
+      HOST_TIMEOUT_SECONDS: ${HOST_TIMEOUT_SECONDS:-60}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-development-internal-token}
+      REGISTRATION_TOKEN: ${REGISTRATION_TOKEN:-development-registration-token}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-development-admin-token}
+      MAXIMUM_CLOCK_SKEW_SECONDS: ${MAXIMUM_CLOCK_SKEW_SECONDS:-900}
+      ROUND_MONITOR_INTERVAL_SECONDS: ${ROUND_MONITOR_INTERVAL_SECONDS:-2}
     ports:
-      - "${HOST_PORT:-8000}:8000"
+      - "${COORDINATOR_PORT:-8000}:8000"
+    volumes:
+      - coordinator_data:/data/coordinator
+    depends_on:
+      host:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
 
   client:
     build:
       context: .
       dockerfile: client/Dockerfile
     environment:
-      MODEL_BACKEND: ${MODEL_BACKEND:-mock}
+      CLIENT_DATA_DIR: /data/client
       CLIENT_ID: ${CLIENT_ID:-legal-client-1}
-      CLIENT_MODEL_ID: ${CLIENT_MODEL_ID:-legal-poc-mock}
-      CLIENT_ADAPTER_POLICY: ${CLIENT_ADAPTER_POLICY:-replace}
-      HOST_URL: http://host:8000
-      HOST_TIMEOUT_SECONDS: ${HOST_TIMEOUT_SECONDS:-10}
-      LORA_RANK: ${LORA_RANK:-2}
-      LORA_TARGET_MODULES: ${LORA_TARGET_MODULES:-q_proj,v_proj}
+      CLIENT_TRAINING_BACKEND: ${CLIENT_TRAINING_BACKEND:-mock}
+      CLIENT_SERVING_BACKEND: ${CLIENT_SERVING_BACKEND:-mock}
+      CLIENT_MODEL_ID: ${CLIENT_MODEL_ID:-legalfedllm/mock-client}
+      CLIENT_OLLAMA_MODEL: ${CLIENT_OLLAMA_MODEL:-llama3.2:1b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      COORDINATOR_URL: http://coordinator:8000
+      COORDINATOR_TIMEOUT_SECONDS: ${COORDINATOR_TIMEOUT_SECONDS:-60}
+      REGISTRATION_TOKEN: ${REGISTRATION_TOKEN:-development-registration-token}
+      CLIENT_ADMIN_TOKEN: ${CLIENT_ADMIN_TOKEN:-development-client-admin-token}
+      MAXIMUM_CLOCK_SKEW_SECONDS: ${MAXIMUM_CLOCK_SKEW_SECONDS:-900}
     ports:
-      - "${CLIENT_PORT:-8001}:8001"
+      - "127.0.0.1:${CLIENT_PORT:-8001}:8001"
+    volumes:
+      - client_data:/data/client
     depends_on:
-      host:
+      coordinator:
         condition: service_healthy
 
 networks:
   default:
     name: legalfedllm_net
+
+volumes:
+  coordinator_data:
+  host_data:
+  client_data:
