@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from math import floor
 from pathlib import Path
 from typing import Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from shared.crypto import sha256_hex
 
 
 REFERENCE_DATASET_SCHEMA_VERSION = 1
@@ -61,6 +64,14 @@ class ReferenceSample(ReferenceModel):
         return value
 
 
+class ReferenceDatasetIdentity(ReferenceModel):
+    schema_version: Literal[1] = REFERENCE_DATASET_SCHEMA_VERSION
+    dataset_id: str = Field(min_length=1, max_length=256)
+    dataset_version: str = Field(min_length=1, max_length=256)
+    sample_count: int = Field(ge=1)
+    dataset_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def validate_reference_samples(
     samples: Iterable[ReferenceSample],
 ) -> list[ReferenceSample]:
@@ -86,6 +97,81 @@ def validate_reference_samples(
         sample_ids.add(sample.sample_id)
 
     return values
+
+
+def reference_dataset_hash_payload(
+    samples: Iterable[ReferenceSample],
+) -> dict:
+    values = validate_reference_samples(samples)
+    first = values[0]
+
+    return {
+        "schema_version": first.schema_version,
+        "dataset_id": first.dataset_id,
+        "dataset_version": first.dataset_version,
+        "samples": [
+            {
+                "sample_id": sample.sample_id,
+                "chapter": sample.chapter,
+                "section": sample.section,
+                "question": sample.question,
+                "gold_answer": sample.gold_answer,
+            }
+            for sample in values
+        ],
+    }
+
+
+def reference_dataset_hash(
+    samples: Iterable[ReferenceSample],
+) -> str:
+    return sha256_hex(reference_dataset_hash_payload(samples))
+
+
+def reference_dataset_identity(
+    samples: Iterable[ReferenceSample],
+) -> ReferenceDatasetIdentity:
+    values = validate_reference_samples(samples)
+
+    return ReferenceDatasetIdentity(
+        schema_version=values[0].schema_version,
+        dataset_id=values[0].dataset_id,
+        dataset_version=values[0].dataset_version,
+        sample_count=len(values),
+        dataset_hash=reference_dataset_hash(values),
+    )
+
+
+def split_reference_samples(
+    samples: Iterable[ReferenceSample],
+) -> tuple[list[ReferenceSample], list[ReferenceSample]]:
+    values = validate_reference_samples(samples)
+    section_indices: dict[tuple[str, str], list[int]] = {}
+
+    for index, sample in enumerate(values):
+        section_key = (sample.chapter, sample.section)
+        section_indices.setdefault(section_key, []).append(index)
+
+    reference_indices: set[int] = set()
+
+    for indices in section_indices.values():
+        if len(indices) == 1:
+            reference_indices.add(indices[0])
+            continue
+
+        cut = floor(0.8 * len(indices))
+        reference_indices.update(indices[:cut])
+
+    reference: list[ReferenceSample] = []
+    validation: list[ReferenceSample] = []
+
+    for index, sample in enumerate(values):
+        if index in reference_indices:
+            reference.append(sample)
+        else:
+            validation.append(sample)
+
+    return reference, validation
 
 
 def write_reference_jsonl(
