@@ -147,9 +147,20 @@ class AlignmentConfig(ContractModel):
 class RoundCreateRequest(ContractModel):
     selected_client_ids: list[str] = Field(min_length=1, max_length=256)
     trusted_client_quorum: int = Field(ge=1)
-    reference_dataset_id: str = Field(min_length=1, max_length=256)
-    reference_dataset_hash: str = Field(pattern=HASH_PATTERN)
-    sample_ids: list[str] = Field(min_length=1, max_length=100_000)
+    reference_dataset_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+    )
+    reference_dataset_hash: str | None = Field(
+        default=None,
+        pattern=HASH_PATTERN,
+    )
+    sample_ids: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100_000,
+    )
     prompt_template: str = Field(min_length=1, max_length=20_000)
     label_format: str = Field(default="causal_lm", min_length=1, max_length=128)
     maximum_sequence_length: int = Field(default=512, ge=2, le=131_072)
@@ -168,8 +179,23 @@ class RoundCreateRequest(ContractModel):
     def validate_round_request(self) -> "RoundCreateRequest":
         if len(self.selected_client_ids) != len(set(self.selected_client_ids)):
             raise ValueError("selected_client_ids must be unique")
-        if len(self.sample_ids) != len(set(self.sample_ids)):
+        if (
+            self.sample_ids is not None
+            and len(self.sample_ids) != len(set(self.sample_ids))
+        ):
             raise ValueError("sample_ids must be unique")
+
+        metadata_fields = (
+            self.reference_dataset_id is not None,
+            self.reference_dataset_hash is not None,
+            self.sample_ids is not None,
+        )
+
+        if any(metadata_fields) and not all(metadata_fields):
+            raise ValueError(
+                "reference dataset ID, hash and sample IDs "
+                "must be provided together"
+            )
         if self.trusted_client_quorum > len(self.selected_client_ids):
             raise ValueError("quorum cannot exceed selected Client count")
         return self
@@ -211,8 +237,23 @@ class RoundManifest(ContractModel):
             raise ValueError("quorum cannot exceed selected Client count")
         if len(self.selected_client_ids) != len(set(self.selected_client_ids)):
             raise ValueError("selected_client_ids must be unique")
-        if len(self.sample_ids) != len(set(self.sample_ids)):
+        if (
+            self.sample_ids is not None
+            and len(self.sample_ids) != len(set(self.sample_ids))
+        ):
             raise ValueError("sample_ids must be unique")
+
+        metadata_fields = (
+            self.reference_dataset_id is not None,
+            self.reference_dataset_hash is not None,
+            self.sample_ids is not None,
+        )
+
+        if any(metadata_fields) and not all(metadata_fields):
+            raise ValueError(
+                "reference dataset ID, hash and sample IDs "
+                "must be provided together"
+            )
         expected = sha256_hex(self.hash_payload())
         if self.manifest_hash != expected:
             raise ValueError("manifest_hash does not match the manifest payload")
@@ -243,6 +284,15 @@ class RoundManifest(ContractModel):
         request: RoundCreateRequest,
         submission_deadline: str,
     ) -> "RoundManifest":
+        if (
+            request.reference_dataset_id is None
+            or request.reference_dataset_hash is None
+            or request.sample_ids is None
+        ):
+            raise ValueError(
+                "resolved reference dataset metadata is required"
+            )
+
         payload = {
             "protocol_version": PROTOCOL_VERSION,
             "round_id": round_id,
@@ -339,8 +389,23 @@ class KnowledgePackage(ContractModel):
             raise ValueError("model profile role does not match sender_role")
         if self.sample_ids != [sample.sample_id for sample in self.samples]:
             raise ValueError("sample_ids must match package sample order")
-        if len(self.sample_ids) != len(set(self.sample_ids)):
+        if (
+            self.sample_ids is not None
+            and len(self.sample_ids) != len(set(self.sample_ids))
+        ):
             raise ValueError("sample_ids must be unique")
+
+        metadata_fields = (
+            self.reference_dataset_id is not None,
+            self.reference_dataset_hash is not None,
+            self.sample_ids is not None,
+        )
+
+        if any(metadata_fields) and not all(metadata_fields):
+            raise ValueError(
+                "reference dataset ID, hash and sample IDs "
+                "must be provided together"
+            )
         if any(sample.top_k != self.top_k for sample in self.samples):
             raise ValueError("sample top-k width does not match package top_k")
         expected = sha256_hex(self.hash_payload())

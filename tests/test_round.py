@@ -23,6 +23,8 @@ class Stack:
         root: str,
         *,
         force_validation_failure: bool = False,
+        reference_dataset_path: str | Path | None = None,
+        validation_dataset_path: str | Path | None = None,
         now_fn=None,
     ):
         self.root = Path(root)
@@ -54,6 +56,8 @@ class Stack:
             host_gateway=self.host_gateway,
             registration_token=self.registration_token,
             admin_token=self.admin_token,
+            reference_dataset_path=reference_dataset_path,
+            validation_dataset_path=validation_dataset_path,
             **kwargs,
         )
         self.coordinator_app = create_coordinator_app(self.coordinator_service)

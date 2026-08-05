@@ -6,6 +6,7 @@ import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from coordinator.service import CoordinatorError, CoordinatorService, HostGateway
@@ -46,17 +47,37 @@ def service_from_environment() -> CoordinatorService:
         internal_token,
         timeout_seconds=float(os.getenv("HOST_TIMEOUT_SECONDS", "60")),
     )
+
+    reference_dataset_path = (
+        os.getenv("COORDINATOR_REFERENCE_DATASET_PATH") or None
+    )
+    validation_dataset_path = (
+        os.getenv("COORDINATOR_VALIDATION_DATASET_PATH") or None
+    )
+
     return CoordinatorService(
-        data_dir=os.getenv("COORDINATOR_DATA_DIR", "data/coordinator"),
-        host_gateway=gateway,
-        coordinator_id=os.getenv("COORDINATOR_ID", "legalfedllm-coordinator"),
-        registration_token=os.getenv(
-            "REGISTRATION_TOKEN", "development-registration-token"
+        data_dir=os.getenv(
+            "COORDINATOR_DATA_DIR",
+            "data/coordinator",
         ),
-        admin_token=os.getenv("ADMIN_TOKEN", "development-admin-token"),
+        host_gateway=gateway,
+        coordinator_id=os.getenv(
+            "COORDINATOR_ID",
+            "legalfedllm-coordinator",
+        ),
+        registration_token=os.getenv(
+            "REGISTRATION_TOKEN",
+            "development-registration-token",
+        ),
+        admin_token=os.getenv(
+            "ADMIN_TOKEN",
+            "development-admin-token",
+        ),
         maximum_clock_skew_seconds=int(
             os.getenv("MAXIMUM_CLOCK_SKEW_SECONDS", "900")
         ),
+        reference_dataset_path=reference_dataset_path,
+        validation_dataset_path=validation_dataset_path,
     )
 
 
@@ -169,6 +190,29 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
     @app.post("/v1/generate")
     async def generate(request: GenerateRequest) -> dict:
         return await coordinator.host.generate(request.prompt, request.max_new_tokens)
+
+    @app.get(
+        "/v1/rounds/{round_id}/reference-dataset"
+    )
+    async def reference_dataset(
+        round_id: str,
+        x_client_id: str | None = Header(default=None),
+        x_registration_token: str | None = Header(default=None),
+    ) -> FileResponse:
+        coordinator.require_registration_token(
+            x_registration_token
+        )
+
+        path = coordinator.get_reference_dataset_path(
+            round_id,
+            x_client_id,
+        )
+
+        return FileResponse(
+            path,
+            media_type="application/x-ndjson",
+            filename=f"{round_id}-reference.jsonl",
+        )
 
     return app
 
