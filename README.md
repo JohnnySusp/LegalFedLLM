@@ -2,30 +2,47 @@
 
 LegalFedLLM is a protocol-first implementation of a FedMKT-centered architecture
 for bidirectional knowledge transfer between heterogeneous language models.
-Step 0 of the proof of concept is complete: the obsolete direct LoRA-delta
-exchange has been replaced by signed Client and Host Knowledge Packages, a
-separate Federated Coordinator, bounded asynchronous rounds, filesystem
-persistence, Host-adapter validation and rollback, hardened replay protection,
-transactional Client knowledge caching, and an Ollama serving boundary.
 
-The current default path remains deterministic and mock-first. No model download,
-GPU, Ollama installation, FATE-Flow deployment, or live public server is required
-to test the control plane.
+The repository now contains two connected layers:
 
-## Implemented milestone
+1. a complete deterministic Step-0 control plane using mock FedMKT knowledge; and
+2. a real shared-reference-dataset boundary with canonical JSONL data, signed
+   dataset identity, Coordinator-owned round snapshots, selected-Client download,
+   Client verification and caching, and Host verification of both reference and
+   validation data.
+
+The default execution path remains mock-first. No model download, GPU, Ollama
+installation, FATE-Flow deployment, or live public server is required to test the
+current implementation.
+
+## Current development snapshot
+
+The current round flow is:
 
 ```text
-Client local work can happen independently
+Optional canonical D^P and D^V JSONL files
+        ↓
+Coordinator loads and validates both datasets
+        ↓
+Coordinator derives the real D^P ID, hash and ordered sample IDs
         ↓
 Coordinator publishes a signed round manifest
         ↓
-Clients create signed mock FedMKT Knowledge Packages independently
+Coordinator stores immutable round-specific D^P and D^V snapshots
+        ↓
+Selected Clients download D^P
+        ↓
+Each Client verifies the dataset ID, semantic hash and sample order
+        ↓
+Each Client caches the verified D^P and creates a signed mock Knowledge Package
         ↓
 Coordinator verifies, stores and safety-checks each package
         ↓
 Coordinator waits for quorum or deadline
         ↓
 Accepted Client set is sealed
+        ↓
+Host receives and independently verifies D^P and D^V
         ↓
 DualMinCE selects the best Client teacher per reference sample
         ↓
@@ -35,42 +52,171 @@ Candidate is promoted or ω(t) is retained
         ↓
 Host publishes a signed Host Knowledge Package
         ↓
-Clients selectively apply the Host package through a mock reverse-distillation step
+Clients selectively apply the Host package through mock reverse distillation
 ```
 
-The mock tensors, logits and losses are deterministic protocol fixtures. They
-prove the service, security, persistence, selection, rollback and bidirectional
-message flow; they do not represent useful model training.
+The dataset boundary is real: JSONL records, identities, hashes, snapshots,
+download and cache verification operate on actual files.
+
+The model-learning path is still mocked. The tensors, logits and losses used by
+the current Knowledge Packages are deterministic protocol fixtures. They prove
+the service, security, persistence, selection, rollback and bidirectional message
+flow; they do not yet represent useful model training.
+
+## Past versions
+
+- **Early prototype:** direct LoRA-delta exchange between participants. This
+  approach was removed because heterogeneous model architectures cannot safely
+  aggregate arbitrary adapter parameters.
+- **Step 0 protocol-first baseline:** signed manifests and Knowledge Packages,
+  bounded asynchronous rounds, filesystem persistence, replay protection,
+  DualMinCE selection, Host validation and rollback, Client synchronization and
+  an Ollama serving boundary.
+
+This section will be extended as additional implementation milestones are frozen.
 
 ## Repository layout
 
 ```text
 LegalFedLLM/
-├── coordinator/              Public round and package-management service
-├── host/                     Private Host model/distillation service
-├── client/                   Local Client agent and Ollama boundary
+├── coordinator/
+│   ├── main.py                 Public federation API
+│   ├── service.py              Round orchestration and Host gateway
+│   └── reference_data.py       Coordinator-owned D^P/D^V boundary
+├── host/
+│   ├── main.py                 Private internal Host API
+│   └── runtime.py              Host state, dataset cache and mock distillation
+├── client/
+│   ├── main.py                 Local Client API and Coordinator gateway
+│   └── runtime.py              Client state, D^P cache and mock knowledge flow
 ├── shared/
-│   ├── protocol.py           Manifests, profiles and Knowledge Package schemas
-│   ├── crypto.py             Ed25519 signatures and canonical SHA-256 hashing
-│   ├── storage.py            Atomic cross-platform filesystem persistence
-│   ├── ollama.py             Ollama HTTP connector
-│   ├── fedmkt_runtime.py     Mock/real FedMKT runtime boundary
+│   ├── protocol.py             Manifests, profiles and package schemas
+│   ├── reference_dataset.py    Canonical schema, JSONL I/O, hashing and splitting
+│   ├── prompt.py               Shared reference-prompt renderer
+│   ├── crypto.py               Ed25519 signatures and canonical SHA-256 hashing
+│   ├── storage.py              Atomic cross-platform filesystem persistence
+│   ├── ollama.py               Ollama HTTP connector
+│   ├── fedmkt_runtime.py       Mock/real FedMKT runtime boundary
 │   └── fedmkt_core/
-│       ├── selection.py      Dependency-free DualMinCE selection
-│       ├── safety.py         Protocol-first package safety checks
-│       └── ml/               Extracted optional FATE-LLM FedMKT core
-├── tests/                    Protocol, round, rollback, persistence and Ollama tests
-├── scripts/demo_round.py     One complete containerized mock round
+│       ├── selection.py        Dependency-free DualMinCE selection
+│       ├── safety.py           Protocol-first package safety checks
+│       └── ml/                 Extracted optional FATE-LLM FedMKT core
+├── tools/
+│   └── datasets/
+│       └── inspect_gld_layout.py
+│                                Offline PDF layout-inspection utility
+├── tests/                      Protocol, dataset, round, rollback and Ollama tests
+├── scripts/demo_round.py       One complete containerized mock round
 ├── compose.yaml
 ├── requirements.txt
-└── requirements-ml.txt
+├── requirements-tools.txt      Optional offline dataset tooling
+└── requirements-ml.txt         Optional real-model dependencies
 ```
 
-## What can be tested before real models
+## Reference dataset boundary
 
-Yes. On Bazzite, Linux, Windows, or another system with Python, the complete
-protocol-first workflow can be tested before any model integration:
+A canonical reference sample contains:
 
+```json
+{
+  "schema_version": 1,
+  "dataset_id": "example-reference",
+  "dataset_version": "v1",
+  "sample_id": "example-ch001-s001-q001",
+  "chapter": "Example Chapter",
+  "section": "Example Section",
+  "question": "What is the question?",
+  "gold_answer": "The original gold answer.",
+  "source": {
+    "document_id": "example-document",
+    "page_start": 10,
+    "page_end": 11
+  }
+}
+```
+
+The authoritative runtime format is UTF-8 JSONL with one sample per line.
+A separate pretty JSON copy may be generated for human inspection, but JSONL
+remains authoritative.
+
+The shared prompt renderer produces:
+
+```text
+Chapter: {chapter}
+
+Section: {section}
+
+Question: {question}
+
+Answer:
+```
+
+The `gold_answer` remains a separate target and is never inserted into the input
+prompt.
+
+### Canonical dataset identity
+
+The semantic dataset hash covers:
+
+```text
+schema_version
+dataset_id
+dataset_version
+ordered samples:
+    sample_id
+    chapter
+    section
+    question
+    gold_answer
+```
+
+It does not include PDF page numbers or other source-provenance fields. Therefore,
+changing the semantic sample content or sample order changes the hash, while
+correcting only source-page metadata does not.
+
+### Deterministic D^P/D^V split
+
+Samples are grouped by `(chapter, section)` and retain their source order.
+
+For a section containing `n` samples:
+
+```python
+if n == 1:
+    D_P = all samples
+    D_V = []
+else:
+    cut = floor(0.8 * n)
+    D_P = samples[:cut]
+    D_V = samples[cut:]
+```
+
+Sample IDs are not renumbered after splitting.
+
+### Real-data and mock-data modes
+
+When the Coordinator is configured with real dataset paths, it:
+
+- loads and validates both D^P and D^V;
+- requires matching dataset IDs and versions;
+- rejects overlap between D^P and D^V;
+- derives the manifest dataset metadata from the real D^P;
+- ignores fabricated dataset metadata supplied by a round-creation request;
+- snapshots both files for the specific round.
+
+When no real dataset is configured, the existing Step-0 fixture path remains
+available. In that mode, the round request supplies mock dataset metadata and the
+reference-dataset download endpoint returns `204 No Content`.
+
+## What can be tested now
+
+The current implementation can test:
+
+- canonical reference-sample validation;
+- JSONL loading, writing and pretty-JSON generation;
+- Unicode and paragraph preservation;
+- duplicate and mixed-version rejection;
+- canonical dataset hashing;
+- deterministic per-section D^P/D^V splitting;
 - signed manifest creation and verification;
 - Ed25519 Client and Host Knowledge Package signatures;
 - SHA-256 payload integrity;
@@ -79,6 +225,14 @@ protocol-first workflow can be tested before any model integration:
 - independent Client submissions;
 - quorum-triggered sealing;
 - deadline-based round skipping;
+- Coordinator-owned real dataset metadata;
+- immutable per-round D^P and D^V snapshots;
+- selected-Client D^P download authorization;
+- Client D^P hash, ID and order verification;
+- rejection of tampered Client dataset downloads;
+- Client round-bound dataset caching;
+- Host D^P and D^V verification and caching;
+- D^P/D^V dataset-version and overlap checks;
 - deterministic DualMinCE selection;
 - Host candidate promotion;
 - Host rollback when validation fails;
@@ -87,12 +241,12 @@ protocol-first workflow can be tested before any model integration:
 - persistence across Coordinator restart;
 - authenticated Client administrative endpoints;
 - immutable accepted Client package and adapter-snapshot binding;
-- replay detection for authenticated packages that were rejected later;
-- strict Host-package identity, round, dataset and adapter-version verification;
-- explicit rejection of real training/alignment backends that are not integrated yet;
-- Ollama list, inspect and generation API boundaries through mocks.
+- replay detection for authenticated packages rejected later;
+- strict Host identity, round, dataset and adapter-version verification;
+- explicit rejection of unintegrated real training and alignment backends;
+- Ollama list, inspect and generation boundaries through mocks.
 
-Run the tests locally:
+Run the test suite locally:
 
 ```bash
 python3 -m venv .venv
@@ -101,19 +255,58 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-The current Step-0 suite contains 13 tests and is expected to finish with:
+At this development snapshot, the suite contains 45 tests. A successful run ends
+with:
 
 ```text
-Ran 13 tests
+Ran 45 tests
 
 OK
 ```
 
-The test suite does not import PyTorch or Transformers.
+The default test suite does not import PyTorch, Transformers or PyMuPDF.
+
+## Offline PDF inspection tooling
+
+The optional layout-inspection utility is separate from the LegalFedLLM runtime.
+
+Install it with:
+
+```bash
+python -m pip install -r requirements-tools.txt
+```
+
+Run:
+
+```bash
+python tools/datasets/inspect_gld_layout.py
+```
+
+By default, it expects a local source PDF at:
+
+```text
+data/private/greek_law_digest.pdf
+```
+
+and creates a local inspection report under:
+
+```text
+data/derived/
+```
+
+The `data/` directory is ignored by Git. Copyrighted source material and generated
+derivatives must not be committed without the required permission.
+
+The utility records page text, positions, fonts, sizes, anchor matches, the exact
+source-file SHA-256 and the PyMuPDF version. It is an inspection tool, not yet the
+final GLD-to-canonical-JSONL importer.
+
+PyMuPDF is an optional offline dependency and is dual-licensed under the GNU
+AGPL-3.0 or an Artifex commercial licence. See `THIRD_PARTY_NOTICES.md`.
 
 ## Run with Docker Compose or Podman Compose
 
-Create the environment file and replace the four development tokens:
+Create the environment file and replace the development tokens:
 
 ```bash
 cp .env.example .env
@@ -160,6 +353,29 @@ podman compose down -v
 Only the Coordinator and Client agent publish host ports. The Host runtime is
 reachable only through the private Compose network.
 
+## Configure real reference and validation JSONL files
+
+Set both paths for the Coordinator:
+
+```env
+COORDINATOR_REFERENCE_DATASET_PATH=data/derived/reference.jsonl
+COORDINATOR_VALIDATION_DATASET_PATH=data/derived/validation.jsonl
+```
+
+Both variables must be configured together. Startup fails if only one is set or
+if the files are malformed, inconsistent or overlapping.
+
+The signed manifest binds the round to D^P through:
+
+```text
+reference_dataset_id
+reference_dataset_hash
+ordered sample_ids
+```
+
+D^V is retained by the Coordinator and Host and is not exposed through the
+public Client download endpoint.
+
 ## Service boundaries
 
 ### Federated Coordinator — port 8000
@@ -174,20 +390,28 @@ The Coordinator owns the public federation protocol:
 | `POST` | `/v1/rounds` | Create and sign a round manifest |
 | `GET` | `/v1/rounds/current` | Retrieve the active manifest |
 | `GET` | `/v1/rounds/{id}/manifest` | Retrieve one manifest |
+| `GET` | `/v1/rounds/{id}/reference-dataset` | Download the round D^P as JSONL |
 | `POST` | `/v1/rounds/{id}/knowledge` | Submit a signed Client Knowledge Package |
 | `GET` | `/v1/rounds/{id}/status` | Poll round state |
 | `GET` | `/v1/rounds/{id}/host-knowledge` | Download the signed Host Knowledge Package |
 | `POST` | `/v1/generate` | Proxy a direct Host consultation request |
 
+The D^P endpoint requires a valid registration token and a registered Client ID.
+The Client must also be selected in the signed round manifest. D^V has no public
+download endpoint.
+
 Registration requires `X-Registration-Token`. Round creation requires
-`X-Admin-Token`. Public internet deployment must place HTTPS and proper
-identity bootstrap in front of these APIs.
+`X-Admin-Token`. Public internet deployment must place HTTPS and stronger identity
+bootstrap in front of these APIs.
 
 ### Host runtime — private port 8002
 
-The Host runtime owns model-specific work and adapter state:
+The Host runtime owns:
 
 - current Host adapter metadata;
+- private D^P and D^V loading;
+- independent dataset verification;
+- per-round dataset caching;
 - reference-dataset Host knowledge generation;
 - candidate Host adapter creation;
 - validation and rollback;
@@ -195,7 +419,16 @@ The Host runtime owns model-specific work and adapter state:
 - signed Host Knowledge Package generation;
 - optional Ollama-backed inference.
 
-Its internal API is protected by `X-Internal-Token` and is not published by
+Its private API includes:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/internal/v1/identity` | Host identity and model profile |
+| `POST` | `/internal/v1/reference-data` | Load and verify round D^P and D^V |
+| `POST` | `/internal/v1/reference-knowledge` | Create Host reference knowledge |
+| `POST` | `/internal/v1/distill` | Run the current mock distillation boundary |
+
+These endpoints are protected by `X-Internal-Token` and are not published by
 `compose.yaml`.
 
 ### Client agent — port 8001
@@ -206,21 +439,19 @@ The Client agent owns local state:
 | --- | --- | --- |
 | `GET` | `/health` | Client state and backend status |
 | `POST` | `/v1/register` | Register with the Coordinator |
-| `POST` | `/v1/local-train` | Mock local training independent of a round manifest |
-| `POST` | `/v1/participate` | Verify the manifest, snapshot local state and submit knowledge |
+| `POST` | `/v1/local-train` | Mock local training independent of a round |
+| `POST` | `/v1/participate` | Verify manifest, download/cache D^P and submit knowledge |
 | `POST` | `/v1/rounds/{id}/sync` | Verify and selectively consume Host knowledge |
 | `POST` | `/v1/generate` | Local mock or Ollama inference |
 | `GET` | `/v1/ollama/models` | List installed Ollama models |
 | `POST` | `/v1/ollama/inspect` | Inspect one Ollama model |
 
-The Client administrative endpoints (`/v1/register`, `/v1/local-train`,
-`/v1/participate`, `/v1/rounds/{id}/sync`, `/v1/ollama/models`, and
-`/v1/ollama/inspect`) require `X-Client-Admin-Token`. `/health` and
+The administrative endpoints require `X-Client-Admin-Token`. `/health` and
 `/v1/generate` remain outside that administrative gate.
 
-Raw local examples passed to `/v1/local-train` remain inside the Client service.
-Only a local content hash and example count are persisted. The Coordinator
-receives only the signed Knowledge Package.
+Raw examples passed to `/v1/local-train` remain inside the Client service. Only a
+local content hash and example count are persisted. The Coordinator receives only
+the signed Knowledge Package.
 
 ## Bounded asynchronous round state
 
@@ -238,9 +469,9 @@ A round becomes `SKIPPED` when its deadline passes without the required trusted
 quorum. It becomes `ABORTED` if a sealed Host job fails. Late packages and second
 submissions from the same Client are rejected.
 
-The first Client may submit and disconnect while the Coordinator continues to
-wait for the remaining Clients. The accepted set is frozen before the Host job
-starts, so late arrivals cannot alter an in-progress distillation job.
+The first Client may submit and disconnect while the Coordinator waits for the
+remaining Clients. The accepted set is frozen before the Host job starts, so late
+arrivals cannot alter an in-progress distillation job.
 
 ## Filesystem persistence
 
@@ -253,16 +484,36 @@ Coordinator data
 ├── clients/
 ├── host/
 ├── rounds/
+│   └── <round-id>/
+│       ├── manifest.json
+│       ├── state.json
+│       ├── datasets/
+│       │   ├── reference.jsonl
+│       │   ├── validation.jsonl
+│       │   └── identity.json
+│       ├── submissions/
+│       ├── safety/
+│       └── ...
 └── audit/events.jsonl
 
 Host data
 ├── identity/
 ├── adapters/
 └── rounds/
+    └── <round-id>/
+        ├── datasets/
+        │   ├── reference.jsonl
+        │   ├── validation.jsonl
+        │   └── identity.json
+        └── ...
 
 Client data
 ├── identity/
 ├── state.json
+├── reference_datasets/
+│   └── <round-id>/
+│       ├── reference.jsonl
+│       └── identity.json
 ├── knowledge_cache/
 │   ├── pending/
 │   ├── accepted/
@@ -272,37 +523,41 @@ Client data
     └── accepted/
 ```
 
-A Client package is first written as pending state. Only after a matching
-Coordinator receipt is returned is the exact package and its round-bound adapter
-snapshot committed as accepted state. Accepted package/snapshot pairs are treated
-as immutable for that round.
+A downloaded Client dataset is written to a temporary path and accepted only
+after schema, dataset ID, semantic hash and sample-order verification. The cache
+identity is bound to the round ID and manifest hash.
 
-Writes use temporary files followed by atomic replacement. Direct local execution
+A Client Knowledge Package is first written as pending state. Only after a
+matching Coordinator receipt is returned is the exact package and its round-bound
+adapter snapshot committed as accepted state. Accepted package/snapshot pairs are
+immutable for that round.
+
+Writes use temporary files followed by atomic replacement. Direct execution
 defaults to `./data/...`; Compose overrides these paths with `/data/...` volume
-mounts. The same design is portable to Windows filesystems, Linux, Docker volumes
-and Podman volumes.
+mounts.
 
 ## Security included now
 
-The protocol-first milestone implements:
+The current implementation includes:
 
 - Ed25519 identities and signatures;
 - canonical JSON signing;
 - SHA-256 manifest, package, dataset and candidate-artifact hashes;
 - registered Client public keys;
 - signed Coordinator manifests;
-- signed Client Knowledge Packages;
-- signed Host Knowledge Packages;
+- signed Client and Host Knowledge Packages;
 - round-bound manifest hashes;
-- nonces and timestamp skew checks;
+- nonces and timestamp-skew checks;
 - duplicate Client submission rejection;
-- replay tracking for seen nonces and package hashes, including authenticated
-  packages later rejected by policy or safety checks;
+- replay tracking for seen nonces and package hashes;
 - package-size limits;
 - exact model-profile verification;
-- exact dataset, sample-order, top-k and alignment-profile verification;
-- strict Host identity, signature, manifest, dataset and accepted-adapter-version
-  verification before Client synchronization;
+- exact dataset ID, semantic hash and sample-order verification;
+- selected-Client authorization for D^P download;
+- Client cache binding to the round and manifest;
+- Host verification of D^P against the signed manifest;
+- Host verification of D^V identity, version and separation from D^P;
+- strict Host identity, signature, manifest and adapter-version verification;
 - authenticated Client administrative endpoints;
 - immutable accepted Client package and adapter-snapshot binding;
 - finite-number and shape validation;
@@ -310,8 +565,8 @@ The protocol-first milestone implements:
 - append-only JSONL audit events.
 
 This does not replace HTTPS. Signatures prove package origin and integrity but do
-not encrypt network traffic. A public deployment must put the Coordinator behind
-a TLS reverse proxy and replace the development bootstrap tokens.
+not encrypt network traffic. The current registration and internal tokens are
+development credentials, not production-grade per-service identity.
 
 ## Ollama boundary and Windows baseline
 
@@ -368,8 +623,7 @@ FATE Context, FATE communication roles, FATE-Flow and FATE aggregation wrappers
 are not included. LegalFedLLM supplies the HTTP, security, storage and round
 layers.
 
-Install the pinned optional machine-learning environment only when moving to
-real models:
+Install the optional machine-learning environment only when moving to real models:
 
 ```bash
 python -m pip install -r requirements-ml.txt
@@ -383,13 +637,17 @@ See `shared/fedmkt_core/UPSTREAM.md`, `shared/fedmkt_core/LICENSE`, and
 
 ## Current limitations
 
-This milestone does not yet perform:
+The repository does not yet perform:
 
+- GLD-specific chapter, section and Q&A import into canonical JSONL;
+- construction, manual inspection and freezing of the first real GLD corpus;
 - real private LoRA training;
-- teacher-forced inference on an actual reference dataset;
+- teacher-forced model inference on D^P;
+- real top-k logit and CE-loss extraction;
 - real cross-tokenizer alignment inside a live round;
 - real Host or Client knowledge distillation;
-- formal differential privacy accounting;
+- scalable binary Knowledge Package artifact transfer;
+- formal differential-privacy accounting;
 - learned malicious-package detection;
 - encrypted artifact storage;
 - production authentication or certificate provisioning;
@@ -397,41 +655,51 @@ This milestone does not yet perform:
 - a graphical Windows application;
 - automatic export of accepted PEFT adapters into Ollama.
 
+The current D^P/D^V transfer and verification boundary is real, but the Host and
+Client still generate deterministic mock knowledge rather than model-derived
+knowledge.
+
 The DP fields currently enforce protocol consistency only. The safety probe is a
 basic deterministic gate, not the final Safe-FedLLM-inspired detector.
 
-## Next implementation milestone
+## Next implementation milestones
 
-Step 0 is complete. The next work should preserve the protocol-first control plane
-and connect the real FedMKT path in measured stages rather than replacing all mock
-operations at once.
+### Complete the first source-specific corpus
 
-### Stage 1 — real shared reference dataset (`D^P`)
+The generic reference-dataset infrastructure is implemented. The remaining
+dataset-preparation work is:
 
-Introduce a versioned reference-dataset boundary with:
+```text
+inspect GLD layout
+        ↓
+define deterministic chapter, section and Q&A rules
+        ↓
+implement the GLD-to-canonical-JSONL importer
+        ↓
+generate complete sections up to the selected boundary
+        ↓
+inspect output against the source PDF
+        ↓
+fix importer rules rather than hand-editing output
+        ↓
+freeze dataset version and hashes
+```
 
-- an explicit sample schema and stable sample IDs;
-- deterministic ordering;
-- legal questions/inputs and gold labels;
-- deterministic prompt/label formatting;
-- dataset version and cryptographic hash;
-- reference/training and held-out validation separation where appropriate;
-- independent Host/Client verification that they loaded the same dataset.
+The GLD source and derivatives remain local unless distribution permission is
+obtained.
 
-The first dataset integration should prove that the manifest's dataset ID, hash and
-sample ordering correspond to real loaded content.
+### Scalable Knowledge Package artifacts
 
-### Stage 2 — scalable Knowledge Package artifacts
+The current protocol keeps deterministic numerical arrays directly in signed
+JSON. Before real-model scale, large tensors should move behind a signed metadata
+envelope and a constrained binary artifact such as `safetensors` or strictly
+validated NumPy `.npz`. Arbitrary pickle/PyTorch object deserialization from
+Clients must not be accepted.
 
-The current protocol keeps deterministic numerical arrays directly in signed JSON.
-Before real-model scale, move large tensors behind a signed metadata envelope and
-a constrained binary artifact such as `safetensors` or strictly validated NumPy
-`.npz`. Do not accept arbitrary pickle/PyTorch object deserialization from Clients.
-
-### Stage 3 — first real Client model
+### First real Client model
 
 Connect one small Client runtime using pinned Transformers/tokenizer revisions and
-PEFT LoRA. Replace mock local training and mock reference inference with:
+PEFT LoRA:
 
 ```text
 private Client examples
@@ -442,7 +710,7 @@ private Client examples
     → signed Client Knowledge Package
 ```
 
-### Stages 4–6 — FedMKT parity, Host distillation and reverse distillation
+### FedMKT parity, Host distillation and reverse distillation
 
 After one Client can generate real knowledge:
 
@@ -454,19 +722,24 @@ protocol-level DualMinCE
     → parity checks against the extracted FedMKT implementation
 
 mock Host candidate
-    → FedMKTTrainer Host LoRA distillation + held-out validation
+    → FedMKTTrainer Host LoRA distillation + D^V validation
 
 mock Client sync
     → Host-to-Client alignment + selective reverse distillation
 ```
 
-The first heterogeneous real-model verification should prioritize a model pair that
-can be compared with the published FedMKT implementation before moving to larger
-or production-oriented Host/Client configurations.
-
 ## Current project claim
 
-The repository currently demonstrates a working protocol-first control plane for
-FedMKT-style heterogeneous knowledge transfer. It does **not** yet demonstrate a
-completed real-model FedMKT round, formal differential privacy, a complete
-Safe-FedLLM defense, or production-ready deployment.
+The repository currently demonstrates:
+
+- a working protocol-first control plane for FedMKT-style heterogeneous knowledge
+  transfer;
+- a canonical and cryptographically identified shared-reference-dataset format;
+- Coordinator-owned D^P/D^V round snapshots;
+- authorized D^P delivery to selected Clients;
+- independent Client and Host dataset verification and caching;
+- deterministic mock bidirectional FedMKT message flow.
+
+It does **not** yet demonstrate a completed real-model FedMKT round, a frozen GLD
+corpus, formal differential privacy, a complete Safe-FedLLM defense, or
+production-ready deployment.
