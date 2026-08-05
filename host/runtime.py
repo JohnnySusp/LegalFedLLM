@@ -15,8 +15,18 @@ from shared.protocol import (
     ModelProfile,
     OllamaProfile,
     RoundManifest,
+    HostReferenceDatasetBundle,
+    HostReferenceDatasetReceipt,
 )
 from shared.storage import JsonFileStore
+from shared.reference_dataset import (
+    ReferenceDatasetIdentity,
+    ReferenceSample,
+    load_reference_jsonl,
+    reference_dataset_identity,
+    verify_reference_dataset,
+    write_reference_jsonl,
+)
 
 
 class HostRuntimeError(RuntimeError):
@@ -123,6 +133,13 @@ class HostRuntime:
     def generate_reference_knowledge(
         self, manifest: RoundManifest, *, enforce_manifest_parent: bool = True
     ) -> KnowledgePackage:
+        identity_path = self._dataset_identity_path(
+            manifest.round_id
+        )
+
+        if self.store.exists(identity_path):
+            self.verify_cached_reference_data(manifest)
+        
         cache_name = (
             "baseline_knowledge.json"
             if enforce_manifest_parent
@@ -162,6 +179,14 @@ class HostRuntime:
 
     def distill(self, job: DistillationJob) -> DistillationResult:
         manifest = job.manifest
+
+        identity_path = self._dataset_identity_path(
+            manifest.round_id
+        )
+
+        if self.store.exists(identity_path):
+            self.verify_cached_reference_data(manifest)
+
         result_path = f"rounds/{manifest.round_id}/distillation_result.json"
         if self.store.exists(result_path):
             return DistillationResult.model_validate(self.store.read_json(result_path))
@@ -232,4 +257,329 @@ class HostRuntime:
         return (
             f"[mock host:{self.model_profile.model_id} omega-v{self.adapter_version}] "
             f"{prompt.strip()}"
+        )
+
+    @staticmethod
+    def _reference_dataset_path(round_id: str) -> str:
+        return (
+            f"rounds/{round_id}/datasets/reference.jsonl"
+        )
+
+
+    @staticmethod
+    def _validation_dataset_path(round_id: str) -> str:
+        return (
+            f"rounds/{round_id}/datasets/validation.jsonl"
+        )
+
+
+    @staticmethod
+    def _dataset_identity_path(round_id: str) -> str:
+        return (
+            f"rounds/{round_id}/datasets/identity.json"
+        )
+
+    @staticmethod
+    def _validate_reference_pair(
+        reference_samples: list[ReferenceSample],
+        validation_samples: list[ReferenceSample],
+        reference_identity: ReferenceDatasetIdentity,
+        validation_identity: ReferenceDatasetIdentity,
+    ) -> None:
+        if (
+            reference_identity.dataset_id
+            != validation_identity.dataset_id
+        ):
+            raise HostRuntimeError(
+                "reference and validation dataset IDs differ"
+            )
+
+        if (
+            reference_identity.dataset_version
+            != validation_identity.dataset_version
+        ):
+            raise HostRuntimeError(
+                "reference and validation dataset versions differ"
+            )
+
+        reference_ids = {
+            sample.sample_id
+            for sample in reference_samples
+        }
+        validation_ids = {
+            sample.sample_id
+            for sample in validation_samples
+        }
+
+        if reference_ids & validation_ids:
+            raise HostRuntimeError(
+                "reference and validation datasets overlap"
+            )
+
+    def verify_cached_reference_data(
+        self,
+        manifest: RoundManifest,
+    ) -> HostReferenceDatasetReceipt:
+        reference_path = self._reference_dataset_path(
+            manifest.round_id
+        )
+        validation_path = self._validation_dataset_path(
+            manifest.round_id
+        )
+        identity_path = self._dataset_identity_path(
+            manifest.round_id
+        )
+
+        if (
+            not self.store.exists(reference_path)
+            or not self.store.exists(validation_path)
+            or not self.store.exists(identity_path)
+        ):
+            raise HostRuntimeError(
+                "Host reference dataset cache is incomplete"
+            )
+
+        try:
+            record = self.store.read_json(identity_path)
+
+            if record.get("round_id") != manifest.round_id:
+                raise ValueError(
+                    "Host datasets belong to another round"
+                )
+
+            if (
+                record.get("manifest_hash")
+                != manifest.manifest_hash
+            ):
+                raise ValueError(
+                    "Host datasets belong to another manifest"
+                )
+
+            recorded_reference = (
+                ReferenceDatasetIdentity.model_validate(
+                    record["reference"]
+                )
+            )
+            recorded_validation = (
+                ReferenceDatasetIdentity.model_validate(
+                    record["validation"]
+                )
+            )
+
+            reference_samples = load_reference_jsonl(
+                self.store.path(reference_path)
+            )
+            validation_samples = load_reference_jsonl(
+                self.store.path(validation_path)
+            )
+
+            reference_identity = verify_reference_dataset(
+                reference_samples,
+                expected_dataset_id=(
+                    manifest.reference_dataset_id
+                ),
+                expected_dataset_hash=(
+                    manifest.reference_dataset_hash
+                ),
+                expected_sample_ids=manifest.sample_ids,
+            )
+
+            validation_identity = (
+                reference_dataset_identity(
+                    validation_samples
+                )
+            )
+
+            if recorded_reference != reference_identity:
+                raise ValueError(
+                    "Host reference identity record differs"
+                )
+
+            if recorded_validation != validation_identity:
+                raise ValueError(
+                    "Host validation identity record differs"
+                )
+
+            self._validate_reference_pair(
+                reference_samples,
+                validation_samples,
+                reference_identity,
+                validation_identity,
+            )
+
+            return HostReferenceDatasetReceipt(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                reference_identity=reference_identity,
+                validation_identity=validation_identity,
+            )
+
+        except (
+            KeyError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise HostRuntimeError(
+                f"Host reference data is invalid: {exc}"
+            ) from exc
+
+    def load_reference_data(
+        self,
+        bundle: HostReferenceDatasetBundle,
+    ) -> HostReferenceDatasetReceipt:
+        manifest = bundle.manifest
+
+        if manifest.host_model_profile != self.model_profile:
+            raise HostRuntimeError(
+                "reference data is bound to another Host profile"
+            )
+
+        reference_path = self._reference_dataset_path(
+            manifest.round_id
+        )
+        validation_path = self._validation_dataset_path(
+            manifest.round_id
+        )
+        identity_path = self._dataset_identity_path(
+            manifest.round_id
+        )
+
+        existing = (
+            self.store.exists(reference_path),
+            self.store.exists(validation_path),
+            self.store.exists(identity_path),
+        )
+
+        if any(existing):
+            if not all(existing):
+                raise HostRuntimeError(
+                    "Host reference dataset cache is incomplete"
+                )
+
+            receipt = self.verify_cached_reference_data(
+                manifest
+            )
+
+            if (
+                receipt.validation_identity
+                != bundle.validation_identity
+            ):
+                raise HostRuntimeError(
+                    "cached validation identity differs "
+                    "from the Coordinator identity"
+                )
+
+            return receipt
+
+        try:
+            reference_identity = verify_reference_dataset(
+                bundle.reference_samples,
+                expected_dataset_id=(
+                    manifest.reference_dataset_id
+                ),
+                expected_dataset_hash=(
+                    manifest.reference_dataset_hash
+                ),
+                expected_sample_ids=manifest.sample_ids,
+            )
+
+            validation_identity = (
+                reference_dataset_identity(
+                    bundle.validation_samples
+                )
+            )
+
+        except ValueError as exc:
+            raise HostRuntimeError(
+                f"received Host reference data is invalid: {exc}"
+            ) from exc
+
+        if validation_identity != bundle.validation_identity:
+            raise HostRuntimeError(
+                "validation dataset identity differs "
+                "from the Coordinator identity"
+            )
+
+        self._validate_reference_pair(
+            bundle.reference_samples,
+            bundle.validation_samples,
+            reference_identity,
+            validation_identity,
+        )
+
+        reference_target = self.store.path(
+            reference_path
+        )
+        validation_target = self.store.path(
+            validation_path
+        )
+
+        reference_target.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        reference_temporary = reference_target.with_name(
+            f".{reference_target.name}.{os.getpid()}.tmp"
+        )
+        validation_temporary = validation_target.with_name(
+            f".{validation_target.name}.{os.getpid()}.tmp"
+        )
+
+        try:
+            write_reference_jsonl(
+                reference_temporary,
+                bundle.reference_samples,
+            )
+            write_reference_jsonl(
+                validation_temporary,
+                bundle.validation_samples,
+            )
+
+            reference_temporary.replace(reference_target)
+            validation_temporary.replace(validation_target)
+
+            try:
+                self.store.write_json_if_absent(
+                    identity_path,
+                    {
+                        "round_id": manifest.round_id,
+                        "manifest_hash": (
+                            manifest.manifest_hash
+                        ),
+                        "reference": (
+                            reference_identity.model_dump(
+                                mode="json"
+                            )
+                        ),
+                        "validation": (
+                            validation_identity.model_dump(
+                                mode="json"
+                            )
+                        ),
+                    },
+                )
+            except Exception:
+                reference_target.unlink(missing_ok=True)
+                validation_target.unlink(missing_ok=True)
+                raise
+
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            reference_temporary.unlink(missing_ok=True)
+            validation_temporary.unlink(missing_ok=True)
+
+            raise HostRuntimeError(
+                f"failed to cache Host reference data: {exc}"
+            ) from exc
+
+        return HostReferenceDatasetReceipt(
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            reference_identity=reference_identity,
+            validation_identity=validation_identity,
         )

@@ -105,6 +105,41 @@ class CoordinatorGateway:
             )
         )
 
+    async def reference_dataset(
+        self,
+        round_id: str,
+        client_id: str,
+    ) -> bytes | None:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+            transport=self.transport,
+        ) as client:
+            response = await client.get(
+                f"/v1/rounds/{round_id}/reference-dataset",
+                headers={
+                    "X-Client-ID": client_id,
+                    "X-Registration-Token": (
+                        self.registration_token
+                    ),
+                },
+            )
+
+        if response.status_code == 204:
+            return None
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=(
+                    f"Coordinator returned "
+                    f"{response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
+
+        return response.content
+
     async def submit(self, package: KnowledgePackage) -> SubmissionReceipt:
         payload = await self._request(
             "POST",
@@ -227,6 +262,19 @@ def create_app(
             )
 
         try:
+            reference_content = (
+                await coordinator.reference_dataset(
+                    manifest.round_id,
+                    client_runtime.client_id,
+                )
+            )
+
+            if reference_content is not None:
+                client_runtime.cache_reference_dataset(
+                    manifest=manifest,
+                    content=reference_content,
+                )
+
             package = client_runtime.create_knowledge_package(manifest)
 
             receipt = await coordinator.submit(package)

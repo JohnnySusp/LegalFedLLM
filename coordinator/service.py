@@ -27,8 +27,14 @@ from shared.protocol import (
     parse_utc,
     utc_now,
     utc_text,
+    HostReferenceDatasetBundle,
+    HostReferenceDatasetReceipt,
 )
 from shared.storage import JsonFileStore
+from shared.reference_dataset import (
+    ReferenceDatasetIdentity,
+    verify_reference_dataset,
+)
 
 
 class CoordinatorError(RuntimeError):
@@ -82,6 +88,20 @@ class HostGateway:
     async def identity(self) -> ServiceIdentity:
         payload = await self._request("GET", "/internal/v1/identity")
         return ServiceIdentity.model_validate(payload)
+
+    async def load_reference_data(
+        self,
+        bundle: HostReferenceDatasetBundle,
+    ) -> HostReferenceDatasetReceipt:
+        payload = await self._request(
+            "POST",
+            "/internal/v1/reference-data",
+            json=bundle.model_dump(mode="json"),
+        )
+
+        return HostReferenceDatasetReceipt.model_validate(
+            payload
+        )
 
     async def reference_knowledge(self, manifest: RoundManifest) -> KnowledgePackage:
         payload = await self._request(
@@ -641,6 +661,38 @@ class CoordinatorService:
         self._write_state(state)
         try:
             host_identity = await self._host_identity(refresh=True)
+
+            identity_path = (
+                f"rounds/{manifest.round_id}/datasets/"
+                "identity.json"
+            )
+
+            if self.store.exists(identity_path):
+                bundle = self._host_reference_dataset_bundle(
+                    manifest
+                )
+
+                receipt = await self.host.load_reference_data(
+                    bundle
+                )
+
+                if (
+                    receipt.round_id != manifest.round_id
+                    or receipt.manifest_hash
+                    != manifest.manifest_hash
+                ):
+                    raise ConflictError(
+                        "Host loaded data for another round"
+                    )
+
+                if (
+                    receipt.reference_identity.dataset_hash
+                    != manifest.reference_dataset_hash
+                ):
+                    raise ConflictError(
+                        "Host loaded a different reference dataset"
+                    )
+
             baseline = await self.host.reference_knowledge(manifest)
 
             self._verify_host_package(
@@ -837,7 +889,7 @@ class CoordinatorService:
         self,
         round_id: str,
         client_id: str | None,
-    ) -> Path:
+    ) -> Path | None:
         if client_id is None:
             raise AuthenticationError("missing Client ID")
 
@@ -849,13 +901,111 @@ class CoordinatorService:
                 "Client is not selected for this round"
             )
 
-        relative_path = (
+        identity_path = (
+            f"rounds/{round_id}/datasets/identity.json"
+        )
+        reference_path = (
             f"rounds/{round_id}/datasets/reference.jsonl"
         )
 
-        if not self.store.exists(relative_path):
+        if not self.store.exists(identity_path):
+            return None
+
+        if not self.store.exists(reference_path):
             raise NotFoundError(
-                "this round does not publish a real reference dataset"
+                "the round reference dataset snapshot is missing"
             )
 
-        return self.store.path(relative_path)
+        return self.store.path(reference_path)
+
+    def _host_reference_dataset_bundle(
+        self,
+        manifest: RoundManifest,
+    ) -> HostReferenceDatasetBundle:
+        reference_path = self.store.path(
+            f"rounds/{manifest.round_id}/datasets/"
+            "reference.jsonl"
+        )
+        validation_path = self.store.path(
+            f"rounds/{manifest.round_id}/datasets/"
+            "validation.jsonl"
+        )
+        identity_path = (
+            f"rounds/{manifest.round_id}/datasets/"
+            "identity.json"
+        )
+
+        if (
+            not reference_path.is_file()
+            or not validation_path.is_file()
+            or not self.store.exists(identity_path)
+        ):
+            raise ConflictError(
+                "round dataset snapshots are incomplete"
+            )
+
+        try:
+            snapshot = CoordinatorReferenceData.load(
+                reference_path,
+                validation_path,
+            )
+
+            record = self.store.read_json(identity_path)
+
+            recorded_reference = (
+                ReferenceDatasetIdentity.model_validate(
+                    record["reference"]
+                )
+            )
+            recorded_validation = (
+                ReferenceDatasetIdentity.model_validate(
+                    record["validation"]
+                )
+            )
+
+            verified_reference = verify_reference_dataset(
+                snapshot.reference_samples,
+                expected_dataset_id=(
+                    manifest.reference_dataset_id
+                ),
+                expected_dataset_hash=(
+                    manifest.reference_dataset_hash
+                ),
+                expected_sample_ids=manifest.sample_ids,
+            )
+
+        except (
+            KeyError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise ConflictError(
+                f"round dataset snapshots are invalid: {exc}"
+            ) from exc
+
+        if verified_reference != recorded_reference:
+            raise ConflictError(
+                "round reference snapshot identity differs"
+            )
+
+        if (
+            snapshot.validation_identity
+            != recorded_validation
+        ):
+            raise ConflictError(
+                "round validation snapshot identity differs"
+            )
+
+        return HostReferenceDatasetBundle(
+            manifest=manifest,
+            reference_samples=list(
+                snapshot.reference_samples
+            ),
+            validation_samples=list(
+                snapshot.validation_samples
+            ),
+            validation_identity=(
+                snapshot.validation_identity
+            ),
+        )

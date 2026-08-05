@@ -21,6 +21,12 @@ from shared.protocol import (
 )
 from shared.storage import JsonFileStore
 
+from shared.reference_dataset import (
+    ReferenceDatasetIdentity,
+    load_reference_jsonl,
+    verify_reference_dataset,
+)
+
 class ClientRuntimeError(RuntimeError):
     pass
 
@@ -144,12 +150,210 @@ class ClientRuntime:
     def _receipt_path(round_id: str) -> str:
         return f"knowledge_cache/receipts/{round_id}.json"
 
+
+    @staticmethod
+    def _reference_dataset_path(round_id: str) -> str:
+        return (
+            f"reference_datasets/{round_id}/reference.jsonl"
+        )
+
+
+    @staticmethod
+    def _reference_dataset_identity_path(
+        round_id: str,
+    ) -> str:
+        return (
+            f"reference_datasets/{round_id}/identity.json"
+        )
+
+
+    def verify_cached_reference_dataset(
+        self,
+        manifest: RoundManifest,
+    ) -> ReferenceDatasetIdentity:
+        dataset_path = self._reference_dataset_path(
+            manifest.round_id
+        )
+        identity_path = (
+            self._reference_dataset_identity_path(
+                manifest.round_id
+            )
+        )
+
+        dataset_exists = self.store.exists(dataset_path)
+        identity_exists = self.store.exists(identity_path)
+
+        if not dataset_exists or not identity_exists:
+            raise ClientRuntimeError(
+                "verified reference dataset cache is incomplete"
+            )
+
+        try:
+            record = self.store.read_json(identity_path)
+
+            if record.get("round_id") != manifest.round_id:
+                raise ValueError(
+                    "cached dataset belongs to another round"
+                )
+
+            if (
+                record.get("manifest_hash")
+                != manifest.manifest_hash
+            ):
+                raise ValueError(
+                    "cached dataset belongs to another manifest"
+                )
+
+            recorded_identity = (
+                ReferenceDatasetIdentity.model_validate(
+                    record["identity"]
+                )
+            )
+
+            samples = load_reference_jsonl(
+                self.store.path(dataset_path)
+            )
+
+            identity = verify_reference_dataset(
+                samples,
+                expected_dataset_id=(
+                    manifest.reference_dataset_id
+                ),
+                expected_dataset_hash=(
+                    manifest.reference_dataset_hash
+                ),
+                expected_sample_ids=manifest.sample_ids,
+            )
+
+            if recorded_identity != identity:
+                raise ValueError(
+                    "cached dataset identity record "
+                    "is inconsistent"
+                )
+
+            return identity
+
+        except (
+            KeyError,
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            raise ClientRuntimeError(
+                f"cached reference dataset is invalid: {exc}"
+            ) from exc
+
+    def cache_reference_dataset(
+        self,
+        *,
+        manifest: RoundManifest,
+        content: bytes,
+    ) -> ReferenceDatasetIdentity:
+        dataset_path = self._reference_dataset_path(
+            manifest.round_id
+        )
+        identity_path = (
+            self._reference_dataset_identity_path(
+                manifest.round_id
+            )
+        )
+
+        dataset_exists = self.store.exists(dataset_path)
+        identity_exists = self.store.exists(identity_path)
+
+        if dataset_exists and identity_exists:
+            return self.verify_cached_reference_dataset(
+                manifest
+            )
+
+        if dataset_exists or identity_exists:
+            raise ClientRuntimeError(
+                "reference dataset cache is incomplete"
+            )
+
+        target = self.store.path(dataset_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        temporary = target.with_name(
+            f".{target.name}.{os.getpid()}.tmp"
+        )
+
+        try:
+            temporary.write_bytes(content)
+
+            samples = load_reference_jsonl(temporary)
+
+            identity = verify_reference_dataset(
+                samples,
+                expected_dataset_id=(
+                    manifest.reference_dataset_id
+                ),
+                expected_dataset_hash=(
+                    manifest.reference_dataset_hash
+                ),
+                expected_sample_ids=manifest.sample_ids,
+            )
+
+            temporary.replace(target)
+
+            try:
+                self.store.write_json_if_absent(
+                    identity_path,
+                    {
+                        "round_id": manifest.round_id,
+                        "manifest_hash": (
+                            manifest.manifest_hash
+                        ),
+                        "identity": identity.model_dump(
+                            mode="json"
+                        ),
+                    },
+                )
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+
+            return identity
+
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+        ) as exc:
+            temporary.unlink(missing_ok=True)
+
+            if (
+                target.exists()
+                and not self.store.exists(identity_path)
+            ):
+                target.unlink(missing_ok=True)
+
+            raise ClientRuntimeError(
+                f"downloaded reference dataset is invalid: {exc}"
+            ) from exc
+
+
     def create_knowledge_package(
         self,
         manifest: RoundManifest,
     ) -> KnowledgePackage:
         if self.client_id not in manifest.selected_client_ids:
             raise ValueError("Client is not selected for this round")
+
+        dataset_path = self._reference_dataset_path(
+            manifest.round_id
+        )
+        identity_path = (
+            self._reference_dataset_identity_path(
+                manifest.round_id
+            )
+        )
+
+        if (
+            self.store.exists(dataset_path)
+            or self.store.exists(identity_path)
+        ):
+            self.verify_cached_reference_dataset(manifest)
 
         accepted_path = self._accepted_package_path(manifest.round_id)
 
