@@ -8,6 +8,8 @@ from typing import Any, Callable
 
 import httpx
 
+from coordinator.reference_data import CoordinatorReferenceData
+
 from shared.crypto import Ed25519Identity
 from shared.fedmkt_core import dual_min_ce_select, inspect_knowledge_package
 from shared.protocol import (
@@ -44,6 +46,8 @@ class ConflictError(CoordinatorError):
 class AuthenticationError(CoordinatorError):
     status_code = 401
 
+class AuthorizationError(CoordinatorError):
+    status_code = 403
 
 class HostGateway:
     def __init__(
@@ -111,6 +115,8 @@ class CoordinatorService:
         registration_token: str = "development-registration-token",
         admin_token: str = "development-admin-token",
         maximum_clock_skew_seconds: int = 900,
+        reference_dataset_path: str | Path | None = None,
+        validation_dataset_path: str | Path | None = None,
         now_fn: Callable[[], Any] = utc_now,
     ):
         self.coordinator_id = coordinator_id
@@ -123,6 +129,29 @@ class CoordinatorService:
         self.admin_token = admin_token
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
         self.now_fn = now_fn
+
+        if (
+            reference_dataset_path is None
+            and validation_dataset_path is not None
+        ) or (
+            reference_dataset_path is not None
+            and validation_dataset_path is None
+        ):
+            raise ValueError(
+                "reference and validation dataset paths "
+                "must be configured together"
+            )
+
+        self.reference_data = (
+            CoordinatorReferenceData.load(
+                reference_dataset_path,
+                validation_dataset_path,
+            )
+            if reference_dataset_path is not None
+            and validation_dataset_path is not None
+            else None
+        )
+
         self._lock = asyncio.Lock()
 
     def require_registration_token(self, value: str | None) -> None:
@@ -175,8 +204,37 @@ class CoordinatorService:
             raise NotFoundError(f"Client {client_id!r} is not registered")
         return RegistrationRecord.model_validate(self.store.read_json(path))
 
+    def _resolve_round_request(
+        self,
+        request: RoundCreateRequest,
+    ) -> RoundCreateRequest:
+        if self.reference_data is not None:
+            identity = self.reference_data.reference_identity
+
+            return request.model_copy(
+                update={
+                    "reference_dataset_id": identity.dataset_id,
+                    "reference_dataset_hash": identity.dataset_hash,
+                    "sample_ids": self.reference_data.sample_ids,
+                }
+            )
+
+        if (
+            request.reference_dataset_id is None
+            or request.reference_dataset_hash is None
+            or request.sample_ids is None
+        ):
+            raise ConflictError(
+                "the Coordinator has no real reference dataset configured "
+                "and the mock request contains no dataset metadata"
+            )
+
+        return request
+
     async def create_round(self, request: RoundCreateRequest) -> RoundManifest:
         async with self._lock:
+            request = self._resolve_round_request(request)
+
             if request.alignment.strategy != "mock_identity":
                 raise ConflictError(
                     "only alignment.strategy=mock_identity is available "
@@ -212,6 +270,9 @@ class CoordinatorService:
                 request=request,
                 submission_deadline=utc_text(deadline),
             )
+
+            self._snapshot_reference_data(round_id)
+
             state = RoundState(
                 round_id=round_id,
                 state="COLLECTING",
@@ -736,3 +797,65 @@ class CoordinatorService:
             "audit/events.jsonl",
             {"timestamp": utc_text(self.now_fn()), "event": event, **details},
         )
+
+    def _snapshot_reference_data(
+        self,
+        round_id: str,
+    ) -> None:
+        if self.reference_data is None:
+            return
+
+        reference_path = self.store.path(
+            f"rounds/{round_id}/datasets/reference.jsonl"
+        )
+        validation_path = self.store.path(
+            f"rounds/{round_id}/datasets/validation.jsonl"
+        )
+
+        self.reference_data.write_snapshot(
+            reference_path,
+            validation_path,
+        )
+
+        self.store.write_json(
+            f"rounds/{round_id}/datasets/identity.json",
+            {
+                "reference": (
+                    self.reference_data.reference_identity.model_dump(
+                        mode="json"
+                    )
+                ),
+                "validation": (
+                    self.reference_data.validation_identity.model_dump(
+                        mode="json"
+                    )
+                ),
+            },
+        )
+
+    def get_reference_dataset_path(
+        self,
+        round_id: str,
+        client_id: str | None,
+    ) -> Path:
+        if client_id is None:
+            raise AuthenticationError("missing Client ID")
+
+        manifest = self.get_manifest(round_id)
+        self.get_registration(client_id)
+
+        if client_id not in manifest.selected_client_ids:
+            raise AuthorizationError(
+                "Client is not selected for this round"
+            )
+
+        relative_path = (
+            f"rounds/{round_id}/datasets/reference.jsonl"
+        )
+
+        if not self.store.exists(relative_path):
+            raise NotFoundError(
+                "this round does not publish a real reference dataset"
+            )
+
+        return self.store.path(relative_path)
