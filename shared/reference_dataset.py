@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Literal
+import json
+from pathlib import Path
+from typing import Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -57,3 +59,101 @@ class ReferenceSample(ReferenceModel):
         if not value.strip():
             raise ValueError("text fields must not be blank")
         return value
+
+
+def validate_reference_samples(
+    samples: Iterable[ReferenceSample],
+) -> list[ReferenceSample]:
+    values = list(samples)
+
+    if not values:
+        raise ValueError("reference dataset must contain at least one sample")
+
+    dataset_id = values[0].dataset_id
+    dataset_version = values[0].dataset_version
+    sample_ids: set[str] = set()
+
+    for sample in values:
+        if sample.dataset_id != dataset_id:
+            raise ValueError("reference dataset contains multiple dataset IDs")
+
+        if sample.dataset_version != dataset_version:
+            raise ValueError("reference dataset contains multiple dataset versions")
+
+        if sample.sample_id in sample_ids:
+            raise ValueError(f"duplicate sample ID: {sample.sample_id}")
+
+        sample_ids.add(sample.sample_id)
+
+    return values
+
+
+def write_reference_jsonl(
+    path: str | Path,
+    samples: Iterable[ReferenceSample],
+) -> None:
+    values = validate_reference_samples(samples)
+    target = Path(path)
+
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        for sample in values:
+            payload = sample.model_dump(mode="json")
+            handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            handle.write("\n")
+
+
+def load_reference_jsonl(
+    path: str | Path,
+) -> list[ReferenceSample]:
+    source = Path(path)
+    samples: list[ReferenceSample] = []
+
+    with source.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                raise ValueError(
+                    f"blank line in reference dataset at line {line_number}"
+                )
+
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid JSON in reference dataset at line {line_number}"
+                ) from exc
+
+            try:
+                sample = ReferenceSample.model_validate(payload)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid reference sample at line {line_number}"
+                ) from exc
+
+            samples.append(sample)
+
+    return validate_reference_samples(samples)
+
+
+def write_pretty_reference_json(
+    jsonl_path: str | Path,
+    pretty_path: str | Path,
+) -> None:
+    samples = load_reference_jsonl(jsonl_path)
+    payload = [sample.model_dump(mode="json") for sample in samples]
+
+    Path(pretty_path).write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
