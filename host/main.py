@@ -12,6 +12,8 @@ from shared.protocol import (
     KnowledgePackage,
     RoundManifest,
     ServiceIdentity,
+    HostReferenceDatasetBundle,
+    HostReferenceDatasetReceipt,
 )
 
 
@@ -84,6 +86,22 @@ def create_app(
     )
     async def identity() -> ServiceIdentity:
         return ServiceIdentity.model_validate(host_runtime.service_identity())
+
+    @app.post(
+        "/internal/v1/reference-data",
+        response_model=HostReferenceDatasetReceipt,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def load_reference_data(
+        bundle: HostReferenceDatasetBundle,
+    ) -> HostReferenceDatasetReceipt:
+        try:
+            return host_runtime.load_reference_data(bundle)
+        except HostRuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+            ) from exc
 
     @app.post(
         "/internal/v1/reference-knowledge",

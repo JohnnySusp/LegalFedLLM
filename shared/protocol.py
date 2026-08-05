@@ -9,6 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from shared.crypto import Ed25519Identity, sha256_hex, verify_json
 
+from shared.reference_dataset import (
+    ReferenceDatasetIdentity,
+    ReferenceSample,
+)
+
 PROTOCOL_VERSION = "1.0"
 PACKAGE_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -324,6 +329,26 @@ class RoundManifest(ContractModel):
             **signed_payload,
             coordinator_signature=identity.sign_json(signed_payload),
         )
+
+
+class HostReferenceDatasetBundle(ContractModel):
+    manifest: RoundManifest
+    reference_samples: list[ReferenceSample] = Field(
+        min_length=1,
+        max_length=100_000,
+    )
+    validation_samples: list[ReferenceSample] = Field(
+        min_length=1,
+        max_length=100_000,
+    )
+    validation_identity: ReferenceDatasetIdentity
+
+
+class HostReferenceDatasetReceipt(ContractModel):
+    round_id: str = Field(min_length=1, max_length=128)
+    manifest_hash: str = Field(pattern=HASH_PATTERN)
+    reference_identity: ReferenceDatasetIdentity
+    validation_identity: ReferenceDatasetIdentity
 
 
 class KnowledgeSample(ContractModel):

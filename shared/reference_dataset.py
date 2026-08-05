@@ -142,6 +142,40 @@ def reference_dataset_identity(
     )
 
 
+def verify_reference_dataset(
+    samples: Iterable[ReferenceSample],
+    *,
+    expected_dataset_id: str,
+    expected_dataset_hash: str,
+    expected_sample_ids: list[str],
+) -> ReferenceDatasetIdentity:
+    values = validate_reference_samples(samples)
+    identity = reference_dataset_identity(values)
+
+    if identity.dataset_id != expected_dataset_id:
+        raise ValueError(
+            "reference dataset ID differs from the expected ID"
+        )
+
+    if identity.dataset_hash != expected_dataset_hash:
+        raise ValueError(
+            "reference dataset hash differs from the expected hash"
+        )
+
+    sample_ids = [
+        sample.sample_id
+        for sample in values
+    ]
+
+    if sample_ids != expected_sample_ids:
+        raise ValueError(
+            "reference dataset sample order differs "
+            "from the expected order"
+        )
+
+    return identity
+
+
 def split_reference_samples(
     samples: Iterable[ReferenceSample],
 ) -> tuple[list[ReferenceSample], list[ReferenceSample]]:

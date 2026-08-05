@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from coordinator.service import CoordinatorError, CoordinatorService, HostGateway
@@ -198,7 +198,7 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         round_id: str,
         x_client_id: str | None = Header(default=None),
         x_registration_token: str | None = Header(default=None),
-    ) -> FileResponse:
+    ) -> Response:
         coordinator.require_registration_token(
             x_registration_token
         )
@@ -207,6 +207,9 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
             round_id,
             x_client_id,
         )
+
+        if path is None:
+            return Response(status_code=204)
 
         return FileResponse(
             path,
