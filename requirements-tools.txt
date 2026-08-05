@@ -1,0 +1,3 @@
+# Offline dataset-preparation tools only.
+# PyMuPDF is dual-licensed under GNU AGPL-3.0 or an Artifex commercial license.
+PyMuPDF==1.28.0
