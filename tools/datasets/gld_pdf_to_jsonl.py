@@ -19,7 +19,7 @@ from shared.reference_dataset import (
     ReferenceSource,
     reference_dataset_identity,
     split_reference_samples,
-    write_pretty_reference_json,
+    write_reference_json,
     write_reference_jsonl,
 )
 
@@ -56,6 +56,9 @@ PROFILE_MARKERS = (
 )
 
 EXTRACTION_HYPHENS = ("\ufffe", "\ufffd", "\u00ad")
+SAMPLE_ID_RE = re.compile(
+    r"^gld2012-ch(?P<chapter>\d{3})-s(?P<section>\d{3})-q(?P<question>\d{3})$"
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,7 @@ class QuestionAnswerPair:
     answer: str
     page_start: int
     page_end: int
+    context_heading: str | None = None
 
 
 @dataclass(frozen=True)
@@ -248,13 +252,47 @@ def is_structural_heading(line: LineRecord) -> bool:
         return False
     if is_primary_question_style(line):
         return True
-    if is_secondary_question_style(line):
-        return True
     return (
         is_bold(line)
         and len(text) <= 180
         and is_upper_heading(text)
     )
+
+
+def is_context_heading(line: LineRecord) -> bool:
+    text = normalize_extracted_text(line.text)
+    return (
+        is_primary_question_style(line)
+        and not text.endswith("?")
+        and is_upper_heading(text)
+        and len(text) <= 180
+    )
+
+
+def context_heading_before(
+    spec: SectionSpec,
+    lines: Sequence[LineRecord],
+    index: int,
+) -> str | None:
+    for cursor in range(index - 1, -1, -1):
+        line = lines[cursor]
+        if not is_context_heading(line):
+            continue
+        key = (
+            spec.chapter_number,
+            spec.section_number,
+            normalize_match_text(line.text),
+        )
+        approved = APPROVED_CONTEXT_HEADINGS.get(key)
+        if approved is not None:
+            return approved
+    return None
+
+
+def contextual_section(spec: SectionSpec, heading: str | None) -> str:
+    if not heading:
+        return spec.section
+    return f"{spec.section} / {heading}"
 
 
 def is_running_matter(line: LineRecord, firm: str) -> bool:
@@ -268,8 +306,12 @@ def is_running_matter(line: LineRecord, firm: str) -> bool:
     if (near_top or near_bottom) and text.isdigit():
         return True
 
-    page = str(line.printed_page)
-    if near_top and page in text and normalize_match_text(firm) in normalized:
+    normalized_firm = normalize_match_text(firm)
+    if (
+        (near_top or near_bottom)
+        and normalized_firm
+        and normalized_firm in normalized
+    ):
         return True
 
     return False
@@ -303,7 +345,43 @@ FOLLOW_UP_REVIEW_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("in-view-of-above", re.compile(r"\bin\s+view\s+of\s+the\s+above\b", re.IGNORECASE)),
 )
 
-FOLLOW_UP_OVERRIDES: dict[tuple[int, int, int], str] = {}
+FOLLOW_UP_OVERRIDES: dict[tuple[int, int, int], str] = {
+    (2, 1, 11): "standalone",
+    (3, 3, 21): "merge",
+    (3, 11, 8): "standalone",
+    (3, 11, 23): "standalone",
+    (3, 11, 39): "standalone",
+}
+
+APPROVED_CONTEXT_HEADINGS: dict[tuple[int, int, str], str] = {
+    (1, 6, "ENFORCEMENT OF FOREIGN JUDGMENTS"): "ENFORCEMENT OF FOREIGN JUDGMENTS",
+    (1, 6, "ENFORCEMENT OF JUDGMENTS FROM OTHER EU MEMBER STATES"): "ENFORCEMENT OF JUDGMENTS FROM OTHER EU MEMBER STATES",
+    (1, 6, "ENFORCEMENT OF JUDGMENTS FROM NON EU MEMBER STATES"): "ENFORCEMENT OF JUDGMENTS FROM NON-EU MEMBER STATES",
+    (1, 6, "ENFORCEMENT OF FOREIGN AWARDS"): "ENFORCEMENT OF FOREIGN AWARDS",
+    (1, 6, "ENFORCEMENT OF AWARDS ISSUED IN NEW YORK CONVENTION MEMBER STATES"): "ENFORCEMENT OF AWARDS ISSUED IN NEW YORK CONVENTION MEMBER STATES",
+    (1, 6, "ENFORCEMENT OF AWARDS FROM NON NEW YORK CONVENTION CONTRACTING STATES"): "ENFORCEMENT OF AWARDS FROM NON-NEW YORK CONVENTION CONTRACTING STATES",
+    (3, 8, "GENERAL AND LIMITED PARTNERSHIPS O E AND E E"): "GENERAL AND LIMITED PARTNERSHIPS (O.E. and E.E.)",
+    (3, 8, "JOINT VENTURES"): "JOINT VENTURES",
+    (3, 11, "MUTUAL FUNDS"): "MUTUAL FUNDS",
+    (3, 11, "PORTFOLIO INVESTMENT COMPANIES"): "PORTFOLIO INVESTMENT COMPANIES",
+    (3, 11, "VENTURE CAPITAL"): "VENTURE CAPITAL",
+    (4, 4, "GENERAL FRAMEWORK"): "GENERAL FRAMEWORK",
+    (4, 4, "PUBLIC SUPPLIES CONTRACTS"): "PUBLIC SUPPLIES CONTRACTS",
+    (4, 4, "PUBLIC SERVICE CONTRACTS"): "PUBLIC SERVICE CONTRACTS",
+    (4, 4, "PUBLIC WORKS CONTRACTS"): "PUBLIC WORKS CONTRACTS",
+    (4, 7, "BACKGROUND"): "BACKGROUND",
+    (4, 7, "SECURITISATION LAW"): "SECURITISATION LAW",
+    (4, 7, "COVERED BONDS ISSUES BY GREEK BANKS"): "COVERED BONDS ISSUES BY GREEK BANKS",
+    (6, 1, "AGENCY AGREEMENT"): "AGENCY AGREEMENT",
+    (6, 1, "DISTRIBUTION AGREEMENT"): "DISTRIBUTION AGREEMENT",
+    (6, 4, "I INTRODUCTION"): "I. INTRODUCTION",
+    (6, 4, "II FACTORING"): "II. FACTORING",
+    (6, 4, "III FORFAITING FORFEITING"): "III. FORFAITING (FORFEITING)",
+    (6, 4, "IV COMPARATIVE ASSESSMENT"): "IV. COMPARATIVE ASSESSMENT",
+    (6, 4, "V BUSINESS BENEFIT AND TAXATION"): "V. BUSINESS BENEFIT AND TAXATION",
+    (6, 4, "VI THE GREEK MARKET"): "VI. THE GREEK MARKET",
+    (6, 4, "VII CONCLUSION"): "VII. CONCLUSION",
+}
 
 
 
@@ -325,7 +403,7 @@ def find_profile_start(lines: Sequence[LineRecord], firm: str) -> int | None:
         if not normalized_firm:
             break
         normalized = normalize_match_text(line.text)
-        if normalized != normalized_firm:
+        if normalized_firm not in normalized:
             continue
         lookahead = " ".join(
             normalize_match_text(item.text)
@@ -502,6 +580,11 @@ def build_section_samples(
                 answer=join_answer_text(answer),
                 page_start=content[first_group.start_index].printed_page,
                 page_end=answer[-1].printed_page,
+                context_heading=context_heading_before(
+                    spec,
+                    content,
+                    first_group.start_index,
+                ),
             )
         )
         pending_questions = []
@@ -579,13 +662,28 @@ def build_section_samples(
             f"gld2012-ch{spec.chapter_number:03d}-"
             f"s{spec.section_number:03d}-q{first_ordinal:03d}"
         )
+        context_headings = {
+            pair.context_heading
+            for pair in pair_group
+            if pair.context_heading is not None
+        }
+        if len(context_headings) > 1:
+            blocking.append(
+                f"{spec.section}: grouped source questions cross contextual headings"
+            )
+            continue
+        context_heading = (
+            next(iter(context_headings))
+            if context_headings
+            else None
+        )
         sample = ReferenceSample(
             schema_version=1,
             dataset_id=dataset_id,
             dataset_version=dataset_version,
             sample_id=sample_id,
             chapter=spec.chapter,
-            section=spec.section,
+            section=contextual_section(spec, context_heading),
             question=" ".join(pair.question for pair in pair_group),
             gold_answer="\n\n".join(pair.answer for pair in pair_group),
             source=ReferenceSource(
@@ -605,6 +703,8 @@ def build_section_samples(
                 ],
                 "grouped_follow_up": len(pair_group) > 1,
                 "follow_up_reasons": reasons,
+                "context_heading": context_heading,
+                "effective_section": sample.section,
                 "question": sample.question,
                 "page_start": first.page_start,
                 "page_end": pair_group[-1].page_end,
@@ -788,6 +888,121 @@ def extract_section_lines(
     }
 
 
+def audit_corpus_samples(
+    samples: Sequence[ReferenceSample],
+) -> dict[str, Any]:
+    duplicate_prompts: list[dict[str, Any]] = []
+    profile_text_hits: list[dict[str, Any]] = []
+    out_of_scope_samples: list[dict[str, Any]] = []
+    cross_reference_only_answers: list[dict[str, Any]] = []
+
+    prompt_ids: dict[tuple[str, str, str], list[str]] = {}
+    spec_map = {
+        (spec.chapter_number, spec.section_number): spec
+        for spec in SECTION_SPECS
+    }
+
+    for sample in samples:
+        key = (sample.chapter, sample.section, sample.question)
+        prompt_ids.setdefault(key, []).append(sample.sample_id)
+
+        match = SAMPLE_ID_RE.fullmatch(sample.sample_id)
+        if match is None:
+            out_of_scope_samples.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "reason": "unexpected GLD sample ID",
+                }
+            )
+            continue
+
+        section_key = (
+            int(match.group("chapter")),
+            int(match.group("section")),
+        )
+        spec = spec_map.get(section_key)
+        if spec is None:
+            out_of_scope_samples.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "reason": "sample ID does not map to a reviewed GLD section",
+                }
+            )
+            continue
+
+        source = sample.source
+        if (
+            source is None
+            or source.page_start < 34
+            or source.page_end > DEFAULT_LAST_INCLUDED_PRINTED_PAGE
+        ):
+            out_of_scope_samples.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "page_start": source.page_start if source else None,
+                    "page_end": source.page_end if source else None,
+                }
+            )
+
+        firm = normalize_match_text(spec.firm)
+        answer = normalize_match_text(sample.gold_answer)
+        if firm and firm in answer:
+            profile_text_hits.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "firm": spec.firm,
+                }
+            )
+
+        if re.match(
+            r"^same\s+answer\s+as\b",
+            sample.gold_answer.strip(),
+            re.IGNORECASE,
+        ):
+            cross_reference_only_answers.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "question": sample.question,
+                    "gold_answer": sample.gold_answer,
+                }
+            )
+
+    for (chapter, section, question), sample_ids in prompt_ids.items():
+        if len(sample_ids) <= 1:
+            continue
+        duplicate_prompts.append(
+            {
+                "chapter": chapter,
+                "section": section,
+                "question": question,
+                "sample_ids": sample_ids,
+            }
+        )
+
+    blocking_issues: list[str] = []
+    if duplicate_prompts:
+        blocking_issues.append(
+            f"{len(duplicate_prompts)} duplicate canonical prompt(s) remain"
+        )
+    if profile_text_hits:
+        blocking_issues.append(
+            f"{len(profile_text_hits)} sample(s) still contain contributing-firm profile text"
+        )
+    if out_of_scope_samples:
+        blocking_issues.append(
+            f"{len(out_of_scope_samples)} sample(s) fall outside the reviewed GLD scope"
+        )
+
+    return {
+        "status": "clean" if not blocking_issues else "needs_review",
+        "duplicate_prompts": duplicate_prompts,
+        "profile_text_hits": profile_text_hits,
+        "out_of_scope_samples": out_of_scope_samples,
+        "cross_reference_only_answers": cross_reference_only_answers,
+        "blocking_issues": blocking_issues,
+    }
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -797,15 +1012,20 @@ def write_json(path: Path, payload: Any) -> None:
     )
 
 
+def remove_output_files(output_dir: Path, names: Sequence[str]) -> None:
+    for name in names:
+        (output_dir / name).unlink(missing_ok=True)
+
+
 def write_candidate(output_dir: Path, samples: Iterable[ReferenceSample]) -> None:
     values = list(samples)
     if not values:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl = output_dir / "candidate_all.jsonl"
-    pretty = output_dir / "candidate_all.pretty.json"
+    json = output_dir / "candidate_all.json"
     write_reference_jsonl(jsonl, values)
-    write_pretty_reference_json(jsonl, pretty)
+    write_reference_json(jsonl, json)
 
 
 def import_gld(
@@ -905,6 +1125,14 @@ def import_gld(
 
         source_page_count = document.page_count
 
+    corpus_audit = audit_corpus_samples(all_samples)
+    blocking_issues.extend(corpus_audit["blocking_issues"])
+    if corpus_audit["cross_reference_only_answers"]:
+        warnings.append(
+            f"{len(corpus_audit['cross_reference_only_answers'])} source answer(s) are "
+            "cross-reference-only and are preserved verbatim"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     follow_up_review_candidate_count = sum(
         len(section.get("follow_up_review_candidates", []))
@@ -939,6 +1167,17 @@ def import_gld(
         },
         "sample_count": len(all_samples),
         "follow_up_review_candidate_count": follow_up_review_candidate_count,
+        "follow_up_overrides": [
+            {
+                "chapter_number": chapter,
+                "section_number": section,
+                "source_question_ordinal": question,
+                "decision": decision,
+            }
+            for (chapter, section, question), decision
+            in sorted(FOLLOW_UP_OVERRIDES.items())
+        ],
+        "corpus_audit": corpus_audit,
         "warnings": warnings,
         "blocking_issues": blocking_issues,
         "sections": review_sections,
@@ -946,13 +1185,30 @@ def import_gld(
     write_json(output_dir / "review.json", review)
 
     if blocking_issues or follow_up_review_candidate_count:
+        remove_output_files(
+            output_dir,
+            (
+                "all.jsonl",
+                "all.json",
+                "reference.jsonl",
+                "reference.json",
+                "validation.jsonl",
+                "validation.json",
+                "identity.json",
+            ),
+        )
         write_candidate(output_dir, all_samples)
         raise RuntimeError(
             "GLD import needs review: "
             f"{len(blocking_issues)} blocking issue(s), "
             f"{follow_up_review_candidate_count} follow-up candidate(s). "
-            f"Inspect {output_dir / 'review.json'} and candidate_all.pretty.json."
+            f"Inspect {output_dir / 'review.json'} and candidate_all.json."
         )
+
+    remove_output_files(
+        output_dir,
+        ("candidate_all.jsonl", "candidate_all.json"),
+    )
 
     reference, validation = split_reference_samples(all_samples)
 
@@ -968,9 +1224,9 @@ def import_gld(
             "validation": validation,
         }[key]
         write_reference_jsonl(path, values)
-        write_pretty_reference_json(
+        write_reference_json(
             path,
-            output_dir / f"{key}.pretty.json",
+            output_dir / f"{key}.json",
         )
 
     identity = {

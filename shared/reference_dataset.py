@@ -260,14 +260,14 @@ def load_reference_jsonl(
     return validate_reference_samples(samples)
 
 
-def write_pretty_reference_json(
+def write_reference_json(
     jsonl_path: str | Path,
-    pretty_path: str | Path,
+    json_path: str | Path,
 ) -> None:
     samples = load_reference_jsonl(jsonl_path)
     payload = [sample.model_dump(mode="json") for sample in samples]
 
-    Path(pretty_path).write_text(
+    Path(json_path).write_text(
         json.dumps(
             payload,
             ensure_ascii=False,

@@ -15,12 +15,15 @@ from tools.datasets.gld_pdf_to_jsonl import (
     DEFAULT_LAST_INCLUDED_PRINTED_PAGE,
     EXPECTED_SOURCE_PAGE_COUNT,
     EXPECTED_SOURCE_SHA256,
+    FOLLOW_UP_OVERRIDES,
     LineRecord,
     SectionSpec,
+    audit_corpus_samples,
     build_section_samples,
     classify_follow_up,
     is_embedded_question_line,
     is_primary_question_style,
+    is_running_matter,
     is_secondary_question_style,
     normalize_extracted_text,
     selected_specs,
@@ -84,6 +87,39 @@ SPEC = SectionSpec(
     printed_start_page=34,
     firm="Kelemenis & Co.",
     anchor="PROCEDURE BEFORE CIVIL COURTS",
+)
+
+CONTRACT_SPEC = SectionSpec(
+    chapter_number=2,
+    section_number=1,
+    chapter="BASIC ASPECTS OF CIVIL LAW",
+    section="GENERAL PRINCIPLES OF CONTRACT LAW",
+    printed_start_page=76,
+    firm="A.S. Papadimitriou & Partners Law Firm",
+    anchor="GENERAL PRINCIPLES OF CONTRACT LAW",
+)
+
+MINORITY_SPEC = SectionSpec(
+    chapter_number=3,
+    section_number=3,
+    chapter="BUSINESS ENTITIES",
+    section=(
+        "SOCIETE ANONYME - COMPANY LIMITED BY SHARES / "
+        "Minority Shareholders Rights - Shareholders Agreements"
+    ),
+    printed_start_page=124,
+    firm="Dryllerakis & Associates",
+    anchor="Minority Shareholders Rights - Shareholders Agreements",
+)
+
+MUTUAL_SPEC = SectionSpec(
+    chapter_number=3,
+    section_number=11,
+    chapter="BUSINESS ENTITIES",
+    section="MUTUAL FUNDS - PORTFOLIO INVESTMENT COMPANIES - VENTURE CAPITAL",
+    printed_start_page=167,
+    firm="A.S. Papadimitriou & Partners Law Firm",
+    anchor="MUTUAL FUNDS - PORTFOLIO INVESTMENT COMPANIES - VENTURE CAPITAL",
 )
 
 
@@ -160,6 +196,27 @@ class GldImporterTests(unittest.TestCase):
         self.assertEqual(
             result.samples[0].question,
             "What are the ordinary legal remedies?",
+        )
+
+    def test_black_bold_answer_caption_is_preserved(self) -> None:
+        lines = [
+            line("What tax rules apply?", style="primary", block=1),
+            line("Income tax (Capital gains tax)", style="secondary", block=2),
+            line("A capital gains rule applies.", block=3),
+            line("VAT and Stamp duty", style="secondary", block=4),
+            line("A separate VAT rule applies.", block=5),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(len(result.samples), 1)
+        self.assertIn(
+            "Income tax (Capital gains tax)",
+            result.samples[0].gold_answer,
+        )
+        self.assertIn(
+            "VAT and Stamp duty",
+            result.samples[0].gold_answer,
         )
 
     def test_regular_question_inside_answer_is_preserved_as_answer_text(self) -> None:
@@ -266,7 +323,149 @@ class GldImporterTests(unittest.TestCase):
         )
         self.assertTrue(result.groups[0]["grouped_follow_up"])
 
-    def test_ambiguous_follow_up_is_reported_for_review(self) -> None:
+    def test_reviewed_implied_terms_question_is_standalone(self) -> None:
+        self.assertEqual(FOLLOW_UP_OVERRIDES[(2, 1, 11)], "standalone")
+
+        lines = []
+        for ordinal in range(1, 11):
+            lines.extend(
+                [
+                    line(
+                        f"What is placeholder contract question {ordinal}?",
+                        style="primary",
+                        block=ordinal * 2,
+                    ),
+                    line(
+                        f"Placeholder contract answer {ordinal}.",
+                        block=ordinal * 2 + 1,
+                    ),
+                ]
+            )
+        lines.extend(
+            [
+                line(
+                    "What about implied terms? Can they be accepted as part of a contract?",
+                    style="primary",
+                    block=22,
+                ),
+                line("Implied terms may be accepted.", block=23),
+            ]
+        )
+
+        result = build_section_samples(CONTRACT_SPEC, lines)
+
+        self.assertEqual(len(result.samples), 11)
+        self.assertEqual(result.review_candidates, [])
+
+    def test_reviewed_shareholders_question_is_merged(self) -> None:
+        self.assertEqual(FOLLOW_UP_OVERRIDES[(3, 3, 21)], "merge")
+
+        lines = []
+        for ordinal in range(1, 20):
+            lines.extend(
+                [
+                    line(
+                        f"What is placeholder question {ordinal}?",
+                        style="primary",
+                        block=ordinal * 2,
+                    ),
+                    line(
+                        f"Placeholder answer {ordinal}.",
+                        block=ordinal * 2 + 1,
+                    ),
+                ]
+            )
+        lines.extend(
+            [
+                line(
+                    "What happens if there is a conflict between the Articles of Association and a Shareholders Agreement?",
+                    style="primary",
+                    block=40,
+                ),
+                line("The documents have different legal effects.", block=41),
+                line(
+                    "In view of the above how can a Shareholders Agreement be enforced?",
+                    style="primary",
+                    block=42,
+                ),
+                line("It may be enforced through courts or arbitration.", block=43),
+            ]
+        )
+
+        result = build_section_samples(MINORITY_SPEC, lines)
+
+        self.assertEqual(result.review_candidates, [])
+        self.assertEqual(len(result.samples), 20)
+        self.assertEqual(
+            result.samples[-1].question,
+            "What happens if there is a conflict between the Articles of Association and a Shareholders Agreement? In view of the above how can a Shareholders Agreement be enforced?",
+        )
+        self.assertEqual(
+            result.groups[-1]["source_question_ordinals"],
+            [20, 21],
+        )
+
+    def test_approved_subsection_caption_disambiguates_repeated_questions(self) -> None:
+        lines = [
+            line("MUTUAL FUNDS", style="primary", block=1),
+            line("How are units acquired by the unit holders?", style="primary", block=2),
+            line("The MF has an acquisition procedure.", block=3),
+            line("What about reporting requirements?", style="primary", block=4),
+            line("The MF has reporting requirements.", block=5),
+            line("PORTFOLIO INVESTMENT COMPANIES", style="primary", block=6),
+            line("How are PIC’s shares acquired?", style="primary", block=7),
+            line("The PIC has a listing procedure.", block=8),
+            line("What about reporting requirements?", style="primary", block=9),
+            line("The PIC has reporting requirements.", block=10),
+        ]
+
+        result = build_section_samples(MUTUAL_SPEC, lines)
+
+        self.assertEqual(len(result.samples), 4)
+        self.assertEqual(
+            result.samples[1].section,
+            f"{MUTUAL_SPEC.section} / MUTUAL FUNDS",
+        )
+        self.assertEqual(
+            result.samples[3].section,
+            f"{MUTUAL_SPEC.section} / PORTFOLIO INVESTMENT COMPANIES",
+        )
+        audit = audit_corpus_samples(result.samples)
+        self.assertEqual(audit["duplicate_prompts"], [])
+
+    def test_contributing_firm_running_footer_is_removed(self) -> None:
+        footer = line(
+            "Kelemenis & Co.",
+            style="regular",
+            y0=790.0,
+            y1=810.0,
+        )
+        self.assertTrue(is_running_matter(footer, SPEC.firm))
+
+        lines = [
+            line("What rules apply?", style="primary", block=1),
+            line("The substantive answer.", block=2),
+            footer,
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(len(result.samples), 1)
+        self.assertNotIn("Kelemenis", result.samples[0].gold_answer)
+
+    def test_corpus_audit_detects_duplicate_canonical_prompts(self) -> None:
+        lines = [
+            line("What rules apply?", style="primary", block=1),
+            line("The answer.", block=2),
+        ]
+        sample = build_section_samples(SPEC, lines).samples[0]
+
+        audit = audit_corpus_samples([sample, sample])
+
+        self.assertEqual(audit["status"], "needs_review")
+        self.assertEqual(len(audit["duplicate_prompts"]), 1)
+
+    def test_ambiguous_follow_up_without_reviewed_override_is_reported(self) -> None:
         decision = classify_follow_up("What about reporting requirements?")
         self.assertFalse(decision.merge)
         self.assertTrue(decision.review)
