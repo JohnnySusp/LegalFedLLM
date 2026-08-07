@@ -15,7 +15,7 @@ from shared.reference_dataset import (
     reference_dataset_hash_payload,
     reference_dataset_identity,
     split_reference_samples,
-    write_pretty_reference_json,
+    write_reference_json,
     write_reference_jsonl,
 )
 
@@ -184,18 +184,18 @@ class ReferenceSampleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_reference_jsonl(path)
 
-    def test_pretty_json_is_generated_from_jsonl(self) -> None:
+    def test_json_is_generated_from_jsonl(self) -> None:
         values = samples()
 
         with tempfile.TemporaryDirectory() as directory:
             jsonl_path = Path(directory) / "reference.jsonl"
-            pretty_path = Path(directory) / "reference.pretty.json"
+            json_path = Path(directory) / "reference.json"
 
             write_reference_jsonl(jsonl_path, values)
-            write_pretty_reference_json(jsonl_path, pretty_path)
+            write_reference_json(jsonl_path, json_path)
 
             payload = json.loads(
-                pretty_path.read_text(encoding="utf-8")
+                json_path.read_text(encoding="utf-8")
             )
 
         self.assertEqual(len(payload), 3)
