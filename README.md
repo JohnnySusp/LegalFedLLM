@@ -3,17 +3,24 @@
 LegalFedLLM is a protocol-first implementation of a FedMKT-centered architecture
 for bidirectional knowledge transfer between heterogeneous language models.
 
-The repository now contains two connected layers:
+The repository now contains three connected pieces:
 
-1. a complete deterministic Step-0 control plane using mock FedMKT knowledge; and
-2. a real shared-reference-dataset boundary with canonical JSONL data, signed
-   dataset identity, Coordinator-owned round snapshots, selected-Client download,
-   Client verification and caching, and Host verification of both reference and
-   validation data.
+1. a deterministic Step-0 control plane using mock FedMKT knowledge;
+2. a real generic shared-reference-dataset boundary with canonical JSONL data,
+   semantic dataset identity, Coordinator-owned round snapshots, selected-Client
+   download, Client verification and caching, and Host verification of both
+   reference and validation data; and
+3. a deterministic source-specific importer for the pinned 2012 Greek Law Digest
+   thesis copy, producing canonical LegalFedLLM Q&A records for the selected
+   printed-page range.
 
 The default execution path remains mock-first. No model download, GPU, Ollama
 installation, FATE-Flow deployment, or live public server is required to test the
 current implementation.
+
+The GLD importer is offline tooling. The copyrighted source PDF and generated
+derivatives remain under the Git-ignored `data/` tree and are not part of the
+runtime repository.
 
 ## Current development snapshot
 
@@ -72,8 +79,17 @@ flow; they do not yet represent useful model training.
   bounded asynchronous rounds, filesystem persistence, replay protection,
   DualMinCE selection, Host validation and rollback, Client synchronization and
   an Ollama serving boundary.
+- **Step 1A reference-dataset boundary:** canonical reference samples, shared
+  prompt rendering, JSONL I/O, deterministic semantic hashing, per-section
+  D^P/D^V splitting, Coordinator snapshots, selected-Client delivery, Client
+  verification/caching and Host D^P/D^V verification.
+- **Step 1B GLD importer:** deterministic parsing of the pinned 2012 Greek Law
+  Digest thesis copy, reviewed follow-up handling, subsection-context
+  disambiguation, corpus auditing and freeze-ready D^P/D^V generation.
 
-This section will be extended as additional implementation milestones are frozen.
+The Step 1B.2 code is implemented. Step 1 should be called fully frozen only
+after the authoritative local importer run is clean and the resulting
+`identity.json` values have been recorded.
 
 ## Repository layout
 
@@ -103,9 +119,13 @@ LegalFedLLM/
 │       └── ml/                 Extracted optional FATE-LLM FedMKT core
 ├── tools/
 │   └── datasets/
-│       └── inspect_gld_layout.py
-│                                Offline PDF layout-inspection utility
-├── tests/                      Protocol, dataset, round, rollback and Ollama tests
+│       ├── inspect_gld_layout.py
+│       │                        Offline PDF layout-inspection utility
+│       └── gld_pdf_to_jsonl.py
+│                                Deterministic pinned-GLD canonical importer
+├── tests/
+│   ├── test_gld_importer.py    GLD extraction, grouping and audit tests
+│   └── ...                     Protocol, dataset, round, rollback and Ollama tests
 ├── scripts/demo_round.py       One complete containerized mock round
 ├── compose.yaml
 ├── requirements.txt
@@ -192,6 +212,16 @@ else:
 
 Sample IDs are not renumbered after splitting.
 
+For GLD specifically, dependent top-level follow-up Q&A pairs are grouped by the
+source-specific importer **before** this generic split runs. The original question
+and answer wording is preserved and concatenated in source order. This prevents a
+base question and its dependent follow-up from being separated between D^P and
+D^V without changing the generic `ReferenceSample` schema.
+
+Where a GLD section contains repeated short questions under different internal
+subheadings, approved source subheadings are appended to the canonical `section`
+value so that the resulting prompts remain unambiguous.
+
 ### Real-data and mock-data modes
 
 When the Coordinator is configured with real dataset paths, it:
@@ -212,11 +242,22 @@ reference-dataset download endpoint returns `204 No Content`.
 The current implementation can test:
 
 - canonical reference-sample validation;
-- JSONL loading, writing and pretty-JSON generation;
+- JSONL loading, writing and human-readable JSON generation;
 - Unicode and paragraph preservation;
 - duplicate and mixed-version rejection;
 - canonical dataset hashing;
 - deterministic per-section D^P/D^V splitting;
+- deterministic GLD question-style recognition;
+- multiline and black-bold GLD question extraction;
+- exclusion of non-question GLD captions;
+- preservation of embedded question-mark sentences inside answers;
+- grouping of consecutive source questions that share one answer;
+- reviewed GLD follow-up grouping without rewriting source wording;
+- stable source-question IDs after grouping;
+- approved subsection-context disambiguation;
+- contributing-firm running-matter filtering;
+- GLD corpus audits for duplicate prompts, profile contamination and scope;
+- pinned GLD source SHA-256 and page-count verification;
 - signed manifest creation and verification;
 - Ed25519 Client and Host Knowledge Package signatures;
 - SHA-256 payload integrity;
@@ -246,7 +287,7 @@ The current implementation can test:
 - explicit rejection of unintegrated real training and alignment backends;
 - Ollama list, inspect and generation boundaries through mocks.
 
-Run the test suite locally:
+Run the lightweight protocol/runtime test environment locally:
 
 ```bash
 python3 -m venv .venv
@@ -255,26 +296,34 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-At this development snapshot, the suite contains 45 tests. A successful run ends
-with:
+`tests/test_gld_importer.py` contains 18 importer tests and does not require opening
+the real PDF. It imports PyMuPDF lazily, so the ordinary unit-test path remains
+independent of the offline PDF tooling.
 
-```text
-Ran 45 tests
+The previous repository-wide suite contained 45 tests; the importer adds 18 more,
+so the expected total after Step 1B is 63. Confirm the final count with the command
+above before recording it as a verified project result.
 
-OK
-```
+The default test suite does not import PyTorch or Transformers. PyMuPDF is required
+only when the real PDF importer or layout-inspection utility is executed.
 
-The default test suite does not import PyTorch, Transformers or PyMuPDF.
+## Offline GLD dataset tooling
 
-## Offline PDF inspection tooling
+The GLD tools are separate from the LegalFedLLM runtime.
 
-The optional layout-inspection utility is separate from the LegalFedLLM runtime.
-
-Install it with:
+Install the optional tooling dependencies:
 
 ```bash
 python -m pip install -r requirements-tools.txt
 ```
+
+The tools expect the local source PDF at:
+
+```text
+data/private/greek_law_digest.pdf
+```
+
+### Layout inspection
 
 Run:
 
@@ -282,24 +331,95 @@ Run:
 python tools/datasets/inspect_gld_layout.py
 ```
 
-By default, it expects a local source PDF at:
+The inspection utility records page text, positions, fonts, sizes, anchor matches,
+the source-file SHA-256 and the PyMuPDF version under `data/derived/`. It exists to
+inspect the PDF layout and extraction assumptions.
 
-```text
-data/private/greek_law_digest.pdf
+### Deterministic GLD importer
+
+Run:
+
+```bash
+python tools/datasets/gld_pdf_to_jsonl.py
 ```
 
-and creates a local inspection report under:
+The importer is intentionally tied to the thesis copy of **Greek Law Digest
+(2012)**:
 
 ```text
-data/derived/
+expected PDF pages: 713
+expected SHA-256:
+9673ee7c86b3d582e2c08e1cdd2b84f144981f31a1fe50d4216e82c5b350b77d
 ```
 
-The `data/` directory is ignored by Git. Copyrighted source material and generated
-derivatives must not be committed without the required permission.
+A different PDF is rejected even if it has the same title.
 
-The utility records page text, positions, fonts, sizes, anchor matches, the exact
-source-file SHA-256 and the PyMuPDF version. It is an inspection tool, not yet the
-final GLD-to-canonical-JSONL importer.
+The initial corpus scope is fixed to complete source sections beginning at printed
+page 34 and ending before `COVERED BONDS` on printed page 306. Therefore the last
+included printed page is 305. The scope contains 46 listed sections: 44
+Q&A-structured sections are imported and two prose-structured sections are
+explicitly excluded because LegalFedLLM does not synthesize questions that are not
+present in the source.
+
+The importer:
+
+- identifies top-level GLD questions from the reviewed source formatting;
+- ignores blue captions that do not end in a question mark;
+- retains valid black-bold questions;
+- keeps ordinary question-mark sentences inside answers when they are not
+  top-level question blocks;
+- joins wrapped question lines;
+- removes reviewed running headers, footers and contributing-firm profile matter;
+- groups dependent follow-up Q&A pairs before D^P/D^V splitting;
+- preserves original source wording and order when grouping;
+- keeps source-question ordinals in sample IDs rather than renumbering after
+  grouping;
+- uses approved GLD subsection headings to disambiguate otherwise identical
+  prompts;
+- records reviewed follow-up overrides;
+- audits the final canonical corpus for duplicate prompts, remaining firm/profile
+  text and out-of-scope samples;
+- preserves source answers that consist only of an internal cross-reference and
+  records them as warnings rather than inventing replacement text.
+
+If unresolved extraction issues or follow-up candidates remain, the run stops and
+writes:
+
+```text
+data/derived/gld2012/
+├── candidate_all.jsonl
+├── candidate_all.json
+└── review.json
+```
+
+It deliberately removes stale final corpus files in that state.
+
+A clean run writes:
+
+```text
+data/derived/gld2012/
+├── all.jsonl
+├── all.json
+├── reference.jsonl
+├── reference.json
+├── validation.jsonl
+├── validation.json
+├── identity.json
+└── review.json
+```
+
+`all.jsonl`, `reference.jsonl` and `validation.jsonl` are the authoritative
+machine-readable datasets. The corresponding `.json` files are generated
+human-readable copies.
+
+`review.json` records source identity, extraction-tool version, scope, per-section
+boundaries, warnings, reviewed follow-up decisions and the corpus audit.
+`identity.json` records the source identity plus semantic identities/hashes for the
+full corpus, D^P and D^V.
+
+The `data/` directory is ignored by Git. The GLD source PDF and generated
+derivatives remain local and must not be committed unless the required
+distribution permission is obtained.
 
 PyMuPDF is an optional offline dependency and is dual-licensed under the GNU
 AGPL-3.0 or an Artifex commercial licence. See `THIRD_PARTY_NOTICES.md`.
@@ -358,8 +478,8 @@ reachable only through the private Compose network.
 Set both paths for the Coordinator:
 
 ```env
-COORDINATOR_REFERENCE_DATASET_PATH=data/derived/reference.jsonl
-COORDINATOR_VALIDATION_DATASET_PATH=data/derived/validation.jsonl
+COORDINATOR_REFERENCE_DATASET_PATH=data/derived/gld2012/reference.jsonl
+COORDINATOR_VALIDATION_DATASET_PATH=data/derived/gld2012/validation.jsonl
 ```
 
 Both variables must be configured together. Startup fails if only one is set or
@@ -639,8 +759,6 @@ See `shared/fedmkt_core/UPSTREAM.md`, `shared/fedmkt_core/LICENSE`, and
 
 The repository does not yet perform:
 
-- GLD-specific chapter, section and Q&A import into canonical JSONL;
-- construction, manual inspection and freezing of the first real GLD corpus;
 - real private LoRA training;
 - teacher-forced model inference on D^P;
 - real top-k logit and CE-loss extraction;
@@ -655,6 +773,12 @@ The repository does not yet perform:
 - a graphical Windows application;
 - automatic export of accepted PEFT adapters into Ollama.
 
+The GLD-specific deterministic importer is implemented, but generated GLD content
+is intentionally not committed to the public repository. Until the authoritative
+local Step 1B.2 run is completed and its clean `review.json` and `identity.json`
+values are recorded, the project should not claim a final frozen thesis corpus
+identity.
+
 The current D^P/D^V transfer and verification boundary is real, but the Host and
 Client still generate deterministic mock knowledge rather than model-derived
 knowledge.
@@ -664,31 +788,32 @@ basic deterministic gate, not the final Safe-FedLLM-inspired detector.
 
 ## Next implementation milestones
 
-### Complete the first source-specific corpus
+### Finish the Step 1 corpus freeze
 
-The generic reference-dataset infrastructure is implemented. The remaining
-dataset-preparation work is:
+The generic dataset boundary and the GLD importer are implemented. The remaining
+Step 1 freeze procedure is operational rather than architectural:
 
 ```text
-inspect GLD layout
+run the pinned GLD importer locally
         ↓
-define deterministic chapter, section and Q&A rules
+require review.json status == clean
         ↓
-implement the GLD-to-canonical-JSONL importer
+require zero unresolved follow-up candidates
         ↓
-generate complete sections up to the selected boundary
+require corpus_audit status == clean
         ↓
-inspect output against the source PDF
+inspect representative records and section boundaries
         ↓
-fix importer rules rather than hand-editing output
+record all/reference/validation identities from identity.json
         ↓
-freeze dataset version and hashes
+record the verified repository-wide test result
+        ↓
+Step 1 complete
 ```
 
-The GLD source and derivatives remain local unless distribution permission is
-obtained.
+Generated GLD source data remains local and Git-ignored.
 
-### Scalable Knowledge Package artifacts
+### Step 2 — Scalable Knowledge Package artifacts
 
 The current protocol keeps deterministic numerical arrays directly in signed
 JSON. Before real-model scale, large tensors should move behind a signed metadata
@@ -696,7 +821,7 @@ envelope and a constrained binary artifact such as `safetensors` or strictly
 validated NumPy `.npz`. Arbitrary pickle/PyTorch object deserialization from
 Clients must not be accepted.
 
-### First real Client model
+### Step 3 — First real Client model
 
 Connect one small Client runtime using pinned Transformers/tokenizer revisions and
 PEFT LoRA:
@@ -707,26 +832,40 @@ private Client examples
     → real D^P inference
     → top-k token/logit extraction
     → real cross-entropy losses
-    → signed Client Knowledge Package
+    → signed real Client Knowledge Package
 ```
 
-### FedMKT parity, Host distillation and reverse distillation
+### Step 4 — FedMKT parity and token alignment
 
-After one Client can generate real knowledge:
+Connect and verify the extracted FedMKT components:
 
 ```text
-mock identity alignment
-    → FATE-derived Client↔Host token/vocabulary alignment
-
-protocol-level DualMinCE
-    → parity checks against the extracted FedMKT implementation
-
-mock Host candidate
-    → FedMKTTrainer Host LoRA distillation + D^V validation
-
-mock Client sync
-    → Host-to-Client alignment + selective reverse distillation
+Client-to-Host alignment
+Host-to-Client alignment
+vocabulary mapping
+DataCollatorForFedMKT
+FedMKTTrainer behavior
+DualMinCE parity
 ```
+
+### Step 5 — Real Host distillation
+
+Replace the mock Host candidate path with real baseline inference, selective
+FedMKT LoRA distillation, D^V validation and real adapter promotion or rollback.
+
+### Step 6 — Real reverse Client distillation
+
+Verify the real Host Knowledge Package, align Host outputs into the Client token
+space, select samples where the Host CE is lower and distil those targets into the
+Client-specific LoRA.
+
+### Step 7 — Complete heterogeneous-model round
+
+Run multiple real Clients against a heterogeneous Host and measure execution
+time, VRAM/RAM, communication volume, selected teaching samples, validation
+behavior, adapter sizes and rollback behavior.
+
+The deterministic mock backend should remain available throughout these stages.
 
 ## Current project claim
 
@@ -735,11 +874,19 @@ The repository currently demonstrates:
 - a working protocol-first control plane for FedMKT-style heterogeneous knowledge
   transfer;
 - a canonical and cryptographically identified shared-reference-dataset format;
+- a deterministic source-specific importer for the pinned 2012 Greek Law Digest
+  thesis copy;
+- reviewed handling of GLD question styles, dependent follow-ups and internal
+  subsection context;
+- corpus-level auditing before GLD D^P/D^V files are accepted;
 - Coordinator-owned D^P/D^V round snapshots;
 - authorized D^P delivery to selected Clients;
 - independent Client and Host dataset verification and caching;
 - deterministic mock bidirectional FedMKT message flow.
 
-It does **not** yet demonstrate a completed real-model FedMKT round, a frozen GLD
-corpus, formal differential privacy, a complete Safe-FedLLM defense, or
-production-ready deployment.
+It does **not** yet demonstrate a completed real-model FedMKT round, formal
+differential privacy, a complete Safe-FedLLM defense, or production-ready
+deployment.
+
+A final frozen GLD corpus should be claimed only after the authoritative local
+Step 1B.2 run is clean and its semantic identities/hashes are recorded.
