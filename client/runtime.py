@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Callable
 
-from shared.crypto import Ed25519Identity, sha256_hex
+from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
+from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.ollama import OllamaClient
 from shared.protocol import (
     DifferentialPrivacyReport,
@@ -132,11 +134,27 @@ class ClientRuntime:
 
     @staticmethod
     def _pending_package_path(round_id: str) -> str:
-        return f"knowledge_cache/pending/{round_id}.json"
+        return f"knowledge_cache/pending/{round_id}/package.json"
+
+    @staticmethod
+    def _pending_artifact_path(round_id: str) -> str:
+        return f"knowledge_cache/pending/{round_id}/knowledge.safetensors"
 
     @staticmethod
     def _accepted_package_path(round_id: str) -> str:
-        return f"knowledge_cache/accepted/{round_id}.json"
+        return f"knowledge_cache/accepted/{round_id}/package.json"
+
+    @staticmethod
+    def _accepted_artifact_path(round_id: str) -> str:
+        return f"knowledge_cache/accepted/{round_id}/knowledge.safetensors"
+
+    @staticmethod
+    def _host_package_path(round_id: str) -> str:
+        return f"knowledge_cache/host/{round_id}/package.json"
+
+    @staticmethod
+    def _host_artifact_path(round_id: str) -> str:
+        return f"knowledge_cache/host/{round_id}/knowledge.safetensors"
 
     @staticmethod
     def _pending_snapshot_path(round_id: str) -> str:
@@ -333,6 +351,41 @@ class ClientRuntime:
             ) from exc
 
 
+    def package_artifact_path(self, package: KnowledgePackage) -> Path:
+        round_id = package.round_id
+        candidates = (
+            (
+                self._pending_package_path(round_id),
+                self._pending_artifact_path(round_id),
+            ),
+            (
+                self._accepted_package_path(round_id),
+                self._accepted_artifact_path(round_id),
+            ),
+        )
+        for metadata_path, artifact_path in candidates:
+            if not self.store.exists(metadata_path):
+                continue
+            stored = KnowledgePackage.model_validate(
+                self.store.read_json(metadata_path)
+            )
+            if stored.package_hash != package.package_hash:
+                continue
+            path = self.store.path(artifact_path)
+            load_package_samples(
+                path,
+                stored,
+                maximum_bytes=stored.artifact.byte_size,
+            )
+            return path
+        raise ClientRuntimeError("Knowledge Package artifact is missing")
+
+    def incoming_host_artifact_path(self, round_id: str) -> Path:
+        return self.store.path(
+            f"knowledge_cache/incoming/{round_id}."
+            f"{secrets.token_hex(8)}.safetensors"
+        )
+
     def create_knowledge_package(
         self,
         manifest: RoundManifest,
@@ -356,8 +409,20 @@ class ClientRuntime:
             self.verify_cached_reference_dataset(manifest)
 
         accepted_path = self._accepted_package_path(manifest.round_id)
+        accepted_artifact_path = self._accepted_artifact_path(
+            manifest.round_id
+        )
 
-        if self.store.exists(accepted_path):
+        accepted_exists = (
+            self.store.exists(accepted_path),
+            self.store.exists(accepted_artifact_path),
+        )
+        if any(accepted_exists) and not all(accepted_exists):
+            raise ClientRuntimeError(
+                "accepted Knowledge Package cache is incomplete"
+            )
+
+        if all(accepted_exists):
             accepted = KnowledgePackage.model_validate(
                 self.store.read_json(accepted_path)
             )
@@ -368,11 +433,29 @@ class ClientRuntime:
                     "with another manifest"
                 )
 
+            load_package_samples(
+                self.store.path(accepted_artifact_path),
+                accepted,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+
             return accepted
 
         pending_path = self._pending_package_path(manifest.round_id)
+        pending_artifact_path = self._pending_artifact_path(
+            manifest.round_id
+        )
 
-        if self.store.exists(pending_path):
+        pending_exists = (
+            self.store.exists(pending_path),
+            self.store.exists(pending_artifact_path),
+        )
+        if any(pending_exists) and not all(pending_exists):
+            raise ClientRuntimeError(
+                "pending Knowledge Package cache is incomplete"
+            )
+
+        if all(pending_exists):
             pending = KnowledgePackage.model_validate(
                 self.store.read_json(pending_path)
             )
@@ -382,6 +465,12 @@ class ClientRuntime:
                     "a pending package already exists for this round "
                     "with another manifest"
                 )
+
+            load_package_samples(
+                self.store.path(pending_artifact_path),
+                pending,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
 
             return pending
 
@@ -395,41 +484,61 @@ class ClientRuntime:
             adapter_version=adapter_version,
         )
 
-        package = KnowledgePackage.create_signed(
-            identity=self.identity,
-            round_id=manifest.round_id,
-            manifest_hash=manifest.manifest_hash,
-            sender_id=self.client_id,
-            sender_role="client",
-            model_profile=self.model_profile,
-            adapter_version=adapter_version,
-            alignment_profile_id=(
-                f"{manifest.alignment.strategy}:"
-                f"{manifest.alignment.profile_version}"
-            ),
-            reference_dataset_id=manifest.reference_dataset_id,
-            reference_dataset_hash=manifest.reference_dataset_hash,
-            top_k=manifest.top_k,
-            samples=samples,
-            dp_report=DifferentialPrivacyReport(
-                enabled=manifest.dp_policy.required,
-                mechanism=(
-                    manifest.dp_policy.mechanism
-                    if manifest.dp_policy.required
-                    else "none"
+        try:
+            descriptor = write_knowledge_artifact(
+                self.store.path(pending_artifact_path),
+                samples,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            package = KnowledgePackage.create_signed(
+                identity=self.identity,
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                sender_id=self.client_id,
+                sender_role="client",
+                model_profile=self.model_profile,
+                adapter_version=adapter_version,
+                alignment_profile_id=(
+                    f"{manifest.alignment.strategy}:"
+                    f"{manifest.alignment.profile_version}"
                 ),
-                epsilon_spent=(
-                    float(os.getenv("CLIENT_MOCK_DP_EPSILON", "0.1"))
-                    if manifest.dp_policy.required
-                    else None
+                reference_dataset_id=manifest.reference_dataset_id,
+                reference_dataset_hash=manifest.reference_dataset_hash,
+                top_k=manifest.top_k,
+                sample_ids=[sample.sample_id for sample in samples],
+                artifact=descriptor,
+                dp_report=DifferentialPrivacyReport(
+                    enabled=manifest.dp_policy.required,
+                    mechanism=(
+                        manifest.dp_policy.mechanism
+                        if manifest.dp_policy.required
+                        else "none"
+                    ),
+                    epsilon_spent=(
+                        float(os.getenv("CLIENT_MOCK_DP_EPSILON", "0.1"))
+                        if manifest.dp_policy.required
+                        else None
+                    ),
+                    delta=(
+                        manifest.dp_policy.delta
+                        if manifest.dp_policy.required
+                        else None
+                    ),
                 ),
-                delta=(
-                    manifest.dp_policy.delta
-                    if manifest.dp_policy.required
-                    else None
-                ),
-            ),
-        )
+                created_at=utc_text(self.now_fn()),
+            )
+            metadata_size = len(
+                canonical_json_bytes(package.model_dump(mode="json"))
+            )
+            if metadata_size + descriptor.byte_size > (
+                manifest.maximum_knowledge_package_bytes
+            ):
+                raise ClientRuntimeError(
+                    "Knowledge Package exceeds the manifest size limit"
+                )
+        except Exception:
+            self.store.delete(pending_artifact_path)
+            raise
 
         snapshot = {
             "round_id": manifest.round_id,
@@ -439,19 +548,24 @@ class ClientRuntime:
             "adapter_version": adapter_version,
             "local_training_runs": int(state["local_training_runs"]),
             "state_hash": sha256_hex(state),
-            "package_hash": package.artifact_sha256,
+            "package_hash": package.package_hash,
             "created_at": utc_text(self.now_fn()),
         }
 
-        self.store.write_json_if_absent(
-            self._pending_snapshot_path(manifest.round_id),
-            snapshot,
-        )
-
-        self.store.write_json_if_absent(
-            pending_path,
-            package.model_dump(mode="json"),
-        )
+        try:
+            self.store.write_json_if_absent(
+                self._pending_snapshot_path(manifest.round_id),
+                snapshot,
+            )
+            self.store.write_json_if_absent(
+                pending_path,
+                package.model_dump(mode="json"),
+            )
+        except Exception:
+            self.store.delete(pending_path)
+            self.store.delete(pending_artifact_path)
+            self.store.delete(self._pending_snapshot_path(manifest.round_id))
+            raise
 
         return package
 
@@ -470,16 +584,20 @@ class ClientRuntime:
                 "submission receipt identity does not match the Client"
             )
 
-        if receipt.package_hash != package.artifact_sha256:
+        if receipt.package_hash != package.package_hash:
             raise ClientRuntimeError(
                 "submission receipt hash does not match the package"
             )
 
         pending_path = self._pending_package_path(manifest.round_id)
+        pending_artifact_path = self._pending_artifact_path(
+            manifest.round_id
+        )
         snapshot_path = self._pending_snapshot_path(manifest.round_id)
 
         if (
             not self.store.exists(pending_path)
+            or not self.store.exists(pending_artifact_path)
             or not self.store.exists(snapshot_path)
         ):
             raise ClientRuntimeError(
@@ -489,14 +607,19 @@ class ClientRuntime:
         pending = KnowledgePackage.model_validate(
             self.store.read_json(pending_path)
         )
+        load_package_samples(
+            self.store.path(pending_artifact_path),
+            pending,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
         snapshot = self.store.read_json(snapshot_path)
 
-        if pending.artifact_sha256 != package.artifact_sha256:
+        if pending.package_hash != package.package_hash:
             raise ClientRuntimeError(
                 "pending package changed before acceptance"
             )
 
-        if snapshot.get("package_hash") != package.artifact_sha256:
+        if snapshot.get("package_hash") != package.package_hash:
             raise ClientRuntimeError(
                 "pending adapter snapshot is bound to another package"
             )
@@ -509,24 +632,50 @@ class ClientRuntime:
         accepted_package_path = self._accepted_package_path(
             manifest.round_id
         )
+        accepted_artifact_path = self._accepted_artifact_path(
+            manifest.round_id
+        )
         accepted_snapshot_path = self._accepted_snapshot_path(
             manifest.round_id
         )
 
-        if self.store.exists(accepted_package_path):
+        accepted_exists = (
+            self.store.exists(accepted_package_path),
+            self.store.exists(accepted_artifact_path),
+        )
+        if any(accepted_exists) and not all(accepted_exists):
+            raise ClientRuntimeError(
+                "accepted Knowledge Package cache is incomplete"
+            )
+
+        if all(accepted_exists):
             existing = KnowledgePackage.model_validate(
                 self.store.read_json(accepted_package_path)
             )
 
-            if existing.artifact_sha256 != package.artifact_sha256:
+            if existing.package_hash != package.package_hash:
                 raise ClientRuntimeError(
                     "accepted package is immutable and cannot be replaced"
                 )
-        else:
-            self.store.write_json_if_absent(
-                accepted_package_path,
-                package.model_dump(mode="json"),
+            load_package_samples(
+                self.store.path(accepted_artifact_path),
+                existing,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
             )
+        else:
+            try:
+                self.store.copy_file_if_absent(
+                    accepted_artifact_path,
+                    self.store.path(pending_artifact_path),
+                )
+                self.store.write_json_if_absent(
+                    accepted_package_path,
+                    package.model_dump(mode="json"),
+                )
+            except Exception:
+                if not self.store.exists(accepted_package_path):
+                    self.store.delete(accepted_artifact_path)
+                raise
 
         if self.store.exists(accepted_snapshot_path):
             existing_snapshot = self.store.read_json(
@@ -549,6 +698,7 @@ class ClientRuntime:
         )
 
         self.store.delete(pending_path)
+        self.store.delete(pending_artifact_path)
         self.store.delete(snapshot_path)
 
     def apply_host_knowledge(
@@ -556,6 +706,7 @@ class ClientRuntime:
         *,
         manifest: RoundManifest,
         host_package: KnowledgePackage,
+        host_artifact_path: str | Path,
         host_public_key: str,
         expected_host_id: str,
         accepted_host_adapter_version: int,
@@ -564,10 +715,12 @@ class ClientRuntime:
         round_id = manifest.round_id
 
         cache_path = self._accepted_package_path(round_id)
+        cache_artifact_path = self._accepted_artifact_path(round_id)
         snapshot_path = self._accepted_snapshot_path(round_id)
 
         if (
             not self.store.exists(cache_path)
+            or not self.store.exists(cache_artifact_path)
             or not self.store.exists(snapshot_path)
         ):
             raise ValueError(
@@ -577,9 +730,14 @@ class ClientRuntime:
         cached = KnowledgePackage.model_validate(
             self.store.read_json(cache_path)
         )
+        cached_samples = load_package_samples(
+            self.store.path(cache_artifact_path),
+            cached,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
         snapshot = self.store.read_json(snapshot_path)
 
-        if cached.artifact_sha256 != snapshot.get("package_hash"):
+        if cached.package_hash != snapshot.get("package_hash"):
             raise ValueError(
                 "accepted Client cache is not bound to its adapter snapshot"
             )
@@ -675,14 +833,20 @@ class ClientRuntime:
                 "Host package timestamp is outside the allowed skew"
             )
 
+        host_samples = load_package_samples(
+            host_artifact_path,
+            host_package,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+
         host_by_id = {
             sample.sample_id: sample
-            for sample in host_package.samples
+            for sample in host_samples
         }
 
         client_by_id = {
             sample.sample_id: sample
-            for sample in cached.samples
+            for sample in cached_samples
         }
 
         selected = [
@@ -707,6 +871,40 @@ class ClientRuntime:
             host_package.adapter_version
         )
         state["host_distillation_samples"] = selected
+
+        host_cache_package = self._host_package_path(round_id)
+        host_cache_artifact = self._host_artifact_path(round_id)
+        host_cache_exists = (
+            self.store.exists(host_cache_package),
+            self.store.exists(host_cache_artifact),
+        )
+        if any(host_cache_exists) and not all(host_cache_exists):
+            raise ValueError("Host Knowledge Package cache is incomplete")
+        if all(host_cache_exists):
+            existing = KnowledgePackage.model_validate(
+                self.store.read_json(host_cache_package)
+            )
+            if existing.package_hash != host_package.package_hash:
+                raise ValueError("Host Knowledge Package cache is immutable")
+            load_package_samples(
+                self.store.path(host_cache_artifact),
+                existing,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+        else:
+            try:
+                self.store.copy_file_if_absent(
+                    host_cache_artifact,
+                    host_artifact_path,
+                )
+                self.store.write_json_if_absent(
+                    host_cache_package,
+                    host_package.model_dump(mode="json"),
+                )
+            except Exception:
+                if not self.store.exists(host_cache_package):
+                    self.store.delete(host_cache_artifact)
+                raise
 
         self.store.write_json("state.json", state)
 

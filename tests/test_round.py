@@ -139,9 +139,22 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 / "rounds"
                 / round_id
                 / "submissions"
-                / "client-a.json"
+                / "client-a"
+                / "package.json"
             )
             self.assertNotIn(private_marker, submission_path.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "samples",
+                json.loads(submission_path.read_text(encoding="utf-8")),
+            )
+            artifact_path = submission_path.with_name(
+                "knowledge.safetensors"
+            )
+            self.assertTrue(artifact_path.is_file())
+            self.assertNotIn(
+                private_marker.encode("utf-8"),
+                artifact_path.read_bytes(),
+            )
 
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app_b),

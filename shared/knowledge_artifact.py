@@ -16,6 +16,7 @@ from shared.protocol import (
     KNOWLEDGE_ARTIFACT_FORMAT,
     KNOWLEDGE_ARTIFACT_SCHEMA_VERSION,
     KnowledgeArtifactDescriptor,
+    KnowledgePackage,
     KnowledgeSample,
 )
 
@@ -312,3 +313,17 @@ def load_knowledge_artifact(
             )
         )
     return samples
+
+
+def load_package_samples(
+    path: str | Path,
+    package: KnowledgePackage,
+    *,
+    maximum_bytes: int,
+) -> list[KnowledgeSample]:
+    return load_knowledge_artifact(
+        path,
+        package.artifact,
+        package.sample_ids,
+        maximum_bytes=maximum_bytes,
+    )

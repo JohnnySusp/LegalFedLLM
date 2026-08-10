@@ -18,7 +18,11 @@ from host.runtime import (
     HostRuntimeError,
     default_host_profile,
 )
-from shared.crypto import sha256_hex
+from shared.crypto import canonical_json_bytes, sha256_hex
+from shared.knowledge_artifact import (
+    load_package_samples,
+    serialize_knowledge_artifact,
+)
 from shared.protocol import (
     DifferentialPrivacyPolicy,
     DifferentialPrivacyReport,
@@ -137,9 +141,14 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(first.status_code, 201, first.text)
 
                 accepted_path = runtime_a.store.path(
-                    f"knowledge_cache/accepted/{manifest.round_id}.json"
+                    f"knowledge_cache/accepted/{manifest.round_id}/package.json"
                 )
                 before = accepted_path.read_bytes()
+                accepted_artifact_path = runtime_a.store.path(
+                    f"knowledge_cache/accepted/{manifest.round_id}/"
+                    "knowledge.safetensors"
+                )
+                artifact_before = accepted_artifact_path.read_bytes()
 
                 trained = await client.post(
                     "/v1/local-train",
@@ -151,18 +160,22 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(duplicate.status_code, 409, duplicate.text)
             self.assertEqual(before, accepted_path.read_bytes())
+            self.assertEqual(
+                artifact_before,
+                accepted_artifact_path.read_bytes(),
+            )
 
             snapshot = runtime_a.store.read_json(
                 f"adapter_snapshots/accepted/{manifest.round_id}.json"
             )
             accepted = KnowledgePackage.model_validate(
                 runtime_a.store.read_json(
-                    f"knowledge_cache/accepted/{manifest.round_id}.json"
+                    f"knowledge_cache/accepted/{manifest.round_id}/package.json"
                 )
             )
 
             self.assertEqual(snapshot["adapter_version"], accepted.adapter_version)
-            self.assertEqual(snapshot["package_hash"], accepted.artifact_sha256)
+            self.assertEqual(snapshot["package_hash"], accepted.package_hash)
 
     async def test_rejected_package_cannot_be_replayed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -180,9 +193,14 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
             )
 
             original = runtime_a.create_knowledge_package(manifest)
+            original_samples = load_package_samples(
+                runtime_a.package_artifact_path(original),
+                original,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
             bad_samples = []
 
-            for sample in original.samples:
+            for sample in original_samples:
                 logits = [row[:] for row in sample.top_k_logits]
                 logits[0][0] = 101.0
                 bad_samples.append(
@@ -196,6 +214,9 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
 
+            bad_artifact, bad_descriptor = serialize_knowledge_artifact(
+                bad_samples
+            )
             bad = KnowledgePackage.create_signed(
                 identity=runtime_a.identity,
                 round_id=manifest.round_id,
@@ -208,23 +229,40 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                 reference_dataset_id=manifest.reference_dataset_id,
                 reference_dataset_hash=manifest.reference_dataset_hash,
                 top_k=manifest.top_k,
-                samples=bad_samples,
+                sample_ids=[sample.sample_id for sample in bad_samples],
+                artifact=bad_descriptor,
             )
 
             payload = bad.model_dump(mode="json")
             endpoint = f"/v1/rounds/{manifest.round_id}/knowledge"
+            files = [
+                (
+                    "package",
+                    (
+                        "package.json",
+                        canonical_json_bytes(payload),
+                        "application/json",
+                    ),
+                ),
+                (
+                    "artifact",
+                    (
+                        "knowledge.safetensors",
+                        bad_artifact,
+                        "application/octet-stream",
+                    ),
+                ),
+            ]
 
             first = await stack.coordinator_request(
                 "POST",
                 endpoint,
-                content=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                files=files,
             )
             second = await stack.coordinator_request(
                 "POST",
                 endpoint,
-                content=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                files=files,
             )
 
             self.assertEqual(first.status_code, 409, first.text)
@@ -232,8 +270,96 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("replayed Knowledge Package hash", second.text)
 
             state = stack.coordinator_service.get_state(manifest.round_id)
-            self.assertIn(bad.artifact_sha256, state.seen_package_hashes)
+            self.assertIn(bad.package_hash, state.seen_package_hashes)
             self.assertIn(bad.nonce, state.seen_nonces)
+
+    async def test_pending_retry_reuses_exact_package_and_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            runtime, app = stack.client("client-a")
+            await self._register(stack, app)
+            manifest = await self._create_round(
+                stack,
+                selected_client_ids=["client-a"],
+                quorum=1,
+            )
+
+            first = runtime.create_knowledge_package(manifest)
+            artifact_path = runtime.package_artifact_path(first)
+            artifact_before = artifact_path.read_bytes()
+            second = runtime.create_knowledge_package(manifest)
+
+            self.assertEqual(first, second)
+            self.assertEqual(artifact_before, artifact_path.read_bytes())
+            pending = runtime.store.path(
+                f"knowledge_cache/pending/{manifest.round_id}"
+            )
+            self.assertEqual(
+                sorted(path.name for path in pending.iterdir()),
+                ["knowledge.safetensors", "package.json"],
+            )
+
+    async def test_artifact_tampering_breaks_signed_package_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            runtime, app = stack.client("client-a")
+            await self._register(stack, app)
+            manifest = await self._create_round(
+                stack,
+                selected_client_ids=["client-a"],
+                quorum=1,
+            )
+            package = runtime.create_knowledge_package(manifest)
+            artifact = bytearray(
+                runtime.package_artifact_path(package).read_bytes()
+            )
+            artifact[-1] ^= 1
+            response = await stack.coordinator_request(
+                "POST",
+                f"/v1/rounds/{manifest.round_id}/knowledge",
+                files=[
+                    (
+                        "package",
+                        (
+                            "package.json",
+                            canonical_json_bytes(
+                                package.model_dump(mode="json")
+                            ),
+                            "application/json",
+                        ),
+                    ),
+                    (
+                        "artifact",
+                        (
+                            "knowledge.safetensors",
+                            bytes(artifact),
+                            "application/octet-stream",
+                        ),
+                    ),
+                ],
+            )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("SHA-256", response.text)
+            state = stack.coordinator_service.get_state(manifest.round_id)
+            self.assertIn(package.package_hash, state.seen_package_hashes)
+            submission = (
+                Path(directory)
+                / "coordinator"
+                / "rounds"
+                / manifest.round_id
+                / "submissions"
+                / "client-a"
+            )
+            self.assertFalse(submission.exists())
+            incoming = (
+                Path(directory)
+                / "coordinator"
+                / "rounds"
+                / manifest.round_id
+                / "incoming"
+            )
+            self.assertEqual(list(incoming.glob("*.safetensors")), [])
 
     async def test_client_rejects_wrong_host_version(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -261,7 +387,8 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                 / "coordinator"
                 / "rounds"
                 / manifest.round_id
-                / "host_knowledge.json"
+                / "host_knowledge"
+                / "package.json"
             )
             original = KnowledgePackage.model_validate(
                 json.loads(host_path.read_text(encoding="utf-8"))
@@ -279,7 +406,8 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                 reference_dataset_id=original.reference_dataset_id,
                 reference_dataset_hash=original.reference_dataset_hash,
                 top_k=original.top_k,
-                samples=original.samples,
+                sample_ids=original.sample_ids,
+                artifact=original.artifact,
             )
 
             host_path.write_text(

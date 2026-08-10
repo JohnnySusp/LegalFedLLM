@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from shared.crypto import Ed25519Identity, sha256_hex
+from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
+from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.ollama import OllamaClient
 from shared.protocol import (
     DistillationJob,
@@ -141,13 +142,30 @@ class HostRuntime:
             self.verify_cached_reference_data(manifest)
         
         cache_name = (
-            "baseline_knowledge.json"
+            "baseline_knowledge"
             if enforce_manifest_parent
-            else "host_knowledge.json"
+            else "host_knowledge"
         )
-        cache_path = f"rounds/{manifest.round_id}/{cache_name}"
-        if self.store.exists(cache_path):
-            return KnowledgePackage.model_validate(self.store.read_json(cache_path))
+        cache_path = f"rounds/{manifest.round_id}/{cache_name}/package.json"
+        artifact_path = (
+            f"rounds/{manifest.round_id}/{cache_name}/knowledge.safetensors"
+        )
+        cached = (
+            self.store.exists(cache_path),
+            self.store.exists(artifact_path),
+        )
+        if any(cached) and not all(cached):
+            raise HostRuntimeError("Host Knowledge Package cache is incomplete")
+        if all(cached):
+            package = KnowledgePackage.model_validate(
+                self.store.read_json(cache_path)
+            )
+            load_package_samples(
+                self.store.path(artifact_path),
+                package,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            return package
 
         active = self.active_adapter()
         if enforce_manifest_parent and manifest.current_host_adapter_version != active["version"]:
@@ -158,24 +176,74 @@ class HostRuntime:
             role="host",
             adapter_version=active["version"],
         )
-        package = KnowledgePackage.create_signed(
-            identity=self.identity,
-            round_id=manifest.round_id,
-            manifest_hash=manifest.manifest_hash,
-            sender_id=self.host_id,
-            sender_role="host",
-            model_profile=self.model_profile,
-            adapter_version=active["version"],
-            alignment_profile_id=(
-                f"{manifest.alignment.strategy}:{manifest.alignment.profile_version}"
-            ),
-            reference_dataset_id=manifest.reference_dataset_id,
-            reference_dataset_hash=manifest.reference_dataset_hash,
-            top_k=manifest.top_k,
-            samples=samples,
-        )
-        self.store.write_json(cache_path, package.model_dump(mode="json"))
+        try:
+            descriptor = write_knowledge_artifact(
+                self.store.path(artifact_path),
+                samples,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            package = KnowledgePackage.create_signed(
+                identity=self.identity,
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                sender_id=self.host_id,
+                sender_role="host",
+                model_profile=self.model_profile,
+                adapter_version=active["version"],
+                alignment_profile_id=(
+                    f"{manifest.alignment.strategy}:"
+                    f"{manifest.alignment.profile_version}"
+                ),
+                reference_dataset_id=manifest.reference_dataset_id,
+                reference_dataset_hash=manifest.reference_dataset_hash,
+                top_k=manifest.top_k,
+                sample_ids=[sample.sample_id for sample in samples],
+                artifact=descriptor,
+            )
+            metadata_size = len(
+                canonical_json_bytes(package.model_dump(mode="json"))
+            )
+            if metadata_size + descriptor.byte_size > (
+                manifest.maximum_knowledge_package_bytes
+            ):
+                raise HostRuntimeError(
+                    "Host Knowledge Package exceeds the manifest size limit"
+                )
+            self.store.write_json_if_absent(
+                cache_path,
+                package.model_dump(mode="json"),
+            )
+        except Exception:
+            self.store.delete(cache_path)
+            self.store.delete(artifact_path)
+            raise
         return package
+
+    def knowledge_artifact_path(
+        self,
+        manifest: RoundManifest,
+        *,
+        enforce_manifest_parent: bool,
+    ) -> Path:
+        cache_name = (
+            "baseline_knowledge"
+            if enforce_manifest_parent
+            else "host_knowledge"
+        )
+        package_path = f"rounds/{manifest.round_id}/{cache_name}/package.json"
+        artifact_path = (
+            f"rounds/{manifest.round_id}/{cache_name}/knowledge.safetensors"
+        )
+        package = KnowledgePackage.model_validate(
+            self.store.read_json(package_path)
+        )
+        path = self.store.path(artifact_path)
+        load_package_samples(
+            path,
+            package,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+        return path
 
     def distill(self, job: DistillationJob) -> DistillationResult:
         manifest = job.manifest

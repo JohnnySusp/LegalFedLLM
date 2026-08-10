@@ -15,7 +15,7 @@ from shared.reference_dataset import (
 )
 
 PROTOCOL_VERSION = "1.0"
-PACKAGE_SCHEMA_VERSION = "1.0"
+PACKAGE_SCHEMA_VERSION = "2.0"
 KNOWLEDGE_ARTIFACT_FORMAT = "safetensors"
 KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -217,7 +217,7 @@ class RoundManifest(ContractModel):
     host_model_profile: ModelProfile
     reference_dataset_id: str
     reference_dataset_hash: str = Field(pattern=HASH_PATTERN)
-    sample_ids: list[str]
+    sample_ids: list[str] = Field(min_length=1, max_length=100_000)
     prompt_template: str
     prompt_template_hash: str = Field(pattern=HASH_PATTERN)
     label_format: str
@@ -399,7 +399,7 @@ class KnowledgeArtifactDescriptor(ContractModel):
 
 class KnowledgePackage(ContractModel):
     protocol_version: Literal["1.0"] = PROTOCOL_VERSION
-    package_schema_version: Literal["1.0"] = PACKAGE_SCHEMA_VERSION
+    package_schema_version: Literal["2.0"] = PACKAGE_SCHEMA_VERSION
     round_id: str
     manifest_hash: str = Field(pattern=HASH_PATTERN)
     sender_id: str = Field(min_length=1, max_length=128)
@@ -409,15 +409,15 @@ class KnowledgePackage(ContractModel):
     alignment_profile_id: str = Field(min_length=1, max_length=256)
     reference_dataset_id: str
     reference_dataset_hash: str = Field(pattern=HASH_PATTERN)
-    sample_ids: list[str]
+    sample_ids: list[str] = Field(min_length=1, max_length=100_000)
     top_k: int = Field(ge=1)
-    samples: list[KnowledgeSample] = Field(min_length=1)
+    artifact: KnowledgeArtifactDescriptor
     dp_report: DifferentialPrivacyReport = Field(
         default_factory=DifferentialPrivacyReport
     )
     nonce: str = Field(min_length=16, max_length=256)
     created_at: str
-    artifact_sha256: str = Field(pattern=HASH_PATTERN)
+    package_hash: str = Field(pattern=HASH_PATTERN)
     signature: str = Field(pattern=BASE64_PATTERN)
 
     @model_validator(mode="after")
@@ -425,35 +425,26 @@ class KnowledgePackage(ContractModel):
         parse_utc(self.created_at)
         if self.model_profile.role != self.sender_role:
             raise ValueError("model profile role does not match sender_role")
-        if self.sample_ids != [sample.sample_id for sample in self.samples]:
-            raise ValueError("sample_ids must match package sample order")
-        if (
-            self.sample_ids is not None
-            and len(self.sample_ids) != len(set(self.sample_ids))
-        ):
+        if not self.sample_ids:
+            raise ValueError("sample_ids must not be empty")
+        if any(not sample_id.strip() for sample_id in self.sample_ids):
+            raise ValueError("sample_ids must contain non-blank values")
+        if len(self.sample_ids) != len(set(self.sample_ids)):
             raise ValueError("sample_ids must be unique")
-
-        metadata_fields = (
-            self.reference_dataset_id is not None,
-            self.reference_dataset_hash is not None,
-            self.sample_ids is not None,
-        )
-
-        if any(metadata_fields) and not all(metadata_fields):
-            raise ValueError(
-                "reference dataset ID, hash and sample IDs "
-                "must be provided together"
-            )
-        if any(sample.top_k != self.top_k for sample in self.samples):
-            raise ValueError("sample top-k width does not match package top_k")
+        if self.artifact.sample_count != len(self.sample_ids):
+            raise ValueError("artifact sample count does not match sample_ids")
+        if self.artifact.sample_ids_sha256 != sha256_hex(self.sample_ids):
+            raise ValueError("artifact is bound to another sample order")
+        if self.artifact.top_k != self.top_k:
+            raise ValueError("artifact top-k width does not match package top_k")
         expected = sha256_hex(self.hash_payload())
-        if self.artifact_sha256 != expected:
-            raise ValueError("artifact_sha256 does not match the package payload")
+        if self.package_hash != expected:
+            raise ValueError("package_hash does not match the package payload")
         return self
 
     def hash_payload(self) -> dict[str, Any]:
         return self.model_dump(
-            mode="json", exclude={"artifact_sha256", "signature"}
+            mode="json", exclude={"package_hash", "signature"}
         )
 
     def signed_payload(self) -> dict[str, Any]:
@@ -477,7 +468,8 @@ class KnowledgePackage(ContractModel):
         reference_dataset_id: str,
         reference_dataset_hash: str,
         top_k: int,
-        samples: list[KnowledgeSample],
+        sample_ids: list[str],
+        artifact: KnowledgeArtifactDescriptor,
         dp_report: DifferentialPrivacyReport | None = None,
         nonce: str | None = None,
         created_at: str | None = None,
@@ -494,17 +486,17 @@ class KnowledgePackage(ContractModel):
             "alignment_profile_id": alignment_profile_id,
             "reference_dataset_id": reference_dataset_id,
             "reference_dataset_hash": reference_dataset_hash,
-            "sample_ids": [sample.sample_id for sample in samples],
+            "sample_ids": sample_ids,
             "top_k": top_k,
-            "samples": [sample.model_dump(mode="json") for sample in samples],
+            "artifact": artifact.model_dump(mode="json"),
             "dp_report": (dp_report or DifferentialPrivacyReport()).model_dump(
                 mode="json"
             ),
             "nonce": nonce or secrets.token_urlsafe(24),
             "created_at": created_at or utc_text(),
         }
-        artifact_sha256 = sha256_hex(payload)
-        signed_payload = {**payload, "artifact_sha256": artifact_sha256}
+        package_hash = sha256_hex(payload)
+        signed_payload = {**payload, "package_hash": package_hash}
         return cls(**signed_payload, signature=identity.sign_json(signed_payload))
 
 

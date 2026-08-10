@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from host.runtime import HostRuntime, HostRuntimeError
+from shared.knowledge_transport import knowledge_transfer_response
 from shared.protocol import (
     DistillationJob,
     DistillationResult,
@@ -105,23 +106,37 @@ def create_app(
 
     @app.post(
         "/internal/v1/reference-knowledge",
-        response_model=KnowledgePackage,
         dependencies=[Depends(require_internal_token)],
     )
-    async def reference_knowledge(manifest: RoundManifest) -> KnowledgePackage:
+    async def reference_knowledge(manifest: RoundManifest):
         try:
-            return host_runtime.generate_reference_knowledge(manifest)
+            package = host_runtime.generate_reference_knowledge(manifest)
+            return knowledge_transfer_response(
+                metadata=package,
+                artifact_path=host_runtime.knowledge_artifact_path(
+                    manifest,
+                    enforce_manifest_parent=True,
+                ),
+                metadata_part_name="package",
+            )
         except HostRuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/internal/v1/distill",
-        response_model=DistillationResult,
         dependencies=[Depends(require_internal_token)],
     )
-    async def distill(job: DistillationJob) -> DistillationResult:
+    async def distill(job: DistillationJob):
         try:
-            return host_runtime.distill(job)
+            result = host_runtime.distill(job)
+            return knowledge_transfer_response(
+                metadata=result,
+                artifact_path=host_runtime.knowledge_artifact_path(
+                    job.manifest,
+                    enforce_manifest_parent=False,
+                ),
+                metadata_part_name="result",
+            )
         except HostRuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

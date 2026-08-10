@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 
-from shared.protocol import KnowledgePackage, SafetyReport
+from shared.protocol import KnowledgePackage, KnowledgeSample, SafetyReport
 
 
 def inspect_knowledge_package(
     package: KnowledgePackage,
+    samples: list[KnowledgeSample],
     *,
     maximum_absolute_logit: float = 100.0,
     maximum_ce_loss: float = 1_000.0,
@@ -15,7 +16,10 @@ def inspect_knowledge_package(
     total_values = 0
     extreme_values = 0
 
-    for sample in package.samples:
+    if package.sample_ids != [sample.sample_id for sample in samples]:
+        reasons.append("loaded sample order differs from the Knowledge Package")
+
+    for sample in samples:
         if sample.ce_loss > maximum_ce_loss:
             reasons.append(f"sample {sample.sample_id} has an excessive CE loss")
         for row in sample.top_k_logits:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import secrets
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -12,11 +13,14 @@ from coordinator.reference_data import CoordinatorReferenceData
 
 from shared.crypto import Ed25519Identity
 from shared.fedmkt_core import dual_min_ce_select, inspect_knowledge_package
+from shared.knowledge_artifact import load_package_samples
+from shared.knowledge_transport import receive_knowledge_transfer
 from shared.protocol import (
     ClientRegistrationRequest,
     DistillationJob,
     DistillationResult,
     KnowledgePackage,
+    KnowledgeSample,
     RegistrationRecord,
     RoundCreateRequest,
     RoundManifest,
@@ -103,17 +107,69 @@ class HostGateway:
             payload
         )
 
-    async def reference_knowledge(self, manifest: RoundManifest) -> KnowledgePackage:
-        payload = await self._request(
+    async def _knowledge_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any],
+        artifact_path: str | Path,
+        metadata_part_name: str,
+        maximum_bytes: int,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+            transport=self.transport,
+            headers={"X-Internal-Token": self.internal_token},
+        ) as client:
+            async with client.stream(
+                method,
+                path,
+                json=json,
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise ConflictError(
+                        f"Host runtime returned {response.status_code}: "
+                        f"{response.text[:500]}"
+                    )
+                received = await receive_knowledge_transfer(
+                    content_type=response.headers.get("content-type", ""),
+                    chunks=response.aiter_bytes(),
+                    artifact_path=artifact_path,
+                    metadata_part_name=metadata_part_name,
+                    maximum_content_bytes=maximum_bytes,
+                )
+        return received.metadata
+
+    async def reference_knowledge(
+        self,
+        manifest: RoundManifest,
+        artifact_path: str | Path,
+    ) -> KnowledgePackage:
+        payload = await self._knowledge_request(
             "POST",
             "/internal/v1/reference-knowledge",
             json=manifest.model_dump(mode="json"),
+            artifact_path=artifact_path,
+            metadata_part_name="package",
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
         )
         return KnowledgePackage.model_validate(payload)
 
-    async def distill(self, job: DistillationJob) -> DistillationResult:
-        payload = await self._request(
-            "POST", "/internal/v1/distill", json=job.model_dump(mode="json")
+    async def distill(
+        self,
+        job: DistillationJob,
+        artifact_path: str | Path,
+    ) -> DistillationResult:
+        payload = await self._knowledge_request(
+            "POST",
+            "/internal/v1/distill",
+            json=job.model_dump(mode="json"),
+            artifact_path=artifact_path,
+            metadata_part_name="result",
+            maximum_bytes=job.manifest.maximum_knowledge_package_bytes,
         )
         return DistillationResult.model_validate(payload)
 
@@ -173,6 +229,53 @@ class CoordinatorService:
         )
 
         self._lock = asyncio.Lock()
+
+    def incoming_artifact_path(self, round_id: str, purpose: str) -> Path:
+        return self.store.path(
+            f"rounds/{round_id}/incoming/{purpose}."
+            f"{secrets.token_hex(8)}.safetensors"
+        )
+
+    def _persist_knowledge_package(
+        self,
+        *,
+        package_path: str,
+        artifact_path: str,
+        package: KnowledgePackage,
+        source_artifact: str | Path,
+        maximum_bytes: int,
+    ) -> None:
+        existing = (
+            self.store.exists(package_path),
+            self.store.exists(artifact_path),
+        )
+        if any(existing) and not all(existing):
+            raise ConflictError("persisted Knowledge Package is incomplete")
+        if all(existing):
+            stored = KnowledgePackage.model_validate(
+                self.store.read_json(package_path)
+            )
+            if stored.package_hash != package.package_hash:
+                raise ConflictError("persisted Knowledge Package is immutable")
+            load_package_samples(
+                self.store.path(artifact_path),
+                stored,
+                maximum_bytes=maximum_bytes,
+            )
+            return
+        try:
+            self.store.copy_file_if_absent(
+                artifact_path,
+                source_artifact,
+            )
+            self.store.write_json_if_absent(
+                package_path,
+                package.model_dump(mode="json"),
+            )
+        except Exception:
+            if not self.store.exists(package_path):
+                self.store.delete(artifact_path)
+            raise
 
     def require_registration_token(self, value: str | None) -> None:
         if value is None or not hmac.compare_digest(value, self.registration_token):
@@ -365,7 +468,10 @@ class CoordinatorService:
                 await self._process_sealed_round(manifest, state)
 
     async def submit_knowledge(
-        self, package: KnowledgePackage, raw_size: int
+        self,
+        package: KnowledgePackage,
+        artifact_path: str | Path,
+        content_size: int,
     ) -> SubmissionReceipt:
         async with self._lock:
             manifest = self.get_manifest(package.round_id)
@@ -378,7 +484,7 @@ class CoordinatorService:
                 state.updated_at = utc_text(self.now_fn())
                 self._write_state(state)
                 raise ConflictError(state.message)
-            if raw_size > manifest.maximum_knowledge_package_bytes:
+            if content_size > manifest.maximum_knowledge_package_bytes:
                 raise ConflictError("Knowledge Package exceeds the manifest size limit")
             if package.sender_role != "client":
                 raise ConflictError("only Client Knowledge Packages may be submitted")
@@ -407,7 +513,7 @@ class CoordinatorService:
                 raise ConflictError("model profile differs from Client registration")
             if not package.verify_signature(registration.public_key):
                 raise AuthenticationError("Client Knowledge Package signature is invalid")
-            if package.artifact_sha256 in state.seen_package_hashes:
+            if package.package_hash in state.seen_package_hashes:
                 raise ConflictError("replayed Knowledge Package hash")
 
             if package.nonce in state.seen_nonces:
@@ -417,12 +523,17 @@ class CoordinatorService:
             skew = abs((self.now_fn() - created).total_seconds())
             if skew > self.maximum_clock_skew_seconds:
                 raise ConflictError("Knowledge Package timestamp is outside the allowed skew")
-            state.seen_package_hashes.append(package.artifact_sha256)
+            state.seen_package_hashes.append(package.package_hash)
             state.seen_nonces.append(package.nonce)
             state.updated_at = utc_text(self.now_fn())
             self._write_state(state)
             try:
                 self._verify_dp(manifest, package)
+                samples = load_package_samples(
+                    artifact_path,
+                    package,
+                    maximum_bytes=manifest.maximum_knowledge_package_bytes,
+                )
             except CoordinatorError as exc:
                 self._record_package_rejection(
                     state,
@@ -430,7 +541,14 @@ class CoordinatorService:
                     [str(exc)],
                 )
                 raise
-            safety = inspect_knowledge_package(package)
+            except (OSError, ValueError) as exc:
+                self._record_package_rejection(
+                    state,
+                    package,
+                    [str(exc)],
+                )
+                raise ConflictError(str(exc)) from exc
+            safety = inspect_knowledge_package(package, samples)
             self.store.write_json(
                 f"rounds/{manifest.round_id}/safety/{package.sender_id}.json",
                 safety.model_dump(mode="json"),
@@ -445,13 +563,22 @@ class CoordinatorService:
                     "Knowledge Package failed the safety probe"
                 )
 
-            self.store.write_json(
-                f"rounds/{manifest.round_id}/submissions/{package.sender_id}.json",
-                package.model_dump(mode="json"),
+            self._persist_knowledge_package(
+                package_path=(
+                    f"rounds/{manifest.round_id}/submissions/"
+                    f"{package.sender_id}/package.json"
+                ),
+                artifact_path=(
+                    f"rounds/{manifest.round_id}/submissions/"
+                    f"{package.sender_id}/knowledge.safetensors"
+                ),
+                package=package,
+                source_artifact=artifact_path,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
             )
             state.accepted_client_ids.append(package.sender_id)
             state.used_nonces.append(package.nonce)
-            state.submission_hashes.append(package.artifact_sha256)
+            state.submission_hashes.append(package.package_hash)
             state.updated_at = utc_text(self.now_fn())
             state.message = "package accepted; waiting for trusted quorum"
             self._write_state(state)
@@ -460,7 +587,8 @@ class CoordinatorService:
                 {
                     "round_id": manifest.round_id,
                     "client_id": package.sender_id,
-                    "hash": package.artifact_sha256,
+                    "package_hash": package.package_hash,
+                    "artifact_sha256": package.artifact.sha256,
                 },
             )
 
@@ -476,7 +604,7 @@ class CoordinatorService:
             return SubmissionReceipt(
                 round_id=manifest.round_id,
                 client_id=package.sender_id,
-                package_hash=package.artifact_sha256,
+                package_hash=package.package_hash,
                 state=state.state,
                 accepted_count=len(state.accepted_client_ids),
                 quorum=manifest.trusted_client_quorum,
@@ -499,7 +627,8 @@ class CoordinatorService:
             {
                 "round_id": package.round_id,
                 "client_id": package.sender_id,
-                "hash": package.artifact_sha256,
+                "package_hash": package.package_hash,
+                "artifact_sha256": package.artifact.sha256,
                 "nonce": package.nonce,
                 "reasons": reasons,
             },
@@ -556,9 +685,10 @@ class CoordinatorService:
         *,
         manifest: RoundManifest,
         package: KnowledgePackage,
+        artifact_path: str | Path,
         host_identity: ServiceIdentity,
         expected_adapter_version: int,
-    ) -> None:
+    ) -> list[KnowledgeSample]:
         if host_identity.model_profile is None:
             raise ConflictError(
                 "Host identity is missing its model profile"
@@ -650,6 +780,17 @@ class CoordinatorService:
                 "Host package timestamp is outside the allowed skew"
             )
 
+        try:
+            return load_package_samples(
+                artifact_path,
+                package,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+        except (OSError, ValueError) as exc:
+            raise ConflictError(
+                f"Host Knowledge Package artifact is invalid: {exc}"
+            ) from exc
+
     async def _process_sealed_round(
         self, manifest: RoundManifest, state: RoundState
     ) -> None:
@@ -659,6 +800,7 @@ class CoordinatorService:
         state.message = "constructing the validated Host distillation dataset"
         state.updated_at = utc_text(self.now_fn())
         self._write_state(state)
+        incoming_paths: list[Path] = []
         try:
             host_identity = await self._host_identity(refresh=True)
 
@@ -693,25 +835,57 @@ class CoordinatorService:
                         "Host loaded a different reference dataset"
                     )
 
-            baseline = await self.host.reference_knowledge(manifest)
+            baseline_artifact = self.incoming_artifact_path(
+                manifest.round_id,
+                "host-baseline",
+            )
+            incoming_paths.append(baseline_artifact)
+            baseline = await self.host.reference_knowledge(
+                manifest,
+                baseline_artifact,
+            )
 
-            self._verify_host_package(
+            baseline_samples = self._verify_host_package(
                 manifest=manifest,
                 package=baseline,
+                artifact_path=baseline_artifact,
                 host_identity=host_identity,
                 expected_adapter_version=(
                     manifest.current_host_adapter_version
                 ),
             )
 
-            packages = [
-                KnowledgePackage.model_validate(
+            self._persist_knowledge_package(
+                package_path=(
+                    f"rounds/{manifest.round_id}/host_baseline/package.json"
+                ),
+                artifact_path=(
+                    f"rounds/{manifest.round_id}/host_baseline/"
+                    "knowledge.safetensors"
+                ),
+                package=baseline,
+                source_artifact=baseline_artifact,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+
+            packages: list[KnowledgePackage] = []
+            client_samples: dict[str, list[KnowledgeSample]] = {}
+            for client_id in state.sealed_client_ids:
+                package = KnowledgePackage.model_validate(
                     self.store.read_json(
-                        f"rounds/{manifest.round_id}/submissions/{client_id}.json"
+                        f"rounds/{manifest.round_id}/submissions/"
+                        f"{client_id}/package.json"
                     )
                 )
-                for client_id in state.sealed_client_ids
-            ]
+                packages.append(package)
+                client_samples[client_id] = load_package_samples(
+                    self.store.path(
+                        f"rounds/{manifest.round_id}/submissions/"
+                        f"{client_id}/knowledge.safetensors"
+                    ),
+                    package,
+                    maximum_bytes=manifest.maximum_knowledge_package_bytes,
+                )
             reports = {
                 client_id: SafetyReport.model_validate(
                     self.store.read_json(
@@ -722,18 +896,23 @@ class CoordinatorService:
             }
             dataset = dual_min_ce_select(
                 host_package=baseline,
+                host_samples=baseline_samples,
                 client_packages=packages,
+                client_samples=client_samples,
                 safety_reports=reports,
             )
             self.store.write_json(
                 f"rounds/{manifest.round_id}/validated_distillation_dataset.json",
                 dataset.model_dump(mode="json"),
             )
+            host_artifact = self.incoming_artifact_path(
+                manifest.round_id,
+                "host-result",
+            )
+            incoming_paths.append(host_artifact)
             result = await self.host.distill(
-                DistillationJob(
-                    manifest=manifest,
-                    dataset=dataset,
-                )
+                DistillationJob(manifest=manifest, dataset=dataset),
+                host_artifact,
             )
 
             if result.round_id != manifest.round_id:
@@ -779,16 +958,17 @@ class CoordinatorService:
             self._verify_host_package(
                 manifest=manifest,
                 package=host_package,
+                artifact_path=host_artifact,
                 host_identity=host_identity,
                 expected_adapter_version=result.accepted_adapter_version,
             )
 
             if (
-                host_package.artifact_sha256
+                host_package.package_hash
                 not in state.host_package_hashes
             ):
                 state.host_package_hashes.append(
-                    host_package.artifact_sha256
+                    host_package.package_hash
                 )
 
             if host_package.nonce not in state.host_nonces:
@@ -797,9 +977,17 @@ class CoordinatorService:
                 f"rounds/{manifest.round_id}/distillation_result.json",
                 result.model_dump(mode="json"),
             )
-            self.store.write_json(
-                f"rounds/{manifest.round_id}/host_knowledge.json",
-                host_package.model_dump(mode="json"),
+            self._persist_knowledge_package(
+                package_path=(
+                    f"rounds/{manifest.round_id}/host_knowledge/package.json"
+                ),
+                artifact_path=(
+                    f"rounds/{manifest.round_id}/host_knowledge/"
+                    "knowledge.safetensors"
+                ),
+                package=host_package,
+                source_artifact=host_artifact,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
             )
             state.state = "COMPLETED"
             state.host_adapter_after = result.accepted_adapter_version
@@ -829,15 +1017,33 @@ class CoordinatorService:
                 "round_aborted", {"round_id": manifest.round_id, "reason": str(exc)}
             )
             raise
+        finally:
+            for path in incoming_paths:
+                path.unlink(missing_ok=True)
 
-    def get_host_knowledge(self, round_id: str) -> KnowledgePackage:
+    def get_host_knowledge(self, round_id: str) -> tuple[KnowledgePackage, Path]:
         state = self.get_state(round_id)
         if state.state != "COMPLETED":
             raise ConflictError("Host Knowledge Package is not available yet")
-        path = f"rounds/{round_id}/host_knowledge.json"
-        if not self.store.exists(path):
+        package_path = f"rounds/{round_id}/host_knowledge/package.json"
+        artifact_path = (
+            f"rounds/{round_id}/host_knowledge/knowledge.safetensors"
+        )
+        if not self.store.exists(package_path) or not self.store.exists(
+            artifact_path
+        ):
             raise NotFoundError("Host Knowledge Package was not published")
-        return KnowledgePackage.model_validate(self.store.read_json(path))
+        package = KnowledgePackage.model_validate(
+            self.store.read_json(package_path)
+        )
+        path = self.store.path(artifact_path)
+        manifest = self.get_manifest(round_id)
+        load_package_samples(
+            path,
+            package,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+        return package, path
 
     def _write_state(self, state: RoundState) -> None:
         self.store.write_json(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -58,6 +59,30 @@ class JsonFileStore:
             temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
             temporary.write_text(payload + "\n", encoding="utf-8")
             temporary.replace(target)
+        return target
+
+    def copy_file_if_absent(
+        self,
+        relative: str | Path,
+        source: str | Path,
+    ) -> Path:
+        target = self.path(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        with self._lock:
+            if target.exists():
+                raise FileExistsError(str(target))
+            try:
+                with Path(source).open("rb") as source_handle:
+                    with temporary.open("xb") as target_handle:
+                        shutil.copyfileobj(
+                            source_handle,
+                            target_handle,
+                            length=1024 * 1024,
+                        )
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
         return target
 
     def delete(self, relative: str | Path, *, missing_ok: bool = True) -> None:

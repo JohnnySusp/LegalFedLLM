@@ -11,6 +11,9 @@ See `shared/fedmkt_core/LICENSE` and `shared/fedmkt_core/UPSTREAM.md`.
 The scalable Knowledge Artifact boundary uses NumPy under the BSD 3-Clause
 License and `safetensors` under the Apache License 2.0.
 
+Multipart Knowledge Package transport uses `python-multipart` under the
+Apache License 2.0.
+
 ## Optional dataset tooling
 
 The offline dataset-preparation utilities under `tools/datasets/` may use

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
+from shared.knowledge_artifact import serialize_knowledge_artifact
 from shared.protocol import (
     AlignmentConfig,
     LoraProfile,
@@ -67,6 +68,7 @@ class ProtocolSecurityTests(unittest.TestCase):
                 role="client",
                 adapter_version=0,
             )
+            _, descriptor = serialize_knowledge_artifact(samples)
             package = KnowledgePackage.create_signed(
                 identity=client,
                 round_id=manifest.round_id,
@@ -79,12 +81,15 @@ class ProtocolSecurityTests(unittest.TestCase):
                 reference_dataset_id=manifest.reference_dataset_id,
                 reference_dataset_hash=manifest.reference_dataset_hash,
                 top_k=manifest.top_k,
-                samples=samples,
+                sample_ids=[sample.sample_id for sample in samples],
+                artifact=descriptor,
             )
             self.assertTrue(package.verify_signature(client.public_key_b64))
+            self.assertEqual(package.package_schema_version, "2.0")
+            self.assertEqual(package.artifact, descriptor)
 
             tampered = package.model_dump(mode="json")
-            tampered["samples"][0]["top_k_logits"][0][0] += 1.0
+            tampered["artifact"]["sha256"] = sha256_hex(b"tampered")
             with self.assertRaises(ValidationError):
                 KnowledgePackage.model_validate(tampered)
 

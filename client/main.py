@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -9,6 +10,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from client.runtime import ClientRuntime, ClientRuntimeError
+from shared.crypto import canonical_json_bytes
+from shared.knowledge_transport import receive_knowledge_transfer
 from shared.ollama import OllamaError
 from shared.protocol import (
     ClientRegistrationRequest,
@@ -140,25 +143,85 @@ class CoordinatorGateway:
 
         return response.content
 
-    async def submit(self, package: KnowledgePackage) -> SubmissionReceipt:
-        payload = await self._request(
-            "POST",
-            f"/v1/rounds/{package.round_id}/knowledge",
-            json=package.model_dump(mode="json"),
-        )
-        return SubmissionReceipt.model_validate(payload)
+    async def submit(
+        self,
+        package: KnowledgePackage,
+        artifact_path: str | Path,
+    ) -> SubmissionReceipt:
+        with Path(artifact_path).open("rb") as artifact:
+            files = [
+                (
+                    "package",
+                    (
+                        "package.json",
+                        canonical_json_bytes(package.model_dump(mode="json")),
+                        "application/json",
+                    ),
+                ),
+                (
+                    "artifact",
+                    (
+                        "knowledge.safetensors",
+                        artifact,
+                        "application/octet-stream",
+                    ),
+                ),
+            ]
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+                transport=self.transport,
+            ) as client:
+                response = await client.post(
+                    f"/v1/rounds/{package.round_id}/knowledge",
+                    files=files,
+                )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=(
+                    f"Coordinator returned {response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
+        return SubmissionReceipt.model_validate(response.json())
 
     async def status(self, round_id: str) -> RoundState:
         return RoundState.model_validate(
             await self._request("GET", f"/v1/rounds/{round_id}/status")
         )
 
-    async def host_knowledge(self, round_id: str) -> KnowledgePackage:
-        return KnowledgePackage.model_validate(
-            await self._request(
+    async def host_knowledge(
+        self,
+        round_id: str,
+        artifact_path: str | Path,
+        maximum_bytes: int,
+    ) -> KnowledgePackage:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+            transport=self.transport,
+        ) as client:
+            async with client.stream(
                 "GET", f"/v1/rounds/{round_id}/host-knowledge"
-            )
-        )
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=(
+                            f"Coordinator returned {response.status_code}: "
+                            f"{response.text[:500]}"
+                        ),
+                    )
+                received = await receive_knowledge_transfer(
+                    content_type=response.headers.get("content-type", ""),
+                    chunks=response.aiter_bytes(),
+                    artifact_path=artifact_path,
+                    metadata_part_name="package",
+                    maximum_content_bytes=maximum_bytes,
+                )
+        return KnowledgePackage.model_validate(received.metadata)
 
 
 def runtime_from_environment() -> ClientRuntime:
@@ -277,7 +340,10 @@ def create_app(
 
             package = client_runtime.create_knowledge_package(manifest)
 
-            receipt = await coordinator.submit(package)
+            receipt = await coordinator.submit(
+                package,
+                client_runtime.package_artifact_path(package),
+            )
 
             client_runtime.commit_knowledge_submission(
                 manifest=manifest,
@@ -326,12 +392,20 @@ def create_app(
                 detail="Host identity or accepted adapter version is missing",
             )
 
-        package = await coordinator.host_knowledge(round_id)
+        incoming_artifact = client_runtime.incoming_host_artifact_path(
+            round_id
+        )
 
         try:
+            package = await coordinator.host_knowledge(
+                round_id,
+                incoming_artifact,
+                manifest.maximum_knowledge_package_bytes,
+            )
             return client_runtime.apply_host_knowledge(
                 manifest=manifest,
                 host_package=package,
+                host_artifact_path=incoming_artifact,
                 host_public_key=identity.host_public_key,
                 expected_host_id=identity.host_service_id,
                 accepted_host_adapter_version=(
@@ -345,6 +419,8 @@ def create_app(
                 status_code=409,
                 detail=str(exc),
             ) from exc
+        finally:
+            incoming_artifact.unlink(missing_ok=True)
 
     @app.post("/v1/generate")
     async def generate(request: GenerateRequest) -> dict[str, Any]:

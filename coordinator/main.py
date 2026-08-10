@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from contextlib import asynccontextmanager, suppress
 
@@ -10,6 +9,12 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from coordinator.service import CoordinatorError, CoordinatorService, HostGateway
+from shared.knowledge_transport import (
+    KnowledgeTransportError,
+    KnowledgeTransportTooLarge,
+    knowledge_transfer_response,
+    receive_knowledge_transfer,
+)
 from shared.protocol import (
     ClientRegistrationRequest,
     KnowledgePackage,
@@ -169,23 +174,48 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
     )
     async def submit_knowledge(round_id: str, request: Request) -> SubmissionReceipt:
         manifest = coordinator.get_manifest(round_id)
-        raw = await request.body()
-        if len(raw) > manifest.maximum_knowledge_package_bytes:
-            raise HTTPException(status_code=413, detail="Knowledge Package is too large")
+        incoming = coordinator.incoming_artifact_path(
+            round_id,
+            "client-submission",
+        )
         try:
-            payload = json.loads(raw)
-            package = KnowledgePackage.model_validate(payload)
-        except (json.JSONDecodeError, ValidationError) as exc:
+            received = await receive_knowledge_transfer(
+                content_type=request.headers.get("content-type", ""),
+                chunks=request.stream(),
+                artifact_path=incoming,
+                metadata_part_name="package",
+                maximum_content_bytes=(
+                    manifest.maximum_knowledge_package_bytes
+                ),
+            )
+            package = KnowledgePackage.model_validate(
+                received.metadata
+            )
+        except KnowledgeTransportTooLarge as exc:
+            incoming.unlink(missing_ok=True)
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except (KnowledgeTransportError, ValidationError) as exc:
+            incoming.unlink(missing_ok=True)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if package.round_id != round_id:
-            raise HTTPException(status_code=409, detail="round ID path mismatch")
-        return await coordinator.submit_knowledge(package, len(raw))
+        try:
+            if package.round_id != round_id:
+                raise HTTPException(status_code=409, detail="round ID path mismatch")
+            return await coordinator.submit_knowledge(
+                package,
+                received.artifact_path,
+                received.content_size,
+            )
+        finally:
+            incoming.unlink(missing_ok=True)
 
-    @app.get(
-        "/v1/rounds/{round_id}/host-knowledge", response_model=KnowledgePackage
-    )
-    async def host_knowledge(round_id: str) -> KnowledgePackage:
-        return coordinator.get_host_knowledge(round_id)
+    @app.get("/v1/rounds/{round_id}/host-knowledge")
+    async def host_knowledge(round_id: str):
+        package, artifact_path = coordinator.get_host_knowledge(round_id)
+        return knowledge_transfer_response(
+            metadata=package,
+            artifact_path=artifact_path,
+            metadata_part_name="package",
+        )
 
     @app.post("/v1/generate")
     async def generate(request: GenerateRequest) -> dict:
