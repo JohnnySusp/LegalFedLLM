@@ -13,6 +13,8 @@ from client.runtime import (
     ClientRuntimeError,
     default_client_profile,
 )
+from coordinator.main import create_app as create_coordinator_app
+from coordinator.service import CoordinatorService
 from host.runtime import (
     HostRuntime,
     HostRuntimeError,
@@ -30,6 +32,7 @@ from shared.protocol import (
     KnowledgeSample,
     ModelProfile,
     RoundManifest,
+    utc_text,
 )
 from tests.test_round import Stack
 
@@ -259,19 +262,116 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
                 endpoint,
                 files=files,
             )
-            second = await stack.coordinator_request(
-                "POST",
-                endpoint,
-                files=files,
+            restarted = CoordinatorService(
+                data_dir=Path(directory) / "coordinator",
+                host_gateway=stack.host_gateway,
+                registration_token=stack.registration_token,
+                admin_token=stack.admin_token,
+                now_fn=stack.coordinator_service.now_fn,
             )
+            restarted_app = create_coordinator_app(restarted)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=restarted_app),
+                base_url="http://coordinator",
+            ) as coordinator:
+                second = await coordinator.post(endpoint, files=files)
+
+                nonce_replay = KnowledgePackage.create_signed(
+                    identity=runtime_a.identity,
+                    round_id=bad.round_id,
+                    manifest_hash=bad.manifest_hash,
+                    sender_id=bad.sender_id,
+                    sender_role=bad.sender_role,
+                    model_profile=bad.model_profile,
+                    adapter_version=bad.adapter_version + 1,
+                    alignment_profile_id=bad.alignment_profile_id,
+                    reference_dataset_id=bad.reference_dataset_id,
+                    reference_dataset_hash=bad.reference_dataset_hash,
+                    top_k=bad.top_k,
+                    sample_ids=bad.sample_ids,
+                    artifact=bad.artifact,
+                    nonce=bad.nonce,
+                    created_at=utc_text(restarted.now_fn()),
+                )
+                self.assertNotEqual(
+                    nonce_replay.package_hash,
+                    bad.package_hash,
+                )
+                nonce_files = [
+                    (
+                        "package",
+                        (
+                            "package.json",
+                            canonical_json_bytes(
+                                nonce_replay.model_dump(mode="json")
+                            ),
+                            "application/json",
+                        ),
+                    ),
+                    (
+                        "artifact",
+                        (
+                            "knowledge.safetensors",
+                            bad_artifact,
+                            "application/octet-stream",
+                        ),
+                    ),
+                ]
+                third = await coordinator.post(
+                    endpoint,
+                    files=nonce_files,
+                )
 
             self.assertEqual(first.status_code, 409, first.text)
             self.assertEqual(second.status_code, 409, second.text)
             self.assertIn("replayed Knowledge Package hash", second.text)
+            self.assertEqual(third.status_code, 409, third.text)
+            self.assertIn("replayed Knowledge Package nonce", third.text)
 
-            state = stack.coordinator_service.get_state(manifest.round_id)
+            state = restarted.get_state(manifest.round_id)
             self.assertIn(bad.package_hash, state.seen_package_hashes)
             self.assertIn(bad.nonce, state.seen_nonces)
+
+    async def test_dp_policy_rejects_a_report_over_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            _, app = stack.client("client-a")
+            await self._register(stack, app)
+            create = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "reference",
+                    "reference_dataset_hash": sha256_hex(b"reference"),
+                    "sample_ids": ["s1", "s2"],
+                    "prompt_template": "{question} {answer}",
+                    "top_k": 2,
+                    "dp_policy": {
+                        "required": True,
+                        "mechanism": "dp_sgd",
+                        "max_epsilon": 0.05,
+                        "delta": 1e-5,
+                    },
+                },
+            )
+            self.assertEqual(create.status_code, 201, create.text)
+            round_id = create.json()["round_id"]
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client-a",
+                headers=stack.client_headers,
+            ) as client:
+                response = await client.post("/v1/participate")
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("privacy budget", response.text)
+            state = stack.coordinator_service.get_state(round_id)
+            self.assertEqual(state.accepted_client_ids, [])
+            self.assertEqual(state.rejected_client_ids, ["client-a"])
 
     async def test_pending_retry_reuses_exact_package_and_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -424,6 +524,91 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(sync.status_code, 409, sync.text)
             self.assertIn("adapter version", sync.text)
+
+    async def test_client_rejects_host_signature_and_artifact_tampering(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            runtime, app = stack.client("client-a")
+            await self._register(stack, app)
+            manifest = await self._create_round(
+                stack,
+                selected_client_ids=["client-a"],
+                quorum=1,
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client-a",
+                headers=stack.client_headers,
+            ) as client:
+                participate = await client.post("/v1/participate")
+            self.assertEqual(participate.status_code, 201, participate.text)
+
+            host_package_path = (
+                Path(directory)
+                / "coordinator"
+                / "rounds"
+                / manifest.round_id
+                / "host_knowledge"
+                / "package.json"
+            )
+            host_artifact_path = host_package_path.with_name(
+                "knowledge.safetensors"
+            )
+            package = KnowledgePackage.model_validate(
+                json.loads(host_package_path.read_text(encoding="utf-8"))
+            )
+            status = stack.coordinator_service.get_state(manifest.round_id)
+            self.assertIsNotNone(status.host_adapter_after)
+            accepted_host_adapter_version = int(
+                status.host_adapter_after
+            )
+            invalid_signature = package.model_copy(
+                update={
+                    "signature": stack.coordinator_service.identity.sign_json(
+                        {}
+                    )
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "signature"):
+                runtime.apply_host_knowledge(
+                    manifest=manifest,
+                    host_package=invalid_signature,
+                    host_artifact_path=host_artifact_path,
+                    host_public_key=stack.host_runtime.identity.public_key_b64,
+                    expected_host_id=stack.host_runtime.host_id,
+                    accepted_host_adapter_version=(
+                        accepted_host_adapter_version
+                    ),
+                    adapter_promoted=bool(status.adapter_promoted),
+                )
+
+            tampered = bytearray(host_artifact_path.read_bytes())
+            tampered[-1] ^= 1
+            tampered_path = Path(directory) / "tampered-host.safetensors"
+            tampered_path.write_bytes(bytes(tampered))
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                runtime.apply_host_knowledge(
+                    manifest=manifest,
+                    host_package=package,
+                    host_artifact_path=tampered_path,
+                    host_public_key=stack.host_runtime.identity.public_key_b64,
+                    expected_host_id=stack.host_runtime.host_id,
+                    accepted_host_adapter_version=(
+                        accepted_host_adapter_version
+                    ),
+                    adapter_promoted=bool(status.adapter_promoted),
+                )
+
+            host_cache = (
+                Path(directory)
+                / "client-a"
+                / "knowledge_cache"
+                / "host"
+                / manifest.round_id
+            )
+            self.assertFalse(host_cache.exists())
 
 
 class StageZeroValidationTests(unittest.TestCase):

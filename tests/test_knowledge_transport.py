@@ -102,25 +102,110 @@ class KnowledgeTransportTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertFalse(target.exists())
 
-            duplicate = multipart_body(
-                [
+            duplicates = {
+                "package": [
+                    ("package", b"{}", "application/json"),
+                    ("package", b"{}", "application/json"),
+                    ("artifact", b"artifact", "application/octet-stream"),
+                ],
+                "artifact": [
                     ("package", b"{}", "application/json"),
                     ("artifact", b"first", "application/octet-stream"),
                     ("artifact", b"second", "application/octet-stream"),
+                ],
+            }
+            for part_name, parts in duplicates.items():
+                with self.subTest(part_name=part_name):
+                    duplicate = multipart_body(parts)
+                    with self.assertRaisesRegex(
+                        KnowledgeTransportError,
+                        "duplicate part",
+                    ):
+                        await receive_knowledge_transfer(
+                            content_type=content_type,
+                            chunks=chunks(duplicate),
+                            artifact_path=target,
+                            metadata_part_name="package",
+                            maximum_content_bytes=4096,
+                        )
+                    self.assertFalse(target.exists())
+
+    async def test_malformed_metadata_is_rejected_and_cleaned_up(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content_type = "multipart/form-data; boundary=test-boundary"
+            payloads = {
+                "invalid JSON": b'{"package_hash":',
+                "must be an object": b"[]",
+                "metadata is empty": b"",
+            }
+            for message, metadata in payloads.items():
+                with self.subTest(message=message):
+                    target = root / "malformed.safetensors"
+                    body = multipart_body(
+                        [
+                            ("package", metadata, "application/json"),
+                            (
+                                "artifact",
+                                b"artifact",
+                                "application/octet-stream",
+                            ),
+                        ]
+                    )
+                    with self.assertRaisesRegex(
+                        KnowledgeTransportError,
+                        message,
+                    ):
+                        await receive_knowledge_transfer(
+                            content_type=content_type,
+                            chunks=chunks(body),
+                            artifact_path=target,
+                            metadata_part_name="package",
+                            maximum_content_bytes=4096,
+                        )
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.iterdir()), [])
+
+    async def test_content_limit_accepts_exact_size_and_rejects_one_byte_over(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content_type = "multipart/form-data; boundary=test-boundary"
+            metadata = b'{"package_hash":"value"}'
+            artifact = b"artifact-bytes"
+            body = multipart_body(
+                [
+                    ("package", metadata, "application/json"),
+                    ("artifact", artifact, "application/octet-stream"),
                 ]
             )
-            with self.assertRaisesRegex(
-                KnowledgeTransportError,
-                "duplicate part",
-            ):
+            content_size = len(metadata) + len(artifact)
+            accepted = root / "accepted.safetensors"
+            received = await receive_knowledge_transfer(
+                content_type=content_type,
+                chunks=chunks(body),
+                artifact_path=accepted,
+                metadata_part_name="package",
+                maximum_content_bytes=content_size,
+            )
+            self.assertEqual(received.content_size, content_size)
+            self.assertEqual(accepted.read_bytes(), artifact)
+
+            rejected = root / "rejected.safetensors"
+            with self.assertRaises(KnowledgeTransportTooLarge):
                 await receive_knowledge_transfer(
                     content_type=content_type,
-                    chunks=chunks(duplicate),
-                    artifact_path=target,
+                    chunks=chunks(body),
+                    artifact_path=rejected,
                     metadata_part_name="package",
-                    maximum_content_bytes=4096,
+                    maximum_content_bytes=content_size - 1,
                 )
-            self.assertFalse(target.exists())
+            self.assertFalse(rejected.exists())
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["accepted.safetensors"],
+            )
 
     async def test_oversized_and_truncated_transfers_are_cleaned_up(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -142,6 +227,7 @@ class KnowledgeTransportTests(unittest.IsolatedAsyncioTestCase):
                     maximum_content_bytes=50,
                 )
             self.assertFalse(target.exists())
+            self.assertEqual(list(root.iterdir()), [])
 
             truncated = multipart_body(
                 [
@@ -162,6 +248,7 @@ class KnowledgeTransportTests(unittest.IsolatedAsyncioTestCase):
                     maximum_content_bytes=4096,
                 )
             self.assertFalse(target.exists())
+            self.assertEqual(list(root.iterdir()), [])
 
 
 if __name__ == "__main__":

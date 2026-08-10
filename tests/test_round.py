@@ -14,7 +14,13 @@ from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService, HostGateway
 from host.main import create_app as create_host_app
 from host.runtime import HostRuntime
-from shared.crypto import sha256_hex
+from shared.crypto import canonical_json_bytes, sha256_hex
+from shared.knowledge_artifact import load_package_samples
+from shared.protocol import (
+    KnowledgePackage,
+    RoundManifest,
+    ValidatedDistillationDataset,
+)
 
 
 class Stack:
@@ -117,7 +123,8 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             self.assertEqual(create.status_code, 201, create.text)
-            round_id = create.json()["round_id"]
+            manifest = RoundManifest.model_validate(create.json())
+            round_id = manifest.round_id
 
             private_marker = "confidential legal memo matter 42"
             async with httpx.AsyncClient(
@@ -187,8 +194,157 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sync.status_code, 200, sync.text)
             self.assertEqual(sync.json()["last_completed_round"], round_id)
 
+            coordinator_root = Path(directory) / "coordinator"
+            client_root = Path(directory) / "client-a"
+            coordinator_host_package = (
+                coordinator_root
+                / "rounds"
+                / round_id
+                / "host_knowledge"
+                / "package.json"
+            )
+            coordinator_host_artifact = coordinator_host_package.with_name(
+                "knowledge.safetensors"
+            )
+            client_host_package = (
+                client_root
+                / "knowledge_cache"
+                / "host"
+                / round_id
+                / "package.json"
+            )
+            client_host_artifact = client_host_package.with_name(
+                "knowledge.safetensors"
+            )
+            self.assertEqual(
+                json.loads(client_host_package.read_text(encoding="utf-8")),
+                json.loads(
+                    coordinator_host_package.read_text(encoding="utf-8")
+                ),
+            )
+            self.assertEqual(
+                client_host_artifact.read_bytes(),
+                coordinator_host_artifact.read_bytes(),
+            )
+            client_incoming = client_root / "knowledge_cache" / "incoming"
+            self.assertEqual(
+                list(client_incoming.glob("*.safetensors")),
+                [],
+            )
+
+            dataset = ValidatedDistillationDataset.model_validate(
+                json.loads(
+                    (
+                        coordinator_root
+                        / "rounds"
+                        / round_id
+                        / "validated_distillation_dataset.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            baseline_package_path = (
+                coordinator_root
+                / "rounds"
+                / round_id
+                / "host_baseline"
+                / "package.json"
+            )
+            baseline_package = KnowledgePackage.model_validate(
+                json.loads(baseline_package_path.read_text(encoding="utf-8"))
+            )
+            baseline_samples = {
+                sample.sample_id: sample
+                for sample in load_package_samples(
+                    baseline_package_path.with_name("knowledge.safetensors"),
+                    baseline_package,
+                    maximum_bytes=manifest.maximum_knowledge_package_bytes,
+                )
+            }
+            client_samples = {}
+            for client_id in ("client-a", "client-b"):
+                package_path = (
+                    coordinator_root
+                    / "rounds"
+                    / round_id
+                    / "submissions"
+                    / client_id
+                    / "package.json"
+                )
+                package = KnowledgePackage.model_validate(
+                    json.loads(package_path.read_text(encoding="utf-8"))
+                )
+                client_samples[client_id] = {
+                    sample.sample_id: sample
+                    for sample in load_package_samples(
+                        package_path.with_name("knowledge.safetensors"),
+                        package,
+                        maximum_bytes=(
+                            manifest.maximum_knowledge_package_bytes
+                        ),
+                    )
+                }
+            for selected in dataset.samples:
+                expected_loss, expected_client = min(
+                    (
+                        samples[selected.sample_id].ce_loss,
+                        client_id,
+                    )
+                    for client_id, samples in client_samples.items()
+                )
+                self.assertEqual(selected.teacher_id, expected_client)
+                self.assertEqual(selected.teacher_ce_loss, expected_loss)
+                self.assertEqual(
+                    selected.host_ce_loss,
+                    baseline_samples[selected.sample_id].ce_loss,
+                )
+                self.assertLess(
+                    selected.teacher_ce_loss,
+                    selected.host_ce_loss,
+                )
+
+            accepted_packages = {
+                client_id: KnowledgePackage.model_validate(
+                    json.loads(
+                        (
+                            coordinator_root
+                            / "rounds"
+                            / round_id
+                            / "submissions"
+                            / client_id
+                            / "package.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                )
+                for client_id in ("client-a", "client-b")
+            }
+            audit_events = [
+                json.loads(line)
+                for line in (
+                    coordinator_root / "audit" / "events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            accepted_events = {
+                event["client_id"]: event
+                for event in audit_events
+                if event["event"] == "package_accepted"
+                and event["round_id"] == round_id
+            }
+            self.assertEqual(
+                set(accepted_events),
+                {"client-a", "client-b"},
+            )
+            for client_id, package in accepted_packages.items():
+                self.assertEqual(
+                    accepted_events[client_id]["package_hash"],
+                    package.package_hash,
+                )
+                self.assertEqual(
+                    accepted_events[client_id]["artifact_sha256"],
+                    package.artifact.sha256,
+                )
+
             restarted = CoordinatorService(
-                data_dir=Path(directory) / "coordinator",
+                data_dir=coordinator_root,
                 host_gateway=stack.host_gateway,
                 registration_token=stack.registration_token,
                 admin_token=stack.admin_token,
@@ -196,11 +352,24 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             restarted_state = await restarted.round_status(round_id)
             self.assertEqual(restarted_state.state, "COMPLETED")
             self.assertEqual(restarted_state.host_adapter_after, 1)
+            restarted_package, restarted_artifact = (
+                restarted.get_host_knowledge(round_id)
+            )
+            self.assertEqual(
+                restarted_package.package_hash,
+                json.loads(
+                    coordinator_host_package.read_text(encoding="utf-8")
+                )["package_hash"],
+            )
+            self.assertEqual(
+                restarted_artifact.read_bytes(),
+                coordinator_host_artifact.read_bytes(),
+            )
 
     async def test_duplicate_client_submission_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stack = Stack(directory)
-            _, app_a = stack.client("client-a")
+            runtime_a, app_a = stack.client("client-a")
             _, app_b = stack.client("client-b")
             for app in (app_a, app_b):
                 async with httpx.AsyncClient(
@@ -233,6 +402,71 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 duplicate = await client.post("/v1/participate")
             self.assertEqual(first.status_code, 201, first.text)
             self.assertEqual(duplicate.status_code, 409, duplicate.text)
+
+            round_id = create.json()["round_id"]
+            stored_package_path = (
+                Path(directory)
+                / "coordinator"
+                / "rounds"
+                / round_id
+                / "submissions"
+                / "client-a"
+                / "package.json"
+            )
+            stored_artifact_path = stored_package_path.with_name(
+                "knowledge.safetensors"
+            )
+            package_before = stored_package_path.read_bytes()
+            artifact_before = stored_artifact_path.read_bytes()
+            original = KnowledgePackage.model_validate(
+                json.loads(package_before)
+            )
+            changed = KnowledgePackage.create_signed(
+                identity=runtime_a.identity,
+                round_id=original.round_id,
+                manifest_hash=original.manifest_hash,
+                sender_id=original.sender_id,
+                sender_role=original.sender_role,
+                model_profile=original.model_profile,
+                adapter_version=original.adapter_version + 1,
+                alignment_profile_id=original.alignment_profile_id,
+                reference_dataset_id=original.reference_dataset_id,
+                reference_dataset_hash=original.reference_dataset_hash,
+                top_k=original.top_k,
+                sample_ids=original.sample_ids,
+                artifact=original.artifact,
+            )
+            changed_response = await stack.coordinator_request(
+                "POST",
+                f"/v1/rounds/{round_id}/knowledge",
+                files=[
+                    (
+                        "package",
+                        (
+                            "package.json",
+                            canonical_json_bytes(
+                                changed.model_dump(mode="json")
+                            ),
+                            "application/json",
+                        ),
+                    ),
+                    (
+                        "artifact",
+                        (
+                            "knowledge.safetensors",
+                            artifact_before,
+                            "application/octet-stream",
+                        ),
+                    ),
+                ],
+            )
+            self.assertEqual(
+                changed_response.status_code,
+                409,
+                changed_response.text,
+            )
+            self.assertEqual(stored_package_path.read_bytes(), package_before)
+            self.assertEqual(stored_artifact_path.read_bytes(), artifact_before)
 
     async def test_deadline_without_quorum_skips_round(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
