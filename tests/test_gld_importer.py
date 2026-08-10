@@ -26,6 +26,7 @@ from tools.datasets.gld_pdf_to_jsonl import (
     is_running_matter,
     is_secondary_question_style,
     normalize_extracted_text,
+    normalize_source_question,
     selected_specs,
     verify_pinned_source,
 )
@@ -41,6 +42,8 @@ def line(
     style: str = "regular",
     y0: float = 100.0,
     y1: float = 110.0,
+    list_item: bool = False,
+    x0_override: float | None = None,
 ) -> LineRecord:
     if style == "primary":
         x0 = 42.5
@@ -61,6 +64,9 @@ def line(
         color = 0
         font = "MyriadPro-Regular"
 
+    if x0_override is not None:
+        x0 = x0_override
+
     return LineRecord(
         text=text,
         pdf_page=pdf_page,
@@ -76,6 +82,7 @@ def line(
         font_size=size,
         color=color,
         font_name=font,
+        list_item=list_item,
     )
 
 
@@ -120,6 +127,16 @@ MUTUAL_SPEC = SectionSpec(
     printed_start_page=167,
     firm="A.S. Papadimitriou & Partners Law Firm",
     anchor="MUTUAL FUNDS - PORTFOLIO INVESTMENT COMPANIES - VENTURE CAPITAL",
+)
+
+INFRASTRUCTURE_SPEC = SectionSpec(
+    chapter_number=4,
+    section_number=10,
+    chapter="BANKING SYSTEM - FINANCE - INVESTMENT",
+    section="FINANCING FOR THE IMPLEMENTATION OF INFRASTRUCTURE PROJECTS",
+    printed_start_page=236,
+    firm="Karatzas & Partners Law Firm",
+    anchor="FINANCING FOR THE IMPLEMENTATION OF INFRASTRUCTURE PROJECTS",
 )
 
 
@@ -491,6 +508,215 @@ class GldImporterTests(unittest.TestCase):
             normalize_extracted_text("cross\ufffeborder rules"),
             "cross-border rules",
         )
+
+    def test_pdf_bullets_are_ascii_and_keep_item_boundaries(self) -> None:
+        lines = [
+            line("What stages apply?", style="primary", block=1),
+            line("The stages are:", block=2),
+            line("\x83\x83 First stage.", block=3, index=0),
+            line("\x83\x83 Second stage.", block=3, index=1),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(result.blocking_issues, [])
+        self.assertEqual(
+            result.samples[0].gold_answer,
+            "The stages are:\n\n- First stage.\n\n- Second stage.",
+        )
+        self.assertNotIn("\x83", result.samples[0].gold_answer)
+
+    def test_labeled_list_marker_is_removed_without_losing_labels(self) -> None:
+        lines = [
+            line("What options apply?", style="primary", block=1),
+            line(
+                "a. \x07First option with a",
+                block=2,
+                index=0,
+                y0=120,
+                y1=130,
+            ),
+            line(
+                "continuation.",
+                block=2,
+                index=1,
+                y0=130,
+                y1=140,
+            ),
+            line(
+                "b. \x07Second option.",
+                block=2,
+                index=2,
+                y0=140,
+                y1=150,
+            ),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(
+            result.samples[0].gold_answer,
+            "a. First option with a continuation.\n\nb. Second option.",
+        )
+        self.assertNotIn("\x07", result.samples[0].gold_answer)
+
+    def test_list_item_continuation_across_blocks_stays_in_the_item(self) -> None:
+        lines = [
+            line("What stages apply?", style="primary", block=1),
+            line(
+                "\x83\x83 A stage with a wrapped",
+                block=2,
+                index=0,
+                y0=120,
+                y1=130,
+            ),
+            line(
+                "continuation line.",
+                block=3,
+                index=0,
+                y0=130,
+                y1=140,
+                x0_override=95.0,
+            ),
+            line(
+                "\x83\x83 Another stage.",
+                block=3,
+                index=1,
+                y0=141,
+                y1=151,
+            ),
+            line(
+                "A concluding paragraph.",
+                block=3,
+                index=2,
+                y0=152,
+                y1=162,
+            ),
+        ]
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(
+            result.samples[0].gold_answer,
+            (
+                "- A stage with a wrapped continuation line.\n\n"
+                "- Another stage.\n\nA concluding paragraph."
+            ),
+        )
+
+    def test_reviewed_line_wraps_join_words_and_keep_compounds(self) -> None:
+        lines = [
+            line("What rules apply?", style="primary", block=1),
+            line("The legisla-", block=2, index=0, y0=120, y1=130),
+            line("tion governs non-", block=2, index=1, y0=130, y1=140),
+            line("performance in medium-", block=2, index=2, y0=140, y1=150),
+            line("and long-term cases.", block=2, index=3, y0=150, y1=160),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(result.hyphenation_review_candidates, [])
+        self.assertEqual(
+            result.samples[0].gold_answer,
+            "The legislation governs non-performance in medium- and long-term cases.",
+        )
+
+    def test_unknown_line_wrap_is_reported_and_blocks_corpus_audit(self) -> None:
+        lines = [
+            line("What rules apply?", style="primary", block=1),
+            line("A flarbi-", block=2, index=0, y0=120, y1=130),
+            line("nated rule applies.", block=2, index=1, y0=130, y1=140),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+        audit = audit_corpus_samples(
+            result.samples,
+            result.hyphenation_review_candidates,
+        )
+
+        self.assertEqual(len(result.hyphenation_review_candidates), 1)
+        self.assertEqual(audit["status"], "needs_review")
+        self.assertEqual(len(audit["unresolved_hyphenation_candidates"]), 1)
+
+    def test_question_number_prefix_is_removed(self) -> None:
+        lines = [
+            line(
+                "2. How are the criminal courts structured?",
+                style="primary",
+                block=1,
+            ),
+            line("They have several levels.", block=2),
+        ]
+
+        result = build_section_samples(SPEC, lines)
+
+        self.assertEqual(
+            result.samples[0].question,
+            "How are the criminal courts structured?",
+        )
+
+    def test_reviewed_question_footnote_markers_are_removed(self) -> None:
+        cases = (
+            (3, "What projects are not eligible3?", "What projects are not eligible?"),
+            (9, "Which expenses are eligible5?", "Which expenses are eligible?"),
+            (
+                10,
+                "Which expenses do not qualify for aid under Law 3908/20117?",
+                "Which expenses do not qualify for aid under Law 3908/2011?",
+            ),
+        )
+
+        for ordinal, source, expected in cases:
+            with self.subTest(ordinal=ordinal):
+                self.assertEqual(
+                    normalize_source_question(
+                        INFRASTRUCTURE_SPEC,
+                        ordinal,
+                        source,
+                    ),
+                    expected,
+                )
+
+    def test_question_override_fails_if_the_pinned_text_changes(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_source_question(
+                INFRASTRUCTURE_SPEC,
+                3,
+                "What projects changed?",
+            )
+
+    def test_known_double_hyphen_extraction_error_is_corrected(self) -> None:
+        self.assertEqual(
+            normalize_extracted_text("the Mult--Member Court"),
+            "the Multi-Member Court",
+        )
+
+    def test_reviewed_inline_hyphen_spacing_is_corrected(self) -> None:
+        self.assertEqual(
+            normalize_extracted_text("requirements for non- listed SAs"),
+            "requirements for non-listed SAs",
+        )
+        self.assertEqual(
+            normalize_extracted_text("before the Notary- One Stop Shop"),
+            "before the Notary-One Stop Shop",
+        )
+
+    def test_corpus_audit_blocks_control_characters(self) -> None:
+        sample = build_section_samples(
+            SPEC,
+            [
+                line("What rules apply?", style="primary", block=1),
+                line("The answer.", block=2),
+            ],
+        ).samples[0]
+        noisy = sample.model_copy(
+            update={"gold_answer": "The answer contains \x07 noise."}
+        )
+
+        audit = audit_corpus_samples([noisy])
+
+        self.assertEqual(audit["status"], "needs_review")
+        self.assertEqual(len(audit["unexpected_control_characters"]), 1)
+        self.assertEqual(len(audit["unresolved_bullet_markers"]), 1)
 
     def test_scope_is_fixed_to_printed_pages_34_through_305(self) -> None:
         selected, sentinel = selected_specs(DEFAULT_LAST_INCLUDED_PRINTED_PAGE)

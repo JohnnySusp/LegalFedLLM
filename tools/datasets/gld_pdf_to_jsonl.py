@@ -6,7 +6,7 @@ import json
 import re
 import sys
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -56,6 +56,149 @@ PROFILE_MARKERS = (
 )
 
 EXTRACTION_HYPHENS = ("\ufffe", "\ufffd", "\u00ad")
+PDF_BULLET_MARKER = "\x83\x83"
+PDF_LIST_MARKER = "\x07"
+QUESTION_NUMBER_PREFIX_RE = re.compile(r"^\d+[.)]\s+")
+WRAPPED_WORD_END_RE = re.compile(r"([^\W\d_]+(?:[’'][^\W\d_]+)*)-$")
+WRAPPED_WORD_START_RE = re.compile(r"([^\W\d_]+(?:[’'][^\W\d_]+)*)")
+
+SOURCE_TEXT_REPLACEMENTS = {
+    "Mult--Member": "Multi-Member",
+    "non- listed": "non-listed",
+    "Notary- One": "Notary-One",
+}
+
+QUESTION_TEXT_OVERRIDES: dict[tuple[int, int, int], tuple[str, str]] = {
+    (4, 10, 3): (
+        "What projects are not eligible3?",
+        "What projects are not eligible?",
+    ),
+    (4, 10, 9): (
+        "Which expenses are eligible5?",
+        "Which expenses are eligible?",
+    ),
+    (4, 10, 10): (
+        "Which expenses do not qualify for aid under Law 3908/20117?",
+        "Which expenses do not qualify for aid under Law 3908/2011?",
+    ),
+}
+
+PRESERVE_HYPHEN_WORD_PAIRS = {
+    ("best", "performing"),
+    ("by", "case"),
+    ("cash", "out"),
+    ("civil", "law"),
+    ("co", "signature"),
+    ("common", "law"),
+    ("court", "connected"),
+    ("cross", "border"),
+    ("double", "entry"),
+    ("in", "law"),
+    ("inter", "ministerial"),
+    ("legally", "binding"),
+    ("multi", "member"),
+    ("non", "discrimination"),
+    ("non", "enforcement"),
+    ("non", "performance"),
+    ("non", "transferable"),
+    ("out", "of"),
+    ("outward", "oriented"),
+    ("pre", "emption"),
+    ("risk", "taking"),
+    ("set", "off"),
+    ("ship", "owner"),
+    ("single", "member"),
+    ("sole", "membered"),
+    ("spun", "off"),
+    ("statute", "barred"),
+    ("strict", "liability"),
+    ("time", "period"),
+    ("two", "year"),
+    ("winding", "up"),
+    ("written", "off"),
+    ("à", "vis"),
+}
+
+PRESERVE_DANGLING_HYPHEN_WORD_PAIRS = {
+    ("medium", "and"),
+}
+
+DEHYPHENATE_WORD_PAIRS = {
+    ("accept", "ing"),
+    ("addi", "tional"),
+    ("ade", "quate"),
+    ("advanta", "geous"),
+    ("au", "thority"),
+    ("audit", "ing"),
+    ("bid", "der’s"),
+    ("car", "ried"),
+    ("chair", "man"),
+    ("co", "ordinates"),
+    ("com", "binations"),
+    ("com", "mittee"),
+    ("com", "munication"),
+    ("con", "cerned"),
+    ("con", "tractor"),
+    ("con", "versions"),
+    ("conduct", "ed"),
+    ("connec", "tion"),
+    ("consid", "eration"),
+    ("considera", "tion"),
+    ("contrib", "uted"),
+    ("corpo", "ration"),
+    ("dec", "ade"),
+    ("devel", "opment"),
+    ("develop", "ment"),
+    ("direc", "tive"),
+    ("domi", "ciled"),
+    ("enter", "prises"),
+    ("es", "tablishment"),
+    ("es", "tate"),
+    ("estab", "lished"),
+    ("establish", "ment"),
+    ("fol", "lows"),
+    ("founda", "tion"),
+    ("free", "dom"),
+    ("here", "inbelow"),
+    ("in", "surance"),
+    ("insti", "tution"),
+    ("institu", "tions"),
+    ("inter", "ests"),
+    ("invita", "tion"),
+    ("leg", "islative"),
+    ("legisla", "tion"),
+    ("mem", "bers"),
+    ("merg", "ers"),
+    ("mort", "gages"),
+    ("pol", "icy"),
+    ("pre", "cautionary"),
+    ("privati", "zation"),
+    ("protec", "tion"),
+    ("provi", "sions"),
+    ("re", "duced"),
+    ("rec", "ommendations"),
+    ("regula", "tory"),
+    ("responsibil", "ity"),
+    ("restruc", "turing"),
+    ("share", "holder"),
+    ("sound", "ness"),
+    ("stan", "dardized"),
+    ("stan", "dards"),
+    ("su", "pervised"),
+    ("supervi", "sion"),
+    ("them", "selves"),
+    ("there", "of"),
+    ("trans", "actions"),
+    ("trans", "feror"),
+    ("trans", "ferred"),
+    ("transac", "tions"),
+    ("transforma", "tions"),
+    ("transpor", "tation"),
+    ("under", "takings"),
+    ("undertak", "ing"),
+    ("undertak", "ings"),
+    ("with", "out"),
+}
 SAMPLE_ID_RE = re.compile(
     r"^gld2012-ch(?P<chapter>\d{3})-s(?P<section>\d{3})-q(?P<question>\d{3})$"
 )
@@ -89,6 +232,7 @@ class LineRecord:
     font_size: float = 10.0
     color: int = 0
     font_name: str = ""
+    list_item: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,6 +267,7 @@ class SectionParseResult:
     groups: list[dict[str, Any]]
     review_candidates: list[dict[str, Any]]
     embedded_question_lines: list[dict[str, Any]]
+    hyphenation_review_candidates: list[dict[str, Any]]
 
 
 SECTION_SPECS: tuple[SectionSpec, ...] = (
@@ -196,8 +341,127 @@ def normalize_extracted_text(value: str) -> str:
     text = value
     for marker in EXTRACTION_HYPHENS:
         text = text.replace(marker, "-")
+    leading_list_marker = text.lstrip().startswith(PDF_LIST_MARKER)
+    text = text.replace(PDF_BULLET_MARKER, "- ")
+    if leading_list_marker:
+        text = re.sub(r"^\s*\x07\s*", "- ", text, count=1)
+    text = text.replace(PDF_LIST_MARKER, "")
+    for source, replacement in SOURCE_TEXT_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
     text = text.replace("\u2013", "-").replace("\u2014", "-")
     return " ".join(text.split())
+
+
+def has_pdf_list_marker(value: str) -> bool:
+    return PDF_BULLET_MARKER in value or PDF_LIST_MARKER in value
+
+
+def normalize_line_record(line: LineRecord) -> LineRecord:
+    return replace(
+        line,
+        text=normalize_extracted_text(line.text),
+        list_item=line.list_item or has_pdf_list_marker(line.text),
+    )
+
+
+def wrapped_word_pair(first: LineRecord, second: LineRecord) -> tuple[str, str] | None:
+    if first.pdf_page != second.pdf_page or second.list_item:
+        return None
+
+    same_block = (
+        first.block_index == second.block_index
+        and second.line_index == first.line_index + 1
+    )
+    next_block = (
+        first.block_index != second.block_index
+        and -2.0 <= second.y0 - first.y1 <= 3.0
+    )
+    if not same_block and not next_block:
+        return None
+
+    first_match = WRAPPED_WORD_END_RE.search(first.text)
+    second_match = WRAPPED_WORD_START_RE.match(second.text)
+    if first_match is None or second_match is None:
+        return None
+    return (
+        first_match.group(1).casefold(),
+        second_match.group(1).casefold(),
+    )
+
+
+def merge_wrapped_lines(
+    lines: Sequence[LineRecord],
+) -> tuple[list[LineRecord], list[dict[str, Any]]]:
+    merged: list[LineRecord] = []
+    review_candidates: list[dict[str, Any]] = []
+
+    for line in lines:
+        if not merged:
+            merged.append(line)
+            continue
+
+        previous = merged[-1]
+        pair = wrapped_word_pair(previous, line)
+        if pair is None or pair in PRESERVE_DANGLING_HYPHEN_WORD_PAIRS:
+            merged.append(line)
+            continue
+
+        if pair in DEHYPHENATE_WORD_PAIRS:
+            joined_text = previous.text[:-1] + line.text
+        elif pair in PRESERVE_HYPHEN_WORD_PAIRS:
+            joined_text = previous.text + line.text
+        else:
+            review_candidates.append(
+                {
+                    "printed_page": previous.printed_page,
+                    "pdf_page": previous.pdf_page,
+                    "first_block_index": previous.block_index,
+                    "first_line_index": previous.line_index,
+                    "second_block_index": line.block_index,
+                    "second_line_index": line.line_index,
+                    "word_pair": list(pair),
+                    "first_line": previous.text,
+                    "second_line": line.text,
+                }
+            )
+            merged.append(line)
+            continue
+
+        merged[-1] = replace(
+            previous,
+            text=joined_text,
+            block_index=line.block_index,
+            line_index=line.line_index,
+            x1=line.x1,
+            y1=line.y1,
+        )
+
+    return merged, review_candidates
+
+
+def normalize_source_question(
+    spec: SectionSpec,
+    source_ordinal: int,
+    question: str,
+) -> str:
+    normalized = QUESTION_NUMBER_PREFIX_RE.sub(
+        "",
+        normalize_extracted_text(question),
+        count=1,
+    )
+    override = QUESTION_TEXT_OVERRIDES.get(
+        (spec.chapter_number, spec.section_number, source_ordinal)
+    )
+    if override is None:
+        return normalized
+
+    expected, replacement = override
+    if normalized != expected:
+        raise ValueError(
+            f"question text override mismatch for {spec.section} question "
+            f"{source_ordinal}: {normalized!r}"
+        )
+    return replacement
 
 
 def normalize_match_text(value: str) -> str:
@@ -494,15 +758,45 @@ def join_answer_text(lines: Sequence[LineRecord]) -> str:
     paragraphs: list[str] = []
     current: list[str] = []
     current_key: tuple[int, int] | None = None
+    current_is_list_item = False
+    current_item_x0 = 0.0
+    current_item_key: tuple[int, int] | None = None
+    current_uses_dash_marker = False
+    previous_line: LineRecord | None = None
 
     for line in lines:
         key = (line.pdf_page, line.block_index)
         text = normalize_extracted_text(line.text)
-        if current_key is not None and key != current_key:
+        list_continuation = (
+            current_is_list_item
+            and previous_line is not None
+            and not line.list_item
+            and previous_line.pdf_page == line.pdf_page
+            and -2.0 <= line.y0 - previous_line.y1 <= 3.0
+            and (
+                line.x0 >= current_item_x0 + 5.0
+                or (
+                    not current_uses_dash_marker
+                    and key == current_item_key
+                )
+            )
+        )
+        if current and (
+            line.list_item
+            or (current_is_list_item and not list_continuation)
+            or (not current_is_list_item and key != current_key)
+        ):
             paragraphs.append(" ".join(current))
             current = []
+            current_is_list_item = False
+        if not current:
+            current_is_list_item = line.list_item
+            current_item_x0 = line.x0
+            current_item_key = key
+            current_uses_dash_marker = text.startswith("- ")
         current.append(text)
         current_key = key
+        previous_line = line
 
     if current:
         paragraphs.append(" ".join(current))
@@ -518,10 +812,16 @@ def build_section_samples(
     dataset_version: str = DEFAULT_DATASET_VERSION,
     document_id: str = DEFAULT_DOCUMENT_ID,
 ) -> SectionParseResult:
-    filtered = [line for line in lines if not is_running_matter(line, spec.firm)]
+    normalized_lines = [normalize_line_record(line) for line in lines]
+    filtered = [
+        line
+        for line in normalized_lines
+        if not is_running_matter(line, spec.firm)
+    ]
     profile_start = find_profile_start(filtered, spec.firm)
     content_end = profile_start if profile_start is not None else len(filtered)
     content = filtered[:content_end]
+    content, hyphenation_review_candidates = merge_wrapped_lines(content)
 
     warnings: list[str] = []
     blocking: list[str] = []
@@ -544,7 +844,15 @@ def build_section_samples(
     question_boundaries = question_groups(content)
     if not question_boundaries:
         blocking.append("no styled question boundaries were detected")
-        return SectionParseResult([], warnings, blocking, [], review_candidates, embedded_questions)
+        return SectionParseResult(
+            [],
+            warnings,
+            blocking,
+            [],
+            review_candidates,
+            embedded_questions,
+            hyphenation_review_candidates,
+        )
 
     pairs: list[QuestionAnswerPair] = []
     pending_questions: list[tuple[int, QuestionGroup]] = []
@@ -574,8 +882,12 @@ def build_section_samples(
                     for source_ordinal, _ in pending_questions
                 ),
                 question=" ".join(
-                    normalize_extracted_text(question_group.text)
-                    for _, question_group in pending_questions
+                    normalize_source_question(
+                        spec,
+                        source_ordinal,
+                        question_group.text,
+                    )
+                    for source_ordinal, question_group in pending_questions
                 ),
                 answer=join_answer_text(answer),
                 page_start=content[first_group.start_index].printed_page,
@@ -599,7 +911,15 @@ def build_section_samples(
         )
 
     if blocking:
-        return SectionParseResult([], warnings, blocking, [], review_candidates, embedded_questions)
+        return SectionParseResult(
+            [],
+            warnings,
+            blocking,
+            [],
+            review_candidates,
+            embedded_questions,
+            hyphenation_review_candidates,
+        )
 
     grouped_pairs: list[list[QuestionAnswerPair]] = []
     group_reasons: list[list[str]] = []
@@ -651,7 +971,15 @@ def build_section_samples(
             )
 
     if blocking:
-        return SectionParseResult([], warnings, blocking, [], review_candidates, embedded_questions)
+        return SectionParseResult(
+            [],
+            warnings,
+            blocking,
+            [],
+            review_candidates,
+            embedded_questions,
+            hyphenation_review_candidates,
+        )
 
     samples: list[ReferenceSample] = []
     groups_report: list[dict[str, Any]] = []
@@ -721,6 +1049,7 @@ def build_section_samples(
         groups_report,
         review_candidates,
         embedded_questions,
+        hyphenation_review_candidates,
     )
 
 
@@ -808,8 +1137,8 @@ def extract_pdf_page_lines(page: Any, pdf_page: int, printed_page: int) -> list[
             continue
         for line_index, line in enumerate(block.get("lines", [])):
             spans = line.get("spans", [])
-            text = "".join(span.get("text", "") for span in spans)
-            text = normalize_extracted_text(text)
+            raw_text = "".join(span.get("text", "") for span in spans)
+            text = normalize_extracted_text(raw_text)
             if not text:
                 continue
 
@@ -843,6 +1172,7 @@ def extract_pdf_page_lines(page: Any, pdf_page: int, printed_page: int) -> list[
                     font_size=(weighted_size / character_count) if character_count else 0.0,
                     color=int(max(spans, key=lambda span: len(span.get("text", ""))).get("color", 0)),
                     font_name=str(max(spans, key=lambda span: len(span.get("text", ""))).get("font", "")),
+                    list_item=has_pdf_list_marker(raw_text),
                 )
             )
     return records
@@ -890,11 +1220,18 @@ def extract_section_lines(
 
 def audit_corpus_samples(
     samples: Sequence[ReferenceSample],
+    unresolved_hyphenation_candidates: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     duplicate_prompts: list[dict[str, Any]] = []
     profile_text_hits: list[dict[str, Any]] = []
     out_of_scope_samples: list[dict[str, Any]] = []
     cross_reference_only_answers: list[dict[str, Any]] = []
+    unexpected_control_characters: list[dict[str, Any]] = []
+    unresolved_bullet_markers: list[dict[str, Any]] = []
+    question_number_prefixes: list[dict[str, Any]] = []
+    question_footnote_markers: list[dict[str, Any]] = []
+    suspicious_double_hyphens: list[dict[str, Any]] = []
+    unicode_replacement_markers: list[dict[str, Any]] = []
 
     prompt_ids: dict[tuple[str, str, str], list[str]] = {}
     spec_map = {
@@ -905,6 +1242,75 @@ def audit_corpus_samples(
     for sample in samples:
         key = (sample.chapter, sample.section, sample.question)
         prompt_ids.setdefault(key, []).append(sample.sample_id)
+
+        for field_name, value in (
+            ("question", sample.question),
+            ("gold_answer", sample.gold_answer),
+        ):
+            location = {
+                "sample_id": sample.sample_id,
+                "field": field_name,
+                "page_start": sample.source.page_start if sample.source else None,
+                "page_end": sample.source.page_end if sample.source else None,
+            }
+            control_points = sorted(
+                {
+                    ord(char)
+                    for char in value
+                    if unicodedata.category(char) == "Cc"
+                    and char not in "\n\r\t"
+                }
+            )
+            if control_points:
+                unexpected_control_characters.append(
+                    {
+                        **location,
+                        "code_points": [
+                            f"U+{code_point:04X}"
+                            for code_point in control_points
+                        ],
+                    }
+                )
+            if PDF_BULLET_MARKER in value or PDF_LIST_MARKER in value:
+                unresolved_bullet_markers.append(location)
+            replacement_points = sorted(
+                {
+                    ord(char)
+                    for char in value
+                    if char in {"\ufffd", "\ufffe", "\uffff"}
+                    or 0xFDD0 <= ord(char) <= 0xFDEF
+                    or ord(char) & 0xFFFF in {0xFFFE, 0xFFFF}
+                }
+            )
+            if replacement_points:
+                unicode_replacement_markers.append(
+                    {
+                        **location,
+                        "code_points": [
+                            f"U+{code_point:04X}"
+                            for code_point in replacement_points
+                        ],
+                    }
+                )
+            if "--" in value:
+                suspicious_double_hyphens.append(location)
+
+        if QUESTION_NUMBER_PREFIX_RE.match(sample.question):
+            question_number_prefixes.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "question": sample.question,
+                }
+            )
+        for expected, _ in QUESTION_TEXT_OVERRIDES.values():
+            if expected in sample.question:
+                question_footnote_markers.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "question": sample.question,
+                        "marker_text": expected,
+                    }
+                )
 
         match = SAMPLE_ID_RE.fullmatch(sample.sample_id)
         if match is None:
@@ -992,6 +1398,34 @@ def audit_corpus_samples(
         blocking_issues.append(
             f"{len(out_of_scope_samples)} sample(s) fall outside the reviewed GLD scope"
         )
+    if unexpected_control_characters:
+        blocking_issues.append(
+            f"{len(unexpected_control_characters)} sample field(s) contain unexpected control characters"
+        )
+    if unresolved_bullet_markers:
+        blocking_issues.append(
+            f"{len(unresolved_bullet_markers)} sample field(s) contain unresolved PDF bullet markers"
+        )
+    if unresolved_hyphenation_candidates:
+        blocking_issues.append(
+            f"{len(unresolved_hyphenation_candidates)} line-wrap hyphenation candidate(s) remain unresolved"
+        )
+    if question_number_prefixes:
+        blocking_issues.append(
+            f"{len(question_number_prefixes)} question number prefix(es) remain"
+        )
+    if question_footnote_markers:
+        blocking_issues.append(
+            f"{len(question_footnote_markers)} reviewed question footnote marker(s) remain"
+        )
+    if suspicious_double_hyphens:
+        blocking_issues.append(
+            f"{len(suspicious_double_hyphens)} sample field(s) contain suspicious double hyphens"
+        )
+    if unicode_replacement_markers:
+        blocking_issues.append(
+            f"{len(unicode_replacement_markers)} sample field(s) contain Unicode replacement or noncharacter markers"
+        )
 
     return {
         "status": "clean" if not blocking_issues else "needs_review",
@@ -999,6 +1433,15 @@ def audit_corpus_samples(
         "profile_text_hits": profile_text_hits,
         "out_of_scope_samples": out_of_scope_samples,
         "cross_reference_only_answers": cross_reference_only_answers,
+        "unexpected_control_characters": unexpected_control_characters,
+        "unresolved_bullet_markers": unresolved_bullet_markers,
+        "unresolved_hyphenation_candidates": list(
+            unresolved_hyphenation_candidates
+        ),
+        "question_number_prefixes": question_number_prefixes,
+        "question_footnote_markers": question_footnote_markers,
+        "suspicious_double_hyphens": suspicious_double_hyphens,
+        "unicode_replacement_markers": unicode_replacement_markers,
         "blocking_issues": blocking_issues,
     }
 
@@ -1045,6 +1488,7 @@ def import_gld(
     review_sections: list[dict[str, Any]] = []
     blocking_issues: list[str] = []
     warnings: list[str] = []
+    hyphenation_review_candidates: list[dict[str, Any]] = []
 
     with pymupdf.open(pdf_path) as document:
         source_hash = verify_pinned_source(pdf_path, document.page_count)
@@ -1070,6 +1514,7 @@ def import_gld(
                         "groups": [],
                         "follow_up_review_candidates": [],
                         "embedded_question_lines": [],
+                        "hyphenation_review_candidates": [],
                     }
                 )
                 continue
@@ -1093,6 +1538,7 @@ def import_gld(
                         "sample_count": 0,
                         "warnings": [],
                         "blocking_issues": [str(exc)],
+                        "hyphenation_review_candidates": [],
                     }
                 )
                 continue
@@ -1108,6 +1554,17 @@ def import_gld(
             ]
             blocking_issues.extend(section_blocking)
             warnings.extend(section_warnings)
+            section_hyphenation_candidates = [
+                {
+                    "chapter": spec.chapter,
+                    "section": spec.section,
+                    **candidate,
+                }
+                for candidate in parsed.hyphenation_review_candidates
+            ]
+            hyphenation_review_candidates.extend(
+                section_hyphenation_candidates
+            )
             review_sections.append(
                 {
                     "chapter": spec.chapter,
@@ -1120,12 +1577,18 @@ def import_gld(
                     "groups": parsed.groups,
                     "follow_up_review_candidates": parsed.review_candidates,
                     "embedded_question_lines": parsed.embedded_question_lines,
+                    "hyphenation_review_candidates": (
+                        section_hyphenation_candidates
+                    ),
                 }
             )
 
         source_page_count = document.page_count
 
-    corpus_audit = audit_corpus_samples(all_samples)
+    corpus_audit = audit_corpus_samples(
+        all_samples,
+        hyphenation_review_candidates,
+    )
     blocking_issues.extend(corpus_audit["blocking_issues"])
     if corpus_audit["cross_reference_only_answers"]:
         warnings.append(
