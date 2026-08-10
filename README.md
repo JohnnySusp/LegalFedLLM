@@ -5,7 +5,7 @@ for bidirectional knowledge transfer between heterogeneous language models.
 
 The repository now contains four connected pieces:
 
-1. a deterministic Step-0 control plane using mock FedMKT knowledge;
+1. a deterministic protocol-first control plane using mock FedMKT knowledge;
 2. a real generic shared-reference-dataset boundary with canonical JSONL data,
    semantic dataset identity, Coordinator-owned round snapshots, selected-Client
    download, Client verification and caching, and Host verification of both
@@ -13,9 +13,9 @@ The repository now contains four connected pieces:
 3. a deterministic source-specific importer for the pinned 2012 Greek Law Digest
    thesis copy, producing canonical LegalFedLLM Q&A records for the selected
    printed-page range; and
-4. a versioned `safetensors` Knowledge Artifact contract with deterministic
-   serialization, atomic file writing, bounded loading and strict structural and
-   numerical validation.
+4. a scalable Knowledge Package implementation in which signed canonical JSON
+   metadata binds an exact `safetensors` artifact that is streamed, validated,
+   stored and exchanged in both directions during a complete mock round.
 
 The default execution path remains mock-first. No model download, GPU, Ollama
 installation, FATE-Flow deployment, or live public server is required to test the
@@ -73,10 +73,10 @@ the current Knowledge Packages are deterministic protocol fixtures. They prove
 the service, security, persistence, selection, rollback and bidirectional message
 flow; they do not yet represent useful model training.
 
-Step 2.1 and Step 2.2 define and implement the binary Knowledge Artifact boundary,
-but the live round still embeds its numerical arrays in `KnowledgePackage` JSON.
-Moving the signed package envelope and HTTP/storage flow onto the artifact boundary
-is the next substep.
+The package path itself is real. Client and Host Knowledge Packages use schema
+2.0: a signed JSON envelope contains a descriptor for the exact binary artifact,
+and bounded multipart transport carries both parts as one logical package. Step 2
+is complete; real Client inference begins in Step 3.
 
 ## Implemented milestones
 
@@ -99,8 +99,16 @@ is the next substep.
   dtypes, dimensions and hash relationships.
 - **Step 2.2 deterministic artifact I/O:** `safetensors` serialization, atomic
   writing, bounded loading, reconstruction and malformed-artifact rejection.
+- **Step 2.3 scalable signed package integration:** schema 2.0 Knowledge Packages,
+  artifact descriptors, multipart Client/Host transport, immutable Coordinator
+  storage and Host-to-Client reverse synchronization.
+- **Step 2.4 security and transport verification:** metadata/artifact tampering,
+  binding, replay/restart, transfer-failure and persistence regressions; complete
+  round assertions; reproducible package-size measurement; and readiness-gated
+  Compose startup.
 
-Step 1 is complete. The accepted corpus identities are recorded below.
+Steps 1 and 2 are complete. The accepted corpus identities and Step 2 package
+measurements are recorded below.
 
 ## Repository layout
 
@@ -119,6 +127,7 @@ LegalFedLLM/
 ├── shared/
 │   ├── protocol.py             Manifests, profiles and package schemas
 │   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
+│   ├── knowledge_transport.py  Bounded streaming multipart transport
 │   ├── reference_dataset.py    Canonical schema, JSONL I/O, hashing and splitting
 │   ├── prompt.py               Shared reference-prompt renderer
 │   ├── crypto.py               Ed25519 signatures and canonical SHA-256 hashing
@@ -139,8 +148,15 @@ LegalFedLLM/
 │   ├── test_gld_importer.py    GLD extraction, grouping and audit tests
 │   ├── test_knowledge_artifact.py
 │   │                            Artifact determinism and rejection tests
+│   ├── test_knowledge_security.py
+│   │                            Package tampering and binding regressions
+│   ├── test_knowledge_transport.py
+│   │                            Multipart boundaries and cleanup regressions
 │   └── ...                     Protocol, dataset, round, rollback and Ollama tests
-├── scripts/demo_round.py       One complete containerized mock round
+├── scripts/
+│   ├── demo_round.py           One complete containerized mock round
+│   └── measure_knowledge_packages.py
+│                                Reproducible Client/Host representation measurement
 ├── compose.yaml
 ├── requirements.txt
 ├── requirements-tools.txt      Optional offline dataset tooling
@@ -247,7 +263,7 @@ When the Coordinator is configured with real dataset paths, it:
 - ignores fabricated dataset metadata supplied by a round-creation request;
 - snapshots both files for the specific round.
 
-When no real dataset is configured, the existing Step-0 fixture path remains
+When no real dataset is configured, the deterministic mock fixture path remains
 available. In that mode, the round request supplies mock dataset metadata and the
 reference-dataset download endpoint returns `204 No Content`.
 
@@ -278,9 +294,17 @@ The current implementation can test:
 - strict tensor-name, dtype, shape, offset and top-k validation;
 - rejection of oversized, truncated, trailing, malformed and non-finite artifacts;
 - signed manifest creation and verification;
-- Ed25519 Client and Host Knowledge Package signatures;
-- SHA-256 payload integrity;
-- nonce, duplicate and replay checks;
+- Ed25519 Client and Host Knowledge Package signatures over complete schema 2.0
+  package metadata;
+- package-hash binding from signed metadata to the artifact descriptor and from
+  its byte size and SHA-256 to the exact tensor bytes;
+- rejection of rehashed metadata, substituted artifacts, invalid signatures and
+  re-signed but round-inconsistent packages;
+- valid reuse of byte-identical artifacts by independently signed packages;
+- bounded streaming multipart upload and download;
+- rejection and cleanup of missing, duplicated, malformed, truncated or oversized
+  transfer parts;
+- nonce, duplicate and replay checks that survive Coordinator restart;
 - package-size and timestamp checks;
 - independent Client submissions;
 - quorum-triggered sealing;
@@ -304,6 +328,8 @@ The current implementation can test:
 - replay detection for authenticated packages rejected later;
 - strict Host identity, round, dataset and adapter-version verification;
 - explicit rejection of unintegrated real training and alignment backends;
+- reproducible Client and Host Knowledge Package size measurement over the frozen
+  565-sample D^P;
 - Ollama list, inspect and generation boundaries through mocks.
 
 Run the lightweight protocol/runtime test environment locally:
@@ -317,16 +343,18 @@ python -m unittest discover -v
 
 `tests/test_gld_importer.py` contains 29 importer tests and does not require opening
 the real PDF. It imports PyMuPDF lazily, so the ordinary unit-test path remains
-independent of the offline PDF tooling. `tests/test_knowledge_artifact.py` adds 16
-artifact-contract and validation tests.
+independent of the offline PDF tooling. `tests/test_knowledge_artifact.py` contains
+16 artifact-contract and validation tests. Security and transport regressions are
+kept in `tests/test_knowledge_security.py` and
+`tests/test_knowledge_transport.py`.
 
-The repository-wide suite contains 90 tests after Step 2.2. Confirm the count with
+The repository-wide suite contains 105 tests after Step 2. Confirm the count with
 the command above in the local environment.
 
 The default test suite does not import PyTorch or Transformers. PyMuPDF is required
 only when the real PDF importer or layout-inspection utility is executed.
 
-## Knowledge Artifact contract
+## Knowledge Package and Artifact contract
 
 The architecture's Client and Host package fields are sufficient as the logical
 content model: round/manifest binding, sender and model/tokenizer identity,
@@ -337,7 +365,8 @@ sender role and adapter version explicit. Exact source input IDs and attention
 lengths are carried as artifact tensors so later token alignment is bound to the
 sequence that actually produced the logits.
 
-Step 2 adds a serialization descriptor for the numerical artifact:
+Knowledge Package schema 2.0 replaces embedded numerical arrays with a
+serialization descriptor for the numerical artifact:
 
 ```json
 {
@@ -372,8 +401,55 @@ mismatches and malformed or trailing file content. It never accepts pickle or
 arbitrary Python object deserialization.
 
 `shared/knowledge_artifact.py` can now serialize, atomically write, size-bound,
-validate and reconstruct these artifacts. The current round endpoints do not use
-it yet; signed-envelope and transport integration belongs to Step 2.3.
+validate and reconstruct these artifacts. `shared/knowledge_transport.py` carries
+the package metadata and artifact as a bounded streaming multipart message without
+loading the complete artifact into application memory.
+
+The verification chain is:
+
+```text
+Ed25519 signature
+    → signed Knowledge Package fields and package hash
+    → artifact descriptor
+    → artifact byte size and SHA-256
+    → validated exact tensor bytes
+```
+
+This representation remains one cryptographically signed logical Knowledge
+Package. Client uploads, immutable Coordinator submissions, Host processing,
+Host publication, Client download and reverse synchronization all use it.
+
+## Step 2 representation measurement
+
+Run the measurement utility against the accepted 565-sample D^P:
+
+```bash
+python scripts/measure_knowledge_packages.py \
+  --reference data/derived/gld2012/reference.jsonl
+```
+
+The utility refuses a dataset whose sample count or semantic hash differs from the
+accepted corpus. It compares the current package-plus-artifact representation with
+an equivalent schema 1.0 package containing the same deterministic mock samples in
+canonical JSON. It also sends the generated multipart body through the real
+receiver at the configured limit, the exact logical size and one byte below it.
+
+The accepted run used top-k 20 and the frozen D^P hash recorded below:
+
+| Representation | Client | Host |
+| --- | ---: | ---: |
+| Canonical package JSON | 16,246 B | 16,234 B |
+| `safetensors` artifact | 1,121,448 B | 1,121,448 B |
+| Logical package | 1,137,694 B | 1,137,682 B |
+| Multipart body | 1,138,040 B | 1,138,028 B |
+| Equivalent embedded JSON | 2,159,947 B | 2,160,046 B |
+| Size reduction | 47.3277% | 47.3307% |
+
+The logical size is canonical package JSON plus artifact bytes. Multipart size
+adds body framing and excludes HTTP headers. The manifest's default 25 MiB limit
+accepted both packages; the exact logical size was accepted and one byte below was
+rejected. These are representation measurements of deterministic mock knowledge,
+not model-quality, training-time, memory or privacy results.
 
 ## Offline GLD dataset tooling
 
@@ -513,7 +589,7 @@ distribution permission is obtained.
 PyMuPDF is an optional offline dependency and is dual-licensed under the GNU
 AGPL-3.0 or an Artifex commercial licence. See `THIRD_PARTY_NOTICES.md`.
 
-## Run with Docker Compose or Podman Compose
+## Run with Docker Compose
 
 Create the environment file and replace the development tokens:
 
@@ -524,16 +600,18 @@ cp .env.example .env
 Start the services:
 
 ```bash
-docker compose up --build -d
+docker compose up --build --wait --wait-timeout 180
 ```
 
-On Bazzite, the corresponding command is normally:
+Host, Coordinator and Client all define `/health` checks. `--wait` prevents an
+external demo command from racing a container whose process has started but whose
+API is not ready. Confirm that all three services report `healthy`:
 
 ```bash
-podman compose up --build -d
+docker compose ps
 ```
 
-Check the public services:
+Check the two published services:
 
 ```bash
 curl -s http://localhost:8000/health
@@ -553,26 +631,23 @@ Reset all prototype state:
 docker compose down -v
 ```
 
-or:
-
-```bash
-podman compose down -v
-```
-
 Only the Coordinator and Client agent publish host ports. The Host runtime is
 reachable only through the private Compose network.
 
 ## Configure real reference and validation JSONL files
 
-Set both paths for the Coordinator:
+Set both paths for the Coordinator process:
 
 ```env
-COORDINATOR_REFERENCE_DATASET_PATH=data/derived/gld2012/reference.jsonl
-COORDINATOR_VALIDATION_DATASET_PATH=data/derived/gld2012/validation.jsonl
+COORDINATOR_REFERENCE_DATASET_PATH=/datasets/reference.jsonl
+COORDINATOR_VALIDATION_DATASET_PATH=/datasets/validation.jsonl
 ```
 
 Both variables must be configured together. Startup fails if only one is set or
-if the files are malformed, inconsistent or overlapping.
+if the files are malformed, inconsistent or overlapping. The paths must be visible
+inside the Coordinator environment. The supplied Compose demo intentionally does
+not mount the Git-ignored GLD corpus, so using it with real data requires an
+explicit local bind mount and matching container paths.
 
 The signed manifest binds the round to D^P through:
 
@@ -600,9 +675,9 @@ The Coordinator owns the public federation protocol:
 | `GET` | `/v1/rounds/current` | Retrieve the active manifest |
 | `GET` | `/v1/rounds/{id}/manifest` | Retrieve one manifest |
 | `GET` | `/v1/rounds/{id}/reference-dataset` | Download the round D^P as JSONL |
-| `POST` | `/v1/rounds/{id}/knowledge` | Submit a signed Client Knowledge Package |
+| `POST` | `/v1/rounds/{id}/knowledge` | Upload signed package JSON plus `safetensors` artifact |
 | `GET` | `/v1/rounds/{id}/status` | Poll round state |
-| `GET` | `/v1/rounds/{id}/host-knowledge` | Download the signed Host Knowledge Package |
+| `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed Host package JSON plus artifact |
 | `POST` | `/v1/generate` | Proxy a direct Host consultation request |
 
 The D^P endpoint requires a valid registration token and a registered Client ID.
@@ -634,8 +709,8 @@ Its private API includes:
 | --- | --- | --- |
 | `GET` | `/internal/v1/identity` | Host identity and model profile |
 | `POST` | `/internal/v1/reference-data` | Load and verify round D^P and D^V |
-| `POST` | `/internal/v1/reference-knowledge` | Create Host reference knowledge |
-| `POST` | `/internal/v1/distill` | Run the current mock distillation boundary |
+| `POST` | `/internal/v1/reference-knowledge` | Stream signed Host reference package and artifact |
+| `POST` | `/internal/v1/distill` | Run mock distillation and stream its signed result |
 
 These endpoints are protected by `X-Internal-Token` and are not published by
 `compose.yaml`.
@@ -701,8 +776,13 @@ Coordinator data
 │       │   ├── validation.jsonl
 │       │   └── identity.json
 │       ├── submissions/
+│       │   └── <client-id>/
+│       │       ├── package.json
+│       │       └── knowledge.safetensors
 │       ├── safety/
-│       └── ...
+│       └── host_knowledge/
+│           ├── package.json
+│           └── knowledge.safetensors
 └── audit/events.jsonl
 
 Host data
@@ -724,8 +804,15 @@ Client data
 │       ├── reference.jsonl
 │       └── identity.json
 ├── knowledge_cache/
-│   ├── pending/
-│   ├── accepted/
+│   ├── pending/<round-id>/
+│   │   ├── package.json
+│   │   └── knowledge.safetensors
+│   ├── accepted/<round-id>/
+│   │   ├── package.json
+│   │   └── knowledge.safetensors
+│   ├── host/<round-id>/
+│   │   ├── package.json
+│   │   └── knowledge.safetensors
 │   └── receipts/
 └── adapter_snapshots/
     ├── pending/
@@ -736,14 +823,16 @@ A downloaded Client dataset is written to a temporary path and accepted only
 after schema, dataset ID, semantic hash and sample-order verification. The cache
 identity is bound to the round ID and manifest hash.
 
-A Client Knowledge Package is first written as pending state. Only after a
-matching Coordinator receipt is returned is the exact package and its round-bound
-adapter snapshot committed as accepted state. Accepted package/snapshot pairs are
-immutable for that round.
+A Client Knowledge Package and artifact are first written as pending state. Only
+after a matching Coordinator receipt is returned are the exact pair and its
+round-bound adapter snapshot committed as accepted state. Accepted package,
+artifact and snapshot sets are immutable for that round. Host packages are cached
+only after signature, round, manifest, dataset, adapter and artifact verification.
 
-Writes use temporary files followed by atomic replacement. Direct execution
-defaults to `./data/...`; Compose overrides these paths with `/data/...` volume
-mounts.
+Streaming uploads and downloads use temporary artifact paths and remove them after
+failure or after immutable persistence. Other writes use temporary files followed
+by atomic replacement. Direct execution defaults to `./data/...`; Compose
+overrides these paths with `/data/...` volume mounts.
 
 ## Security included now
 
@@ -755,11 +844,15 @@ The current implementation includes:
 - registered Client public keys;
 - signed Coordinator manifests;
 - signed Client and Host Knowledge Packages;
+- signed artifact descriptors containing exact byte size, SHA-256, tensor schema,
+  sample count, ordered-sample-ID hash, token count and top-k;
 - round-bound manifest hashes;
 - nonces and timestamp-skew checks;
 - duplicate Client submission rejection;
-- replay tracking for seen nonces and package hashes;
-- package-size limits;
+- persistent replay tracking for seen nonces and package hashes, including
+  authenticated packages that fail later policy checks;
+- logical package-size limits plus separately bounded multipart framing;
+- bounded streaming transport and rejected-transfer temporary-file cleanup;
 - exact model-profile verification;
 - exact dataset ID, semantic hash and sample-order verification;
 - selected-Client authorization for D^P download;
@@ -769,6 +862,7 @@ The current implementation includes:
 - strict Host identity, signature, manifest and adapter-version verification;
 - authenticated Client administrative endpoints;
 - immutable accepted Client package and adapter-snapshot binding;
+- immutable Coordinator package/artifact storage and verified Host-package cache;
 - finite-number and shape validation;
 - a minimal Knowledge Package Safety Probe;
 - append-only JSONL audit events.
@@ -799,7 +893,7 @@ Windows 10/11
     └── Client agent
 ```
 
-For Bazzite or another Podman host, use:
+When Compose is run through Podman and Ollama is on the host, use:
 
 ```env
 OLLAMA_BASE_URL=http://host.containers.internal:11434
@@ -853,7 +947,6 @@ The repository does not yet perform:
 - real top-k logit and CE-loss extraction;
 - real cross-tokenizer alignment inside a live round;
 - real Host or Client knowledge distillation;
-- signed-envelope and HTTP/storage integration of binary Knowledge Artifacts;
 - formal differential-privacy accounting;
 - learned malicious-package detection;
 - encrypted artifact storage;
@@ -873,21 +966,6 @@ The DP fields currently enforce protocol consistency only. The safety probe is a
 basic deterministic gate, not the final Safe-FedLLM-inspired detector.
 
 ## Next implementation milestones
-
-### Step 2.3 — Signed Knowledge Package envelope
-
-Step 2.1 and Step 2.2 are implemented. The current protocol still keeps
-deterministic numerical arrays directly in signed JSON. The next substep replaces
-those embedded samples with a `KnowledgeArtifactDescriptor`, distinguishes the
-binary `artifact.sha256` from the canonical signed `package_hash`, and updates
-signature and replay tests without changing HTTP transport yet.
-
-### Step 2.4 — Artifact transport and persistence
-
-Move Client-to-Coordinator and Host-to-Client knowledge exchange onto bounded
-artifact upload/download and immutable storage. The Coordinator must verify exact
-bytes, descriptor, signature, round binding and tensor schema before accepting an
-artifact; rejected temporary files must be removed.
 
 ### Step 3 — First real Client model
 
@@ -952,10 +1030,14 @@ The repository currently demonstrates:
 - Coordinator-owned D^P/D^V round snapshots;
 - authorized D^P delivery to selected Clients;
 - independent Client and Host dataset verification and caching;
-- a deterministic, bounded and strictly validated `safetensors` Knowledge
-  Artifact boundary;
+- signed schema 2.0 Client and Host Knowledge Packages whose descriptors bind
+  exact `safetensors` artifacts;
+- bounded streaming artifact transport, immutable persistence, restart recovery
+  and reverse synchronization in the live mock round;
+- measured representation size for the frozen 565-sample D^P, including a roughly
+  47.33% reduction from the equivalent embedded-JSON mock representation;
 - deterministic mock bidirectional FedMKT message flow.
 
-It does **not** yet demonstrate binary artifact transport inside a live round, a
-completed real-model FedMKT round, formal differential privacy, a complete
-Safe-FedLLM defense, or production-ready deployment.
+It does **not** yet demonstrate a completed real-model FedMKT round, formal
+differential privacy, a complete Safe-FedLLM defense, encrypted transport/storage
+or production-ready deployment.
