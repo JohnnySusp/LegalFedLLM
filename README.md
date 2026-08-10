@@ -3,16 +3,19 @@
 LegalFedLLM is a protocol-first implementation of a FedMKT-centered architecture
 for bidirectional knowledge transfer between heterogeneous language models.
 
-The repository now contains three connected pieces:
+The repository now contains four connected pieces:
 
 1. a deterministic Step-0 control plane using mock FedMKT knowledge;
 2. a real generic shared-reference-dataset boundary with canonical JSONL data,
    semantic dataset identity, Coordinator-owned round snapshots, selected-Client
    download, Client verification and caching, and Host verification of both
-   reference and validation data; and
+   reference and validation data;
 3. a deterministic source-specific importer for the pinned 2012 Greek Law Digest
    thesis copy, producing canonical LegalFedLLM Q&A records for the selected
-   printed-page range.
+   printed-page range; and
+4. a versioned `safetensors` Knowledge Artifact contract with deterministic
+   serialization, atomic file writing, bounded loading and strict structural and
+   numerical validation.
 
 The default execution path remains mock-first. No model download, GPU, Ollama
 installation, FATE-Flow deployment, or live public server is required to test the
@@ -70,7 +73,12 @@ the current Knowledge Packages are deterministic protocol fixtures. They prove
 the service, security, persistence, selection, rollback and bidirectional message
 flow; they do not yet represent useful model training.
 
-## Past versions
+Step 2.1 and Step 2.2 define and implement the binary Knowledge Artifact boundary,
+but the live round still embeds its numerical arrays in `KnowledgePackage` JSON.
+Moving the signed package envelope and HTTP/storage flow onto the artifact boundary
+is the next substep.
+
+## Implemented milestones
 
 - **Early prototype:** direct LoRA-delta exchange between participants. This
   approach was removed because heterogeneous model architectures cannot safely
@@ -85,11 +93,14 @@ flow; they do not yet represent useful model training.
   verification/caching and Host D^P/D^V verification.
 - **Step 1B GLD importer:** deterministic parsing of the pinned 2012 Greek Law
   Digest thesis copy, reviewed follow-up handling, subsection-context
-  disambiguation, corpus auditing and freeze-ready D^P/D^V generation.
+  disambiguation, text-hygiene hardening, corpus auditing and reproducible D^P/D^V
+  generation.
+- **Step 2.1 Knowledge Artifact contract:** fixed descriptor fields, tensor names,
+  dtypes, dimensions and hash relationships.
+- **Step 2.2 deterministic artifact I/O:** `safetensors` serialization, atomic
+  writing, bounded loading, reconstruction and malformed-artifact rejection.
 
-The Step 1B.2 code is implemented. Step 1 should be called fully frozen only
-after the authoritative local importer run is clean and the resulting
-`identity.json` values have been recorded.
+Step 1 is complete. The accepted corpus identities are recorded below.
 
 ## Repository layout
 
@@ -107,6 +118,7 @@ LegalFedLLM/
 │   └── runtime.py              Client state, D^P cache and mock knowledge flow
 ├── shared/
 │   ├── protocol.py             Manifests, profiles and package schemas
+│   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
 │   ├── reference_dataset.py    Canonical schema, JSONL I/O, hashing and splitting
 │   ├── prompt.py               Shared reference-prompt renderer
 │   ├── crypto.py               Ed25519 signatures and canonical SHA-256 hashing
@@ -125,6 +137,8 @@ LegalFedLLM/
 │                                Deterministic pinned-GLD canonical importer
 ├── tests/
 │   ├── test_gld_importer.py    GLD extraction, grouping and audit tests
+│   ├── test_knowledge_artifact.py
+│   │                            Artifact determinism and rejection tests
 │   └── ...                     Protocol, dataset, round, rollback and Ollama tests
 ├── scripts/demo_round.py       One complete containerized mock round
 ├── compose.yaml
@@ -258,6 +272,11 @@ The current implementation can test:
 - contributing-firm running-matter filtering;
 - GLD corpus audits for duplicate prompts, profile contamination and scope;
 - pinned GLD source SHA-256 and page-count verification;
+- deterministic binary Knowledge Artifact serialization;
+- variable-length sample flattening and reconstruction;
+- artifact byte-size, SHA-256 and ordered-sample-ID binding;
+- strict tensor-name, dtype, shape, offset and top-k validation;
+- rejection of oversized, truncated, trailing, malformed and non-finite artifacts;
 - signed manifest creation and verification;
 - Ed25519 Client and Host Knowledge Package signatures;
 - SHA-256 payload integrity;
@@ -296,16 +315,65 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-`tests/test_gld_importer.py` contains 18 importer tests and does not require opening
+`tests/test_gld_importer.py` contains 29 importer tests and does not require opening
 the real PDF. It imports PyMuPDF lazily, so the ordinary unit-test path remains
-independent of the offline PDF tooling.
+independent of the offline PDF tooling. `tests/test_knowledge_artifact.py` adds 16
+artifact-contract and validation tests.
 
-The previous repository-wide suite contained 45 tests; the importer adds 18 more,
-so the expected total after Step 1B is 63. Confirm the final count with the command
-above before recording it as a verified project result.
+The repository-wide suite contains 90 tests after Step 2.2. Confirm the count with
+the command above in the local environment.
 
 The default test suite does not import PyTorch or Transformers. PyMuPDF is required
 only when the real PDF importer or layout-inspection utility is executed.
+
+## Knowledge Artifact contract
+
+The architecture's Client and Host package fields are sufficient as the logical
+content model: round/manifest binding, sender and model/tokenizer identity,
+alignment profile, reference-dataset identity, ordered samples, top-k token IDs
+and logits, CE losses, privacy report where applicable, nonce/timestamp, package
+hash and signature. The wire contract additionally makes protocol/package schema,
+sender role and adapter version explicit. Exact source input IDs and attention
+lengths are carried as artifact tensors so later token alignment is bound to the
+sequence that actually produced the logits.
+
+Step 2 adds a serialization descriptor for the numerical artifact:
+
+```json
+{
+  "format": "safetensors",
+  "schema_version": "1.0",
+  "byte_size": 123456,
+  "sha256": "<SHA-256 of exact artifact bytes>",
+  "sample_count": 565,
+  "sample_ids_sha256": "<SHA-256 of the canonical ordered ID list>",
+  "total_token_count": 289280,
+  "top_k": 20
+}
+```
+
+Schema version 1.0 contains exactly six tensors. `N` is the sample count, `T` is
+the total number of source tokens and `K` is top-k.
+
+| Tensor | Dtype | Shape | Purpose |
+| --- | --- | --- | --- |
+| `sample_offsets` | `int64` | `[N + 1]` | Boundaries of variable-length samples |
+| `source_input_ids` | `int32` | `[T]` | Flattened sender-tokenizer input IDs |
+| `attention_lengths` | `int32` | `[N]` | Unmasked token count per sample |
+| `top_k_token_ids` | `int32` | `[T, K]` | Sender-tokenizer top-k IDs |
+| `top_k_logits` | `float32` | `[T, K]` | Top-k logits |
+| `ce_losses` | `float32` | `[N]` | Per-sample cross-entropy loss |
+
+Sample IDs remain in deterministic order in the signed JSON envelope. They are
+not duplicated in the binary file; `sample_ids_sha256` binds that ordered list to
+the descriptor. The loader rejects missing or unknown tensors, dtype/shape/offset
+mismatches, negative token IDs or losses, non-finite values, size/hash/order
+mismatches and malformed or trailing file content. It never accepts pickle or
+arbitrary Python object deserialization.
+
+`shared/knowledge_artifact.py` can now serialize, atomically write, size-bound,
+validate and reconstruct these artifacts. The current round endpoints do not use
+it yet; signed-envelope and transport integration belongs to Step 2.3.
 
 ## Offline GLD dataset tooling
 
@@ -377,8 +445,13 @@ The importer:
 - uses approved GLD subsection headings to disambiguate otherwise identical
   prompts;
 - records reviewed follow-up overrides;
+- normalizes PDF bullet controls into stable ASCII list items;
+- resolves only reviewed line-wrap and inline hyphenation artifacts;
+- removes reviewed question-number and superscript-footnote noise;
+- blocks unknown control characters, hyphenation candidates and other targeted
+  text-hygiene failures;
 - audits the final canonical corpus for duplicate prompts, remaining firm/profile
-  text and out-of-scope samples;
+  text, extraction noise and out-of-scope samples;
 - preserves source answers that consist only of an internal cross-reference and
   records them as warnings rather than inventing replacement text.
 
@@ -411,6 +484,22 @@ data/derived/gld2012/
 `all.jsonl`, `reference.jsonl` and `validation.jsonl` are the authoritative
 machine-readable datasets. The corresponding `.json` files are generated
 human-readable copies.
+
+### Accepted Step 1 corpus identity
+
+The authoritative PyMuPDF 1.28.0 run used the pinned 713-page source above. Its
+`review.json` and corpus audit were clean, human inspection was accepted, and all
+74 tests then present passed.
+
+| Dataset | Samples | Semantic SHA-256 |
+| --- | ---: | --- |
+| Complete corpus | 738 | `cf5c81dcecaab58848c1afb0e99f86bcf5fd32823c2aaee34a65f6f4a2ccd0e8` |
+| D^P reference corpus | 565 | `5d855a429d43b70eb146aeb11cda1f675c05d6465bea0792796fdcd8d6ceb231` |
+| D^V validation corpus | 173 | `1e40a74799b9900ff8b9a9e05dd379fd0c00226370625f7da1fdca13142b83b5` |
+
+The generated datasets and source PDF remain local and Git-ignored. These hashes
+identify semantic corpus content and order; they are not hashes of the JSONL file
+bytes.
 
 `review.json` records source identity, extraction-tool version, scope, per-section
 boundaries, warnings, reviewed follow-up decisions and the corpus audit.
@@ -764,7 +853,7 @@ The repository does not yet perform:
 - real top-k logit and CE-loss extraction;
 - real cross-tokenizer alignment inside a live round;
 - real Host or Client knowledge distillation;
-- scalable binary Knowledge Package artifact transfer;
+- signed-envelope and HTTP/storage integration of binary Knowledge Artifacts;
 - formal differential-privacy accounting;
 - learned malicious-package detection;
 - encrypted artifact storage;
@@ -773,11 +862,8 @@ The repository does not yet perform:
 - a graphical Windows application;
 - automatic export of accepted PEFT adapters into Ollama.
 
-The GLD-specific deterministic importer is implemented, but generated GLD content
-is intentionally not committed to the public repository. Until the authoritative
-local Step 1B.2 run is completed and its clean `review.json` and `identity.json`
-values are recorded, the project should not claim a final frozen thesis corpus
-identity.
+The GLD-specific deterministic importer and accepted corpus identity are complete,
+but generated GLD content remains intentionally absent from the public repository.
 
 The current D^P/D^V transfer and verification boundary is real, but the Host and
 Client still generate deterministic mock knowledge rather than model-derived
@@ -788,38 +874,20 @@ basic deterministic gate, not the final Safe-FedLLM-inspired detector.
 
 ## Next implementation milestones
 
-### Finish the Step 1 corpus freeze
+### Step 2.3 — Signed Knowledge Package envelope
 
-The generic dataset boundary and the GLD importer are implemented. The remaining
-Step 1 freeze procedure is operational rather than architectural:
+Step 2.1 and Step 2.2 are implemented. The current protocol still keeps
+deterministic numerical arrays directly in signed JSON. The next substep replaces
+those embedded samples with a `KnowledgeArtifactDescriptor`, distinguishes the
+binary `artifact.sha256` from the canonical signed `package_hash`, and updates
+signature and replay tests without changing HTTP transport yet.
 
-```text
-run the pinned GLD importer locally
-        ↓
-require review.json status == clean
-        ↓
-require zero unresolved follow-up candidates
-        ↓
-require corpus_audit status == clean
-        ↓
-inspect representative records and section boundaries
-        ↓
-record all/reference/validation identities from identity.json
-        ↓
-record the verified repository-wide test result
-        ↓
-Step 1 complete
-```
+### Step 2.4 — Artifact transport and persistence
 
-Generated GLD source data remains local and Git-ignored.
-
-### Step 2 — Scalable Knowledge Package artifacts
-
-The current protocol keeps deterministic numerical arrays directly in signed
-JSON. Before real-model scale, large tensors should move behind a signed metadata
-envelope and a constrained binary artifact such as `safetensors` or strictly
-validated NumPy `.npz`. Arbitrary pickle/PyTorch object deserialization from
-Clients must not be accepted.
+Move Client-to-Coordinator and Host-to-Client knowledge exchange onto bounded
+artifact upload/download and immutable storage. The Coordinator must verify exact
+bytes, descriptor, signature, round binding and tensor schema before accepting an
+artifact; rejected temporary files must be removed.
 
 ### Step 3 — First real Client model
 
@@ -878,15 +946,16 @@ The repository currently demonstrates:
   thesis copy;
 - reviewed handling of GLD question styles, dependent follow-ups and internal
   subsection context;
-- corpus-level auditing before GLD D^P/D^V files are accepted;
+- a frozen 738-sample GLD corpus with recorded D^P/D^V identities;
+- corpus-level structural and text-hygiene auditing before GLD D^P/D^V files are
+  accepted;
 - Coordinator-owned D^P/D^V round snapshots;
 - authorized D^P delivery to selected Clients;
 - independent Client and Host dataset verification and caching;
+- a deterministic, bounded and strictly validated `safetensors` Knowledge
+  Artifact boundary;
 - deterministic mock bidirectional FedMKT message flow.
 
-It does **not** yet demonstrate a completed real-model FedMKT round, formal
-differential privacy, a complete Safe-FedLLM defense, or production-ready
-deployment.
-
-A final frozen GLD corpus should be claimed only after the authoritative local
-Step 1B.2 run is clean and its semantic identities/hashes are recorded.
+It does **not** yet demonstrate binary artifact transport inside a live round, a
+completed real-model FedMKT round, formal differential privacy, a complete
+Safe-FedLLM defense, or production-ready deployment.

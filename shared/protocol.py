@@ -16,6 +16,8 @@ from shared.reference_dataset import (
 
 PROTOCOL_VERSION = "1.0"
 PACKAGE_SCHEMA_VERSION = "1.0"
+KNOWLEDGE_ARTIFACT_FORMAT = "safetensors"
+KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
 BASE64_PATTERN = r"^[A-Za-z0-9+/]+={0,2}$"
 
@@ -382,6 +384,17 @@ class KnowledgeSample(ContractModel):
     @property
     def top_k(self) -> int:
         return len(self.top_k_token_ids[0])
+
+
+class KnowledgeArtifactDescriptor(ContractModel):
+    format: Literal["safetensors"] = KNOWLEDGE_ARTIFACT_FORMAT
+    schema_version: Literal["1.0"] = KNOWLEDGE_ARTIFACT_SCHEMA_VERSION
+    byte_size: int = Field(ge=1, le=2 * 1024 * 1024 * 1024)
+    sha256: str = Field(pattern=HASH_PATTERN)
+    sample_count: int = Field(ge=1, le=100_000)
+    sample_ids_sha256: str = Field(pattern=HASH_PATTERN)
+    total_token_count: int = Field(ge=1)
+    top_k: int = Field(ge=1, le=4096)
 
 
 class KnowledgePackage(ContractModel):

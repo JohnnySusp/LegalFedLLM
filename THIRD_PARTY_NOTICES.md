@@ -6,6 +6,11 @@ extracted and adapted from FederatedAI/FATE-LLM commit
 The FATE and FuseAI/FuseLLM notices present in the source files are retained.
 See `shared/fedmkt_core/LICENSE` and `shared/fedmkt_core/UPSTREAM.md`.
 
+## Knowledge Artifact runtime
+
+The scalable Knowledge Artifact boundary uses NumPy under the BSD 3-Clause
+License and `safetensors` under the Apache License 2.0.
+
 ## Optional dataset tooling
 
 The offline dataset-preparation utilities under `tools/datasets/` may use
