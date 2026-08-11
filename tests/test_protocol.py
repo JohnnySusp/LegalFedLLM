@@ -58,6 +58,9 @@ class ProtocolSecurityTests(unittest.TestCase):
                 coordinator_id="coordinator",
                 current_host_adapter_version=0,
                 host_model_profile=profile("host"),
+                selected_client_profile_hashes={
+                    "client-a": profile("client").profile_hash()
+                },
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,11 +9,8 @@ from pathlib import Path
 import httpx
 from pydantic import ValidationError
 
-from client.runtime import (
-    ClientRuntime,
-    ClientRuntimeError,
-    default_client_profile,
-)
+from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
+from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService
 from host.runtime import (
@@ -612,19 +610,22 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StageZeroValidationTests(unittest.TestCase):
-    def test_real_training_backends_fail_fast(self) -> None:
+    def test_client_real_backend_is_lazy_while_host_remains_mock_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            client_data = default_client_profile().model_dump(mode="json")
-            client_data["training_backend"] = "transformers"
-
-            with self.assertRaises(ClientRuntimeError):
-                ClientRuntime(
-                    data_dir=Path(directory) / "client",
-                    model_profile=ModelProfile.model_validate(client_data),
-                )
+            self.assertNotIn("torch", sys.modules)
+            ClientRuntime(
+                data_dir=Path(directory) / "client",
+                model_profile=pinned_client_profile(QWEN_PROFILE_ID),
+            )
+            self.assertNotIn("torch", sys.modules)
 
             host_data = default_host_profile().model_dump(mode="json")
             host_data["training_backend"] = "transformers"
+            host_data["model_revision"] = "0" * 40
+            host_data["tokenizer_revision"] = "0" * 40
+            host_data["tokenizer_chat_template_hash"] = "0" * 64
+            host_data["vocabulary_size"] = 1
+            host_data["chat_template_mode"] = "standard"
 
             with self.assertRaises(HostRuntimeError):
                 HostRuntime(

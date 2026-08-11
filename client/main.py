@@ -305,8 +305,59 @@ def create_app(
     async def local_train(request: LocalTrainRequest) -> dict[str, Any]:
         try:
             return client_runtime.local_train(request.examples)
-        except ValueError as exc:
+        except (ClientRuntimeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async def verified_manifest(round_id: str) -> RoundManifest:
+        identity = await coordinator.identity()
+        manifest = await coordinator.manifest(round_id)
+        if not manifest.verify_signature(identity.public_key):
+            raise HTTPException(
+                status_code=401,
+                detail="round manifest signature is invalid",
+            )
+        return manifest
+
+    @app.post(
+        "/v1/rounds/{round_id}/local-train",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def local_train_round(round_id: str) -> dict[str, Any]:
+        manifest = await verified_manifest(round_id)
+        try:
+            return client_runtime.local_train_round(manifest)
+        except (ClientRuntimeError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def submit_participation(
+        manifest: RoundManifest,
+        *,
+        require_round_training: bool,
+    ) -> SubmissionReceipt:
+        if require_round_training:
+            client_runtime.require_round_training(manifest)
+
+        reference_content = await coordinator.reference_dataset(
+            manifest.round_id,
+            client_runtime.client_id,
+        )
+        if reference_content is not None:
+            client_runtime.cache_reference_dataset(
+                manifest=manifest,
+                content=reference_content,
+            )
+
+        package = client_runtime.create_knowledge_package(manifest)
+        receipt = await coordinator.submit(
+            package,
+            client_runtime.package_artifact_path(package),
+        )
+        client_runtime.commit_knowledge_submission(
+            manifest=manifest,
+            package=package,
+            receipt=receipt,
+        )
+        return receipt
 
     @app.post(
         "/v1/participate",
@@ -325,39 +376,31 @@ def create_app(
             )
 
         try:
-            reference_content = (
-                await coordinator.reference_dataset(
-                    manifest.round_id,
-                    client_runtime.client_id,
-                )
+            return await submit_participation(
+                manifest,
+                require_round_training=False,
             )
-
-            if reference_content is not None:
-                client_runtime.cache_reference_dataset(
-                    manifest=manifest,
-                    content=reference_content,
-                )
-
-            package = client_runtime.create_knowledge_package(manifest)
-
-            receipt = await coordinator.submit(
-                package,
-                client_runtime.package_artifact_path(package),
-            )
-
-            client_runtime.commit_knowledge_submission(
-                manifest=manifest,
-                package=package,
-                receipt=receipt,
-            )
-
-            return receipt
-
         except ClientRuntimeError as exc:
             raise HTTPException(
                 status_code=409,
                 detail=str(exc),
             ) from exc
+
+    @app.post(
+        "/v1/rounds/{round_id}/participate",
+        response_model=SubmissionReceipt,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def participate_round(round_id: str) -> SubmissionReceipt:
+        manifest = await verified_manifest(round_id)
+        try:
+            return await submit_participation(
+                manifest,
+                require_round_training=True,
+            )
+        except (ClientRuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post(
         "/v1/rounds/{round_id}/sync",

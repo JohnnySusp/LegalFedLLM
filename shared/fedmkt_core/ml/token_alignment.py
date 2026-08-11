@@ -19,7 +19,7 @@
 #
 import logging
 import transformers
-import editdistance
+from rapidfuzz.distance import Levenshtein
 import numpy as np
 
 from typing import Dict, List
@@ -35,6 +35,18 @@ from shared.fedmkt_core.ml.vars_define import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def token_levenshtein_distance(
+    blending_token: str,
+    base_token: str,
+    blending_model_special_token: str,
+    base_model_special_token: str,
+) -> int:
+    return Levenshtein.distance(
+        blending_token.replace(blending_model_special_token, ""),
+        base_token.replace(base_model_special_token, ""),
+    )
 
 
 def dtw(series_1, series_2, norm_func=np.linalg.norm):
@@ -248,9 +260,13 @@ def transform_step_logits(base_model_tokenizer: transformers.tokenization_utils_
     aligned_blending_model_per_step_logits, aligned_blending_model_per_step_indices = [], []
     if align_strategy == "dtw":
         def dist_fn(a, b):
-            """Calculate editdistance between two tokens, a is from blending model, b is from base model."""
-            return editdistance.eval(a.replace(blending_model_special_token, ''),
-                                     b.replace(base_model_special_token, ''))
+            """Calculate Levenshtein distance between blending and base tokens."""
+            return token_levenshtein_distance(
+                a,
+                b,
+                blending_model_special_token,
+                base_model_special_token,
+            )
 
         _, _, _, base_to_blending, _ = dtw(blending_model_tokens, base_model_tokens, norm_func=dist_fn)
         for i, blending_idx in enumerate(base_to_blending):

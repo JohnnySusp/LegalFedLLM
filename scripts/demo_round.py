@@ -13,6 +13,9 @@ CLIENT_ADMIN_TOKEN = os.getenv(
     "CLIENT_ADMIN_TOKEN",
     "replace-this-client-admin-token",
 )
+CLIENT_TRAINING_TIMEOUT_SECONDS = float(
+    os.getenv("CLIENT_TRAINING_TIMEOUT_SECONDS", "3600")
+)
 
 CLIENT_ADMIN_HEADERS = {
     "X-Client-Admin-Token": CLIENT_ADMIN_TOKEN
@@ -62,20 +65,15 @@ def main() -> None:
         show(
             "local Client training",
             client.post(
-                f"{CLIENT_URL}/v1/local-train",
+                f"{CLIENT_URL}/v1/rounds/{round_id}/local-train",
                 headers=CLIENT_ADMIN_HEADERS,
-                json={
-                    "examples": [
-                        "Private local example A",
-                        "Private local example B",
-                    ]
-                },
+                timeout=CLIENT_TRAINING_TIMEOUT_SECONDS,
             ),
         )
         show(
             "participate",
             client.post(
-                f"{CLIENT_URL}/v1/participate",
+                f"{CLIENT_URL}/v1/rounds/{round_id}/participate",
                 headers=CLIENT_ADMIN_HEADERS,
             ),
         )

@@ -7,3 +7,15 @@ pydantic==2.12.5
 python-multipart==0.0.32
 safetensors==0.8.0
 uvicorn==0.35.0
+
+# ML dependencies
+accelerate==1.14.0
+peft==0.20.0
+rapidfuzz==3.14.5
+sentencepiece==0.2.2
+torch==2.13.0
+transformers==4.57.6
+
+# Offline dataset-preparation tools only.
+# PyMuPDF is dual-licensed under GNU AGPL-3.0 or an Artifex commercial license.
+PyMuPDF==1.28.0

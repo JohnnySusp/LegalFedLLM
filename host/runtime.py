@@ -8,6 +8,7 @@ from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.ollama import OllamaClient
+from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import (
     DistillationJob,
     DistillationResult,
@@ -47,14 +48,17 @@ def default_host_profile() -> ModelProfile:
         tokenizer_class=os.getenv("HOST_TOKENIZER_CLASS", "MockTokenizer"),
         training_backend=os.getenv("HOST_TRAINING_BACKEND", "mock"),
         serving_backend=serving_backend,
-        prompt_template_hash=sha256_hex(b"legalfedllm-default-prompt"),
+        prompt_template_id=PROMPT_TEMPLATE_ID,
+        prompt_template_hash=sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
         lora=LoraProfile(
             rank=int(os.getenv("HOST_LORA_RANK", "8")),
             alpha=float(os.getenv("HOST_LORA_ALPHA", "16")),
+            dropout=float(os.getenv("HOST_LORA_DROPOUT", "0.05")),
             target_modules=tuple(
                 item.strip()
                 for item in os.getenv(
-                    "HOST_LORA_TARGET_MODULES", "q_proj,v_proj"
+                    "HOST_LORA_TARGET_MODULES",
+                    "q_proj,k_proj,v_proj,o_proj",
                 ).split(",")
                 if item.strip()
             ),

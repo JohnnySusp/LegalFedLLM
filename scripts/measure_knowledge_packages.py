@@ -23,6 +23,7 @@ from shared.knowledge_transport import (
     KnowledgeTransportTooLarge,
     receive_knowledge_transfer,
 )
+from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import (
     KnowledgePackage,
     KnowledgeSample,
@@ -56,11 +57,13 @@ def _measurement_profile(role: str) -> ModelProfile:
         tokenizer_class="MockTokenizer",
         training_backend="mock",
         serving_backend="mock",
-        prompt_template_hash=sha256_hex(b"legalfedllm-default-prompt"),
+        prompt_template_id=PROMPT_TEMPLATE_ID,
+        prompt_template_hash=sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
         lora=LoraProfile(
             rank=8,
             alpha=16,
-            target_modules=("q_proj", "v_proj"),
+            dropout=0.05,
+            target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
         ),
     )
 
@@ -259,6 +262,11 @@ async def measure(
             coordinator_id="measurement-coordinator",
             current_host_adapter_version=0,
             host_model_profile=_measurement_profile("host"),
+            selected_client_profile_hashes={
+                "measurement-client": _measurement_profile(
+                    "client"
+                ).profile_hash()
+            },
             request=request,
             submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
         )

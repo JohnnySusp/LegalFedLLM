@@ -18,7 +18,7 @@
 #  limitations under the License.
 #
 import json
-import editdistance
+from rapidfuzz.distance import Levenshtein
 import tqdm
 import multiprocessing
 import logging
@@ -40,9 +40,9 @@ def find_best_mapping(x, base_tokens, blending_model_special_token, base_model_s
         return tmp_x, tmp_x
     else:
         if best_one:
-            return tmp_x, min([(y, editdistance.eval(tmp_x, y)) for y in base_tokens], key=lambda d: d[1])[0]
+            return tmp_x, min([(y, Levenshtein.distance(tmp_x, y)) for y in base_tokens], key=lambda d: d[1])[0]
         else:
-            token_and_distance = [(y, editdistance.eval(tmp_x, y)) for y in base_tokens]
+            token_and_distance = [(y, Levenshtein.distance(tmp_x, y)) for y in base_tokens]
             min_distance = min(item[1] for item in token_and_distance)
             shortest_distance_tokens = [item[0] for item in token_and_distance if item[1] == min_distance]
             return tmp_x, shortest_distance_tokens

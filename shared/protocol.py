@@ -45,7 +45,16 @@ class ContractModel(BaseModel):
 class LoraProfile(ContractModel):
     rank: int = Field(ge=1, le=4096)
     alpha: float = Field(default=16.0, gt=0)
-    target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    dropout: float = Field(default=0.05, ge=0, lt=1)
+    target_modules: tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+    )
+    bias: Literal["none"] = "none"
+    task_type: Literal["CAUSAL_LM"] = "CAUSAL_LM"
+    modules_to_save: tuple[str, ...] = ()
 
     @field_validator("target_modules")
     @classmethod
@@ -57,6 +66,16 @@ class LoraProfile(ContractModel):
             raise ValueError("target_modules must be unique")
         return cleaned
 
+    @field_validator("modules_to_save")
+    @classmethod
+    def clean_modules_to_save(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(item.strip() for item in values)
+        if any(not item for item in cleaned):
+            raise ValueError("modules_to_save must contain non-blank names")
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("modules_to_save must be unique")
+        return cleaned
+
 
 class OllamaProfile(ContractModel):
     model: str = Field(min_length=1, max_length=256)
@@ -64,16 +83,36 @@ class OllamaProfile(ContractModel):
 
 
 class ModelProfile(ContractModel):
+    profile_schema_version: Literal["1.0"] = "1.0"
     profile_id: str = Field(min_length=1, max_length=128)
     role: Literal["client", "host"]
     model_id: str = Field(min_length=1, max_length=512)
     model_revision: str = Field(min_length=1, max_length=256)
+    model_class: str = Field(
+        default="MockForCausalLM",
+        min_length=1,
+        max_length=256,
+    )
+    model_type: str = Field(default="mock", min_length=1, max_length=128)
     tokenizer_id: str = Field(min_length=1, max_length=512)
     tokenizer_revision: str = Field(min_length=1, max_length=256)
     tokenizer_class: str = Field(min_length=1, max_length=256)
+    vocabulary_size: int | None = Field(default=None, ge=1)
     training_backend: Literal["mock", "transformers"] = "mock"
     serving_backend: Literal["mock", "ollama"] = "mock"
+    prompt_template_id: str = Field(
+        default="chapter-section-question-v1",
+        min_length=1,
+        max_length=256,
+    )
     prompt_template_hash: str = Field(pattern=HASH_PATTERN)
+    tokenizer_chat_template_hash: str | None = Field(
+        default=None,
+        pattern=HASH_PATTERN,
+    )
+    chat_template_mode: Literal["mock", "standard", "qwen_non_thinking"] = (
+        "mock"
+    )
     lora: LoraProfile
     ollama: OllamaProfile | None = None
 
@@ -81,7 +120,42 @@ class ModelProfile(ContractModel):
     def validate_ollama(self) -> "ModelProfile":
         if self.serving_backend == "ollama" and self.ollama is None:
             raise ValueError("ollama profile is required for Ollama serving")
+        if self.training_backend == "transformers":
+            for name, revision in (
+                ("model_revision", self.model_revision),
+                ("tokenizer_revision", self.tokenizer_revision),
+            ):
+                if len(revision) != 40 or any(
+                    character not in "0123456789abcdef" for character in revision
+                ):
+                    raise ValueError(
+                        f"{name} must be a full lowercase commit hash"
+                    )
+            if self.model_revision != self.tokenizer_revision:
+                raise ValueError(
+                    "model and tokenizer revisions must identify one snapshot"
+                )
+            if self.tokenizer_chat_template_hash is None:
+                raise ValueError(
+                    "Transformers profiles require a chat-template hash"
+                )
+            if self.vocabulary_size is None:
+                raise ValueError(
+                    "Transformers profiles require an expected vocabulary size"
+                )
+            if self.chat_template_mode == "mock":
+                raise ValueError(
+                    "Transformers profiles require a real chat-template mode"
+                )
         return self
+
+    def profile_hash(self) -> str:
+        return sha256_hex(
+            self.model_dump(
+                mode="json",
+                exclude={"serving_backend", "ollama"},
+            )
+        )
 
 
 class DifferentialPrivacyPolicy(ContractModel):
@@ -212,6 +286,7 @@ class RoundManifest(ContractModel):
     protocol_version: Literal["1.0"] = PROTOCOL_VERSION
     round_id: str = Field(min_length=1, max_length=128)
     selected_client_ids: list[str]
+    selected_client_profile_hashes: dict[str, str]
     trusted_client_quorum: int = Field(ge=1)
     current_host_adapter_version: int = Field(ge=0)
     host_model_profile: ModelProfile
@@ -244,6 +319,19 @@ class RoundManifest(ContractModel):
             raise ValueError("quorum cannot exceed selected Client count")
         if len(self.selected_client_ids) != len(set(self.selected_client_ids)):
             raise ValueError("selected_client_ids must be unique")
+        if set(self.selected_client_profile_hashes) != set(
+            self.selected_client_ids
+        ):
+            raise ValueError(
+                "selected Client profile hashes must match selected Client IDs"
+            )
+        if any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in self.selected_client_profile_hashes.values()
+        ):
+            raise ValueError("selected Client profile hashes must be SHA-256 hex")
         if (
             self.sample_ids is not None
             and len(self.sample_ids) != len(set(self.sample_ids))
@@ -288,6 +376,7 @@ class RoundManifest(ContractModel):
         coordinator_id: str,
         current_host_adapter_version: int,
         host_model_profile: ModelProfile,
+        selected_client_profile_hashes: dict[str, str],
         request: RoundCreateRequest,
         submission_deadline: str,
     ) -> "RoundManifest":
@@ -304,6 +393,7 @@ class RoundManifest(ContractModel):
             "protocol_version": PROTOCOL_VERSION,
             "round_id": round_id,
             "selected_client_ids": request.selected_client_ids,
+            "selected_client_profile_hashes": selected_client_profile_hashes,
             "trusted_client_quorum": request.trusted_client_quorum,
             "current_host_adapter_version": current_host_adapter_version,
             "host_model_profile": host_model_profile.model_dump(mode="json"),

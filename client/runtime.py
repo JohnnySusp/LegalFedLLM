@@ -5,6 +5,16 @@ import secrets
 from pathlib import Path
 from typing import Any, Callable
 
+from client.model_profiles import pinned_client_profile
+from client.training import (
+    AdapterCheckpointStore,
+    BackendTrainingResult,
+    LocalTrainingRecord,
+    TrainingExecutionProfile,
+    execution_profile_from_environment,
+    load_private_examples,
+    private_dataset_semantic_hash,
+)
 from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
@@ -22,6 +32,7 @@ from shared.protocol import (
     utc_text,
 )
 from shared.storage import JsonFileStore
+from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 
 from shared.reference_dataset import (
     ReferenceDatasetIdentity,
@@ -34,6 +45,21 @@ class ClientRuntimeError(RuntimeError):
 
 def default_client_profile() -> ModelProfile:
     serving_backend = os.getenv("CLIENT_SERVING_BACKEND", "mock").strip().lower()
+    selected_profile = os.getenv("CLIENT_MODEL_PROFILE", "mock").strip()
+    if selected_profile != "mock":
+        requested_backend = os.getenv(
+            "CLIENT_TRAINING_BACKEND", "transformers"
+        ).strip().lower()
+        if requested_backend != "transformers":
+            raise ClientRuntimeError(
+                "pinned real Client profiles require "
+                "CLIENT_TRAINING_BACKEND=transformers"
+            )
+        return pinned_client_profile(
+            selected_profile,
+            serving_backend=serving_backend,
+        )
+
     ollama_model = os.getenv("CLIENT_OLLAMA_MODEL", "llama3.2:1b")
     return ModelProfile(
         profile_id=os.getenv("CLIENT_PROFILE_ID", "client-mock-v1"),
@@ -45,14 +71,17 @@ def default_client_profile() -> ModelProfile:
         tokenizer_class=os.getenv("CLIENT_TOKENIZER_CLASS", "MockTokenizer"),
         training_backend=os.getenv("CLIENT_TRAINING_BACKEND", "mock"),
         serving_backend=serving_backend,
-        prompt_template_hash=sha256_hex(b"legalfedllm-default-prompt"),
+        prompt_template_id=PROMPT_TEMPLATE_ID,
+        prompt_template_hash=sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
         lora=LoraProfile(
             rank=int(os.getenv("CLIENT_LORA_RANK", "8")),
             alpha=float(os.getenv("CLIENT_LORA_ALPHA", "16")),
+            dropout=float(os.getenv("CLIENT_LORA_DROPOUT", "0.05")),
             target_modules=tuple(
                 item.strip()
                 for item in os.getenv(
-                    "CLIENT_LORA_TARGET_MODULES", "q_proj,v_proj"
+                    "CLIENT_LORA_TARGET_MODULES",
+                    "q_proj,k_proj,v_proj,o_proj",
                 ).split(",")
                 if item.strip()
             ),
@@ -73,6 +102,9 @@ class ClientRuntime:
         client_id: str = "legal-client-1",
         model_profile: ModelProfile | None = None,
         ollama_client: OllamaClient | None = None,
+        private_data_path: str | Path | None = None,
+        private_dataset_id: str | None = None,
+        training_execution_profile: TrainingExecutionProfile | None = None,
         maximum_clock_skew_seconds: int = 900,
         now_fn: Callable[[], Any] = utc_now,
     ):
@@ -86,10 +118,26 @@ class ClientRuntime:
         if self.model_profile.role != "client":
             raise ValueError("Client runtime requires a Client model profile")
 
-        if self.model_profile.training_backend != "mock":
-            raise ClientRuntimeError(
-                "CLIENT_TRAINING_BACKEND=transformers is not integrated yet; "
-                "use mock until the real FedMKT runtime is connected"
+        self.private_data_path = Path(
+            private_data_path
+            or os.getenv("CLIENT_PRIVATE_DATA_PATH", "/private/train.jsonl")
+        )
+        self.private_dataset_id = private_dataset_id or os.getenv(
+            "CLIENT_PRIVATE_DATASET_ID", "client-private-v1"
+        )
+        if not self.private_dataset_id.strip():
+            raise ValueError("private dataset ID must not be blank")
+        self.training_execution_profile = (
+            training_execution_profile
+            or execution_profile_from_environment(
+                self.model_profile.training_backend
+            )
+        )
+        if self.training_execution_profile.backend != (
+            self.model_profile.training_backend
+        ):
+            raise ValueError(
+                "training execution backend differs from the ModelProfile"
             )
 
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
@@ -102,24 +150,51 @@ class ClientRuntime:
                 timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60")),
             )
         self._ensure_state()
+        self.adapter_store: AdapterCheckpointStore | None = None
+        if self.model_profile.training_backend == "transformers":
+            self.adapter_store = AdapterCheckpointStore(
+                self.store.path("adapters"),
+                self.model_profile,
+            )
+            current = self.adapter_store.current()
+            if current is not None:
+                metadata, _ = current
+                state = self.state()
+                state["candidate_adapter_version"] = metadata.version
+                state["training_adapter_version"] = metadata.version
+                state["training_checkpoint_hash"] = metadata.checkpoint_hash
+                self.store.write_json("state.json", state)
 
     def _ensure_state(self) -> None:
+        defaults = {
+            "serving_adapter_version": 0,
+            "candidate_adapter_version": 0,
+            "training_adapter_version": 0,
+            "training_checkpoint_hash": None,
+            "local_training_runs": 0,
+            "last_completed_round": None,
+            "last_training_round": None,
+        }
         if self.store.exists("state.json"):
+            state = self.store.read_json("state.json")
+            changed = False
+            for key, value in defaults.items():
+                if key not in state:
+                    state[key] = value
+                    changed = True
+            if changed:
+                self.store.write_json("state.json", state)
             return
-        self.store.write_json(
-            "state.json",
-            {
-                "serving_adapter_version": 0,
-                "candidate_adapter_version": 0,
-                "local_training_runs": 0,
-                "last_completed_round": None,
-            },
-        )
+        self.store.write_json("state.json", defaults)
 
     def state(self) -> dict[str, Any]:
         return self.store.read_json("state.json")
 
     def local_train(self, examples: list[str]) -> dict[str, Any]:
+        if self.model_profile.training_backend != "mock":
+            raise ClientRuntimeError(
+                "/v1/local-train is mock-only; use the round-specific endpoint"
+            )
         if not examples or any(not item.strip() for item in examples):
             raise ValueError("local training requires non-blank examples")
         state = self.state()
@@ -131,6 +206,203 @@ class ClientRuntime:
         }
         self.store.write_json("state.json", state)
         return state
+
+    @staticmethod
+    def _local_training_record_path(round_id: str) -> str:
+        return f"local_training/rounds/{round_id}.json"
+
+    def local_train_round(self, manifest: RoundManifest) -> dict[str, Any]:
+        self._validate_training_manifest(manifest)
+        examples = load_private_examples(self.private_data_path)
+        dataset_hash = private_dataset_semantic_hash(examples)
+        record_path = self._local_training_record_path(manifest.round_id)
+        if self.store.exists(record_path):
+            record = LocalTrainingRecord.model_validate(
+                self.store.read_json(record_path)
+            )
+            self._validate_local_training_record(
+                record,
+                manifest,
+                dataset_hash=dataset_hash,
+            )
+            return record.model_dump(mode="json")
+
+        started_at = utc_text(self.now_fn())
+        if self.model_profile.training_backend == "mock":
+            state = self.state()
+            parent_version = int(state["candidate_adapter_version"])
+            parent_hash = state.get("training_checkpoint_hash")
+            result_version = parent_version + 1
+            result_hash = sha256_hex(
+                {
+                    "backend": "mock",
+                    "round_id": manifest.round_id,
+                    "manifest_hash": manifest.manifest_hash,
+                    "profile_hash": self.model_profile.profile_hash(),
+                    "dataset_hash": dataset_hash,
+                    "parent_version": parent_version,
+                    "parent_hash": parent_hash,
+                }
+            )
+            result = BackendTrainingResult(
+                parent_version=parent_version,
+                parent_checkpoint_hash=parent_hash,
+                result_version=result_version,
+                result_checkpoint_hash=result_hash,
+                checkpoint_format="mock-json",
+                dependency_versions={},
+                trainable_parameter_count=0,
+                total_parameter_count=0,
+            )
+        else:
+            from client.peft_backend import TransformersPeftTrainingBackend
+
+            backend = TransformersPeftTrainingBackend(
+                data_dir=self.store.root,
+                model_profile=self.model_profile,
+                execution_profile=self.training_execution_profile,
+            )
+            result = backend.train(examples, manifest)
+
+        record = LocalTrainingRecord.create(
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            client_model_profile_hash=self.model_profile.profile_hash(),
+            training_execution_profile=self.training_execution_profile,
+            training_execution_profile_hash=(
+                self.training_execution_profile.profile_hash()
+            ),
+            private_dataset_id=self.private_dataset_id,
+            private_dataset_semantic_hash=dataset_hash,
+            private_example_count=len(examples),
+            parent_adapter_version=result.parent_version,
+            parent_checkpoint_hash=result.parent_checkpoint_hash,
+            result_adapter_version=result.result_version,
+            result_checkpoint_hash=result.result_checkpoint_hash,
+            checkpoint_format=result.checkpoint_format,
+            label_format="chat_sft_answer_only_v1",
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            truncation_policy="reject",
+            started_at=started_at,
+            completed_at=utc_text(self.now_fn()),
+            dependency_versions=result.dependency_versions,
+            trainable_parameter_count=result.trainable_parameter_count,
+            total_parameter_count=result.total_parameter_count,
+        )
+        self.store.write_json_if_absent(
+            record_path,
+            record.model_dump(mode="json"),
+        )
+        state = self.state()
+        state["candidate_adapter_version"] = result.result_version
+        state["training_adapter_version"] = result.result_version
+        state["training_checkpoint_hash"] = result.result_checkpoint_hash
+        state["local_training_runs"] += 1
+        state["last_training_round"] = manifest.round_id
+        state["last_local_batch"] = {
+            "example_count": len(examples),
+            "content_hash": dataset_hash,
+        }
+        self.store.write_json("state.json", state)
+        return record.model_dump(mode="json")
+
+    def require_round_training(
+        self,
+        manifest: RoundManifest,
+    ) -> LocalTrainingRecord:
+        self._validate_training_manifest(manifest)
+        path = self._local_training_record_path(manifest.round_id)
+        if not self.store.exists(path):
+            raise ClientRuntimeError(
+                "the Client has not trained for this signed round manifest"
+            )
+        record = LocalTrainingRecord.model_validate(self.store.read_json(path))
+        current_dataset_hash = private_dataset_semantic_hash(
+            load_private_examples(self.private_data_path)
+        )
+        self._validate_local_training_record(
+            record,
+            manifest,
+            dataset_hash=current_dataset_hash,
+        )
+        return record
+
+    def _validate_training_manifest(self, manifest: RoundManifest) -> None:
+        if self.client_id not in manifest.selected_client_ids:
+            raise ClientRuntimeError("Client is not selected for this round")
+        expected_profile_hash = manifest.selected_client_profile_hashes.get(
+            self.client_id
+        )
+        if expected_profile_hash != self.model_profile.profile_hash():
+            raise ClientRuntimeError(
+                "signed manifest is bound to another Client model profile"
+            )
+        if manifest.prompt_template_hash != self.model_profile.prompt_template_hash:
+            raise ClientRuntimeError(
+                "signed manifest prompt differs from the Client ModelProfile"
+            )
+        if manifest.label_format != "chat_sft_answer_only_v1":
+            raise ClientRuntimeError(
+                "signed manifest requires another private label format"
+            )
+        if manifest.truncation_policy != "reject":
+            raise ClientRuntimeError(
+                "signed manifest requires another truncation policy"
+            )
+        if (
+            self.model_profile.training_backend == "transformers"
+            and manifest.dp_policy.required
+        ):
+            raise ClientRuntimeError(
+                "real DP-SGD is not implemented for Client PEFT training"
+            )
+
+    def _validate_local_training_record(
+        self,
+        record: LocalTrainingRecord,
+        manifest: RoundManifest,
+        *,
+        dataset_hash: str | None = None,
+    ) -> None:
+        if record.round_id != manifest.round_id:
+            raise ClientRuntimeError("local training record belongs to another round")
+        if record.manifest_hash != manifest.manifest_hash:
+            raise ClientRuntimeError(
+                "local training record belongs to another signed manifest"
+            )
+        if record.client_model_profile_hash != self.model_profile.profile_hash():
+            raise ClientRuntimeError(
+                "local training record belongs to another Client profile"
+            )
+        if dataset_hash is not None and (
+            record.private_dataset_semantic_hash != dataset_hash
+        ):
+            raise ClientRuntimeError(
+                "private dataset changed after round-bound local training"
+            )
+        state = self.state()
+        if int(state["training_adapter_version"]) != (
+            record.result_adapter_version
+        ):
+            raise ClientRuntimeError(
+                "current training adapter belongs to another local training run"
+            )
+        if state.get("training_checkpoint_hash") != record.result_checkpoint_hash:
+            raise ClientRuntimeError(
+                "current training checkpoint differs from the round record"
+            )
+        if self.adapter_store is not None:
+            current = self.adapter_store.current()
+            if current is None:
+                raise ClientRuntimeError("current PEFT adapter checkpoint is missing")
+            metadata, _ = current
+            if (
+                metadata.version != record.result_adapter_version
+                or metadata.checkpoint_hash != record.result_checkpoint_hash
+            ):
+                raise ClientRuntimeError(
+                    "current PEFT checkpoint differs from the round record"
+                )
 
     @staticmethod
     def _pending_package_path(round_id: str) -> str:
@@ -551,6 +823,21 @@ class ClientRuntime:
             "package_hash": package.package_hash,
             "created_at": utc_text(self.now_fn()),
         }
+        training_record_path = self._local_training_record_path(
+            manifest.round_id
+        )
+        if self.store.exists(training_record_path):
+            training_record = LocalTrainingRecord.model_validate(
+                self.store.read_json(training_record_path)
+            )
+            snapshot.update(
+                {
+                    "local_training_record_hash": training_record.record_hash,
+                    "training_checkpoint_hash": (
+                        training_record.result_checkpoint_hash
+                    ),
+                }
+            )
 
         try:
             self.store.write_json_if_absent(

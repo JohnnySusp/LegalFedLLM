@@ -1,6 +1,6 @@
 """Optional FedMKT machine-learning components.
 
-Import concrete modules only after installing requirements-ml.txt.
+Import concrete modules only after installing requirements.txt.
 """
 
 __all__ = [

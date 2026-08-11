@@ -1092,7 +1092,7 @@ def _import_pymupdf():
         import pymupdf
     except ImportError as exc:
         raise RuntimeError(
-            "PyMuPDF is required for GLD import. Install requirements-tools.txt first."
+            "PyMuPDF is required for GLD import. Install requirements.txt first."
         ) from exc
     return pymupdf
 

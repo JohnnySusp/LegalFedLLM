@@ -364,8 +364,10 @@ class CoordinatorService:
                     "in the protocol-first milestone"
                 )
 
-            for client_id in request.selected_client_ids:
-                self.get_registration(client_id)
+            registrations = {
+                client_id: self.get_registration(client_id)
+                for client_id in request.selected_client_ids
+            }
             if self.store.exists("rounds/current.json"):
                 current = self.store.read_json("rounds/current.json")
                 state = self.get_state(current["round_id"])
@@ -390,6 +392,10 @@ class CoordinatorService:
                 coordinator_id=self.coordinator_id,
                 current_host_adapter_version=host_identity.adapter_version,
                 host_model_profile=host_identity.model_profile,
+                selected_client_profile_hashes={
+                    client_id: registration.model_profile.profile_hash()
+                    for client_id, registration in registrations.items()
+                },
                 request=request,
                 submission_deadline=utc_text(deadline),
             )
@@ -509,6 +515,13 @@ class CoordinatorService:
                 raise ConflictError("alignment profile does not match the manifest")
 
             registration = self.get_registration(package.sender_id)
+            expected_profile_hash = manifest.selected_client_profile_hashes[
+                package.sender_id
+            ]
+            if package.model_profile.profile_hash() != expected_profile_hash:
+                raise ConflictError(
+                    "model profile differs from the signed round manifest"
+                )
             if package.model_profile != registration.model_profile:
                 raise ConflictError("model profile differs from Client registration")
             if not package.verify_signature(registration.public_key):

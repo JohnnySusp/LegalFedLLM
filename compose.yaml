@@ -53,10 +53,11 @@ services:
     build:
       context: .
       dockerfile: client/Dockerfile
+      target: client-ml
     environment:
       CLIENT_DATA_DIR: /data/client
       CLIENT_ID: ${CLIENT_ID:-legal-client-1}
-      CLIENT_TRAINING_BACKEND: ${CLIENT_TRAINING_BACKEND:-mock}
+      CLIENT_TRAINING_BACKEND: transformers
       CLIENT_SERVING_BACKEND: ${CLIENT_SERVING_BACKEND:-mock}
       CLIENT_MODEL_ID: ${CLIENT_MODEL_ID:-legalfedllm/mock-client}
       CLIENT_OLLAMA_MODEL: ${CLIENT_OLLAMA_MODEL:-llama3.2:1b}
@@ -66,10 +67,26 @@ services:
       REGISTRATION_TOKEN: ${REGISTRATION_TOKEN:-development-registration-token}
       CLIENT_ADMIN_TOKEN: ${CLIENT_ADMIN_TOKEN:-development-client-admin-token}
       MAXIMUM_CLOCK_SKEW_SECONDS: ${MAXIMUM_CLOCK_SKEW_SECONDS:-900}
+      CLIENT_MODEL_PROFILE: ${CLIENT_MODEL_PROFILE:-qwen3-1.7b-lora-v1}
+      CLIENT_TRAINING_DEVICE: ${CLIENT_TRAINING_DEVICE:-cuda}
+      CLIENT_TRAINING_PRECISION: ${CLIENT_TRAINING_PRECISION:-bfloat16}
+      CLIENT_TRAINING_QUANTIZATION: none
+      CLIENT_PRIVATE_DATA_PATH: /private/train.jsonl
+      CLIENT_PRIVATE_DATASET_ID: ${CLIENT_PRIVATE_DATASET_ID:-client-private-v1}
+      CLIENT_MICRO_BATCH_SIZE: ${CLIENT_MICRO_BATCH_SIZE:-1}
+      CLIENT_GRADIENT_ACCUMULATION_STEPS: ${CLIENT_GRADIENT_ACCUMULATION_STEPS:-8}
+      CLIENT_LEARNING_RATE: ${CLIENT_LEARNING_RATE:-2e-4}
+      CLIENT_TRAINING_SEED: ${CLIENT_TRAINING_SEED:-42}
+      CLIENT_GRADIENT_CHECKPOINTING: ${CLIENT_GRADIENT_CHECKPOINTING:-false}
+      CLIENT_VERIFY_FROZEN_BASE_CHECKSUM: ${CLIENT_VERIFY_FROZEN_BASE_CHECKSUM:-false}
+      HF_HOME: /models/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
     ports:
       - "127.0.0.1:${CLIENT_PORT:-8001}:8001"
     volumes:
       - client_data:/data/client
+      - huggingface_cache:/models/huggingface
+      - ${CLIENT_PRIVATE_DATA_DIR:-./data/client-private}:/private:ro
     depends_on:
       coordinator:
         condition: service_healthy
@@ -78,6 +95,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    gpus: all
+    shm_size: 2gb
 
 networks:
   default:
@@ -87,3 +106,4 @@ volumes:
   coordinator_data:
   host_data:
   client_data:
+  huggingface_cache:

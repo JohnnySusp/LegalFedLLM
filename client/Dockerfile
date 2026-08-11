@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm AS client-base
 
 WORKDIR /app
 
@@ -11,3 +11,16 @@ COPY client /app/client
 ENV PYTHONPATH=/app
 
 CMD ["uvicorn", "client.main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+FROM client-base AS client
+
+FROM client-base AS client-ml
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CC=/usr/bin/gcc
+
+COPY tests/__init__.py /app/tests/__init__.py
+COPY tests/test_client_real_model.py /app/tests/test_client_real_model.py

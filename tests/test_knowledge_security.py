@@ -62,6 +62,9 @@ class KnowledgePackageSecurityTests(unittest.TestCase):
             coordinator_id="coordinator",
             current_host_adapter_version=0,
             host_model_profile=default_host_profile(),
+            selected_client_profile_hashes={
+                "client-a": default_client_profile().profile_hash()
+            },
             request=request,
             submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
         )
@@ -338,7 +341,7 @@ class ClientPackageBindingTests(unittest.IsolatedAsyncioTestCase):
             "sender role": "only Client Knowledge Packages",
             "round ID": "round ID path mismatch",
             "manifest hash": "stale manifest hash",
-            "model profile": "differs from Client registration",
+            "model profile": "differs from the signed round manifest",
             "alignment": "alignment profile",
             "dataset ID": "dataset ID",
             "dataset hash": "dataset hash",
