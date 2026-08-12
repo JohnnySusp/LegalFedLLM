@@ -10,7 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.crypto import sha256_hex
-from shared.protocol import HASH_PATTERN, ModelProfile, RoundManifest, utc_text
+from shared.protocol import HASH_PATTERN, ModelProfile, utc_text
 
 
 class TrainingContract(BaseModel):
@@ -170,6 +170,64 @@ def _input_ids(value: Any) -> list[int]:
     return value
 
 
+def encode_answer_only_example(
+    *,
+    item_id: str,
+    item_kind: str,
+    prompt: str,
+    answer: str,
+    tokenizer: Any,
+    model_profile: ModelProfile,
+    maximum_sequence_length: int | None,
+) -> EncodedTrainingExample:
+    template_options: dict[str, Any] = {}
+    if model_profile.chat_template_mode == "qwen_non_thinking":
+        template_options["enable_thinking"] = False
+
+    user_messages = [{"role": "user", "content": prompt}]
+    full_messages = [
+        *user_messages,
+        {"role": "assistant", "content": answer},
+    ]
+    prompt_ids = _input_ids(
+        tokenizer.apply_chat_template(
+            user_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            **template_options,
+        )
+    )
+    full_ids = _input_ids(
+        tokenizer.apply_chat_template(
+            full_messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            **template_options,
+        )
+    )
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        raise ValueError(
+            f"chat template is not prefix-stable for {item_id!r}"
+        )
+    if (
+        maximum_sequence_length is not None
+        and len(full_ids) > maximum_sequence_length
+    ):
+        raise ValueError(
+            f"{item_kind} {item_id!r} has {len(full_ids)} tokens, "
+            f"exceeding maximum_sequence_length="
+            f"{maximum_sequence_length}"
+        )
+    answer_ids = full_ids[len(prompt_ids) :]
+    if not answer_ids:
+        raise ValueError(f"{item_kind} {item_id!r} has no answer tokens")
+    return EncodedTrainingExample(
+        input_ids=full_ids,
+        attention_mask=[1] * len(full_ids),
+        labels=[-100] * len(prompt_ids) + answer_ids,
+    )
+
+
 def encode_private_examples(
     examples: list[PrivateTrainingExample],
     *,
@@ -177,57 +235,18 @@ def encode_private_examples(
     model_profile: ModelProfile,
     maximum_sequence_length: int,
 ) -> list[EncodedTrainingExample]:
-    encoded: list[EncodedTrainingExample] = []
-    template_options: dict[str, Any] = {}
-    if model_profile.chat_template_mode == "qwen_non_thinking":
-        template_options["enable_thinking"] = False
-
-    for example in examples:
-        user_messages = [{"role": "user", "content": example.prompt}]
-        full_messages = [
-            *user_messages,
-            {"role": "assistant", "content": example.answer},
-        ]
-        prompt_ids = _input_ids(
-            tokenizer.apply_chat_template(
-                user_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                **template_options,
-            )
+    return [
+        encode_answer_only_example(
+            item_id=example.example_id,
+            item_kind="private example",
+            prompt=example.prompt,
+            answer=example.answer,
+            tokenizer=tokenizer,
+            model_profile=model_profile,
+            maximum_sequence_length=maximum_sequence_length,
         )
-        full_ids = _input_ids(
-            tokenizer.apply_chat_template(
-                full_messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                **template_options,
-            )
-        )
-        if full_ids[: len(prompt_ids)] != prompt_ids:
-            raise ValueError(
-                f"chat template is not prefix-stable for {example.example_id!r}"
-            )
-        if len(full_ids) > maximum_sequence_length:
-            raise ValueError(
-                f"private example {example.example_id!r} has {len(full_ids)} "
-                f"tokens, exceeding maximum_sequence_length="
-                f"{maximum_sequence_length}"
-            )
-        answer_ids = full_ids[len(prompt_ids) :]
-        if not answer_ids:
-            raise ValueError(
-                f"private example {example.example_id!r} has no answer tokens"
-            )
-        labels = [-100] * len(prompt_ids) + answer_ids
-        encoded.append(
-            EncodedTrainingExample(
-                input_ids=full_ids,
-                attention_mask=[1] * len(full_ids),
-                labels=labels,
-            )
-        )
-    return encoded
+        for example in examples
+    ]
 
 
 class AdapterCheckpointMetadata(TrainingContract):

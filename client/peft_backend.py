@@ -6,8 +6,13 @@ import os
 import secrets
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+from client.knowledge import (
+    FedMKTGenerationArguments,
+    encode_reference_samples,
+    knowledge_sample_from_rows,
+)
 from client.training import (
     AdapterCheckpointStore,
     BackendTrainingResult,
@@ -17,7 +22,8 @@ from client.training import (
     encode_private_examples,
 )
 from shared.crypto import sha256_hex
-from shared.protocol import ModelProfile, RoundManifest
+from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest
+from shared.reference_dataset import ReferenceSample
 
 
 class TransformersPeftTrainingBackend:
@@ -27,6 +33,7 @@ class TransformersPeftTrainingBackend:
         data_dir: str | Path,
         model_profile: ModelProfile,
         execution_profile: TrainingExecutionProfile,
+        knowledge_batch_size: int | None = None,
     ):
         if model_profile.training_backend != "transformers":
             raise ValueError("PEFT backend requires a Transformers model profile")
@@ -35,6 +42,13 @@ class TransformersPeftTrainingBackend:
         self.data_dir = Path(data_dir).resolve()
         self.model_profile = model_profile
         self.execution_profile = execution_profile
+        self.knowledge_batch_size = (
+            int(os.getenv("CLIENT_KNOWLEDGE_BATCH_SIZE", "1"))
+            if knowledge_batch_size is None
+            else knowledge_batch_size
+        )
+        if self.knowledge_batch_size < 1:
+            raise ValueError("knowledge batch size must be positive")
         self.checkpoints = AdapterCheckpointStore(
             self.data_dir / "adapters",
             model_profile,
@@ -260,6 +274,116 @@ class TransformersPeftTrainingBackend:
             raise
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def generate_knowledge(
+        self,
+        reference_samples: Sequence[ReferenceSample],
+        manifest: RoundManifest,
+        *,
+        expected_adapter_version: int,
+        expected_checkpoint_hash: str,
+    ) -> list[KnowledgeSample]:
+        torch, transformers, peft, _ = self._dependencies()
+        from shared.fedmkt_core.ml.logit_generation import (
+            generate_pub_data_logits,
+        )
+        from shared.fedmkt_core.ml.vars_define import (
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
+
+        self._validate_device(torch)
+        transformers.set_seed(self.execution_profile.seed)
+        tokenizer = self._load_tokenizer(transformers)
+        encoded = encode_reference_samples(
+            reference_samples,
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=manifest.sample_ids,
+        )
+        if manifest.top_k > int(self.model_profile.vocabulary_size or 0):
+            raise ValueError("manifest top_k exceeds the Client vocabulary size")
+
+        current = self.checkpoints.current()
+        if current is None:
+            raise RuntimeError("current PEFT adapter checkpoint is missing")
+        metadata, checkpoint_path = current
+        if (
+            metadata.version != expected_adapter_version
+            or metadata.checkpoint_hash != expected_checkpoint_hash
+        ):
+            raise RuntimeError("current PEFT checkpoint differs from the round record")
+        if (
+            metadata.round_id != manifest.round_id
+            or metadata.manifest_hash != manifest.manifest_hash
+        ):
+            raise RuntimeError("current PEFT checkpoint belongs to another round")
+
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                checkpoint_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(model)
+            if any(parameter.requires_grad for parameter in model.parameters()):
+                raise RuntimeError("knowledge generation loaded trainable parameters")
+            model.eval()
+
+            collator = _AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+            arguments = FedMKTGenerationArguments(
+                top_k_logits_keep=manifest.top_k
+            )
+            generated: list[KnowledgeSample] = []
+            for start in range(0, len(encoded), self.knowledge_batch_size):
+                batch_values = encoded[start : start + self.knowledge_batch_size]
+                inputs = {
+                    "input_ids": [item.input_ids for item in batch_values],
+                    "attention_mask": [
+                        item.attention_mask for item in batch_values
+                    ],
+                    "labels": [item.labels for item in batch_values],
+                }
+                result = generate_pub_data_logits(
+                    inputs,
+                    model,
+                    arguments,
+                    collator,
+                )
+                token_ids = result[PER_STEP_INDICES]
+                logits = result[PER_STEP_LOGITS]
+                losses = result[METRIC]
+                if (
+                    token_ids.size(0) != len(batch_values)
+                    or logits.size(0) != len(batch_values)
+                    or losses.numel() != len(batch_values)
+                ):
+                    raise RuntimeError("FedMKT returned an invalid batch shape")
+                for index, item in enumerate(batch_values):
+                    generated.append(
+                        knowledge_sample_from_rows(
+                            item,
+                            top_k_token_ids=token_ids[index].tolist(),
+                            top_k_logits=logits[index].tolist(),
+                            ce_loss=float(losses[index].item()),
+                        )
+                    )
+
+            if [sample.sample_id for sample in generated] != list(
+                manifest.sample_ids
+            ):
+                raise RuntimeError("generated knowledge changed the signed D^P order")
+            return generated
+        finally:
+            del model, base_model
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

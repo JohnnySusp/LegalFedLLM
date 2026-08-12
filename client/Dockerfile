@@ -23,4 +23,5 @@ RUN apt-get update \
 ENV CC=/usr/bin/gcc
 
 COPY tests/__init__.py /app/tests/__init__.py
+COPY tests/test_client_knowledge.py /app/tests/test_client_knowledge.py
 COPY tests/test_client_real_model.py /app/tests/test_client_real_model.py

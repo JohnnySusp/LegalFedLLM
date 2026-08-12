@@ -22,6 +22,7 @@ from shared.ollama import OllamaClient
 from shared.protocol import (
     DifferentialPrivacyReport,
     KnowledgePackage,
+    KnowledgeSample,
     LoraProfile,
     ModelProfile,
     OllamaProfile,
@@ -105,6 +106,7 @@ class ClientRuntime:
         private_data_path: str | Path | None = None,
         private_dataset_id: str | None = None,
         training_execution_profile: TrainingExecutionProfile | None = None,
+        knowledge_batch_size: int | None = None,
         maximum_clock_skew_seconds: int = 900,
         now_fn: Callable[[], Any] = utc_now,
     ):
@@ -139,6 +141,13 @@ class ClientRuntime:
             raise ValueError(
                 "training execution backend differs from the ModelProfile"
             )
+        self.knowledge_batch_size = (
+            int(os.getenv("CLIENT_KNOWLEDGE_BATCH_SIZE", "1"))
+            if knowledge_batch_size is None
+            else knowledge_batch_size
+        )
+        if self.knowledge_batch_size < 1:
+            raise ValueError("knowledge batch size must be positive")
 
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
         self.now_fn = now_fn
@@ -655,6 +664,44 @@ class ClientRuntime:
             )
             return path
         raise ClientRuntimeError("Knowledge Package artifact is missing")
+
+    def generate_knowledge_samples(
+        self,
+        manifest: RoundManifest,
+    ) -> list[KnowledgeSample]:
+        record = self.require_round_training(manifest)
+        self.verify_cached_reference_dataset(manifest)
+        reference_samples = load_reference_jsonl(
+            self.store.path(self._reference_dataset_path(manifest.round_id))
+        )
+
+        if self.model_profile.training_backend == "mock":
+            return deterministic_knowledge_samples(
+                manifest=manifest,
+                participant_id=self.client_id,
+                role="client",
+                adapter_version=record.result_adapter_version,
+            )
+
+        from client.peft_backend import TransformersPeftTrainingBackend
+
+        backend = TransformersPeftTrainingBackend(
+            data_dir=self.store.root,
+            model_profile=self.model_profile,
+            execution_profile=self.training_execution_profile,
+            knowledge_batch_size=self.knowledge_batch_size,
+        )
+        try:
+            return backend.generate_knowledge(
+                reference_samples,
+                manifest,
+                expected_adapter_version=record.result_adapter_version,
+                expected_checkpoint_hash=record.result_checkpoint_hash,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ClientRuntimeError(
+                f"real Client knowledge generation failed: {exc}"
+            ) from exc
 
     def incoming_host_artifact_path(self, round_id: str) -> Path:
         return self.store.path(

@@ -31,17 +31,26 @@ class Metric:
     def cal_metric(cls, logits, input_ids, attention_mask, labels, training_args):
         if training_args.metric_type == "ce":
             return cls.cal_ce(logits, input_ids, attention_mask, labels, training_args)
-        raise NotImplementedError(f"metric={training_args.metric_type} is not implemented")
+        raise NotImplementedError(
+            f"metric={training_args.metric_type} is not implemented"
+        )
 
     @classmethod
     def cal_ce(cls, logits, input_ids, attention_mask, labels, training_args):
+        shifted_labels = labels[..., 1:].contiguous()
         metric = F.cross_entropy(
-            logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
-            labels[..., 1:].contiguous().view(-1),
+            logits[..., :-1, :].contiguous().float().view(-1, logits.size(-1)),
+            shifted_labels.view(-1),
             reduction="none",
         ).view(logits.size(0), -1)
-        mask = attention_mask[..., 1:]
-        return (metric * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1)
+        mask = shifted_labels.ne(-100) & attention_mask[..., 1:].bool()
+        supervised = mask.sum(dim=-1)
+        if torch.any(supervised == 0):
+            raise ValueError("CE requires at least one supervised target token")
+        result = (metric * mask).sum(dim=-1) / supervised
+        if not torch.isfinite(result).all():
+            raise ValueError("CE produced a non-finite per-sample loss")
+        return result
 
 
 class LogitsSelection:
@@ -80,7 +89,11 @@ def generate_pub_data_logits(inputs, model, training_args, data_collator):
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        logits = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).logits
         metric = Metric.cal_metric(
             logits, input_ids, attention_mask, labels, training_args
         )
@@ -89,7 +102,7 @@ def generate_pub_data_logits(inputs, model, training_args, data_collator):
         selected_logits, selected_indices = LogitsSelection.select_logits(
             logits, training_args
         )
-        inputs[PER_STEP_LOGITS] = selected_logits.detach().cpu()
+        inputs[PER_STEP_LOGITS] = selected_logits.detach().float().cpu()
         inputs[PER_STEP_INDICES] = selected_indices.detach().cpu()
         inputs[METRIC] = metric.detach().cpu()
 
