@@ -403,19 +403,25 @@ class AdapterCheckpointStore:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         if set(pointer) != {"version", "checkpoint_hash", "profile_hash"}:
             raise ValueError("adapter current pointer has an invalid schema")
-        path = self.version_path(int(pointer["version"]))
-        metadata_path = path / "checkpoint.json"
-        if not metadata_path.is_file():
-            raise ValueError("current adapter checkpoint metadata is missing")
-        metadata = AdapterCheckpointMetadata.model_validate_json(
-            metadata_path.read_text(encoding="utf-8")
-        )
+        metadata, path = self.version(int(pointer["version"]))
         if pointer != {
             "version": metadata.version,
             "checkpoint_hash": metadata.checkpoint_hash,
             "profile_hash": metadata.profile_hash,
         }:
             raise ValueError("adapter current pointer does not match its metadata")
+        return metadata, path
+
+    def version(self, version: int) -> tuple[AdapterCheckpointMetadata, Path]:
+        path = self.version_path(version)
+        metadata_path = path / "checkpoint.json"
+        if not metadata_path.is_file():
+            raise ValueError(f"adapter checkpoint version {version} is missing")
+        metadata = AdapterCheckpointMetadata.model_validate_json(
+            metadata_path.read_text(encoding="utf-8")
+        )
+        if metadata.version != version:
+            raise ValueError("adapter checkpoint directory has another version")
         self._validate_directory(path, metadata)
         return metadata, path
 

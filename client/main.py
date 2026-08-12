@@ -259,15 +259,16 @@ def create_app(
     app = FastAPI(title="LegalFedLLM Client Agent", version="0.2.0")
     app.state.runtime = client_runtime
     app.state.gateway = coordinator
-    app.state.training_lock = asyncio.Lock()
+    app.state.ml_lock = asyncio.Lock()
+    app.state.training_lock = app.state.ml_lock
 
-    async def run_exclusive_training(call, *args) -> dict[str, Any]:
-        if app.state.training_lock.locked():
+    async def run_exclusive_ml(call, *args):
+        if app.state.ml_lock.locked():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="another local training job is already running",
+                detail="another local ML job is already running",
             )
-        async with app.state.training_lock:
+        async with app.state.ml_lock:
             return await asyncio.to_thread(call, *args)
 
     def require_client_admin_token(
@@ -315,7 +316,7 @@ def create_app(
     )
     async def local_train(request: LocalTrainRequest) -> dict[str, Any]:
         try:
-            return await run_exclusive_training(
+            return await run_exclusive_ml(
                 client_runtime.local_train,
                 request.examples,
             )
@@ -339,7 +340,7 @@ def create_app(
     async def local_train_round(round_id: str) -> dict[str, Any]:
         manifest = await verified_manifest(round_id)
         try:
-            return await run_exclusive_training(
+            return await run_exclusive_ml(
                 client_runtime.local_train_round,
                 manifest,
             )
@@ -351,7 +352,10 @@ def create_app(
         *,
         require_round_training: bool,
     ) -> SubmissionReceipt:
-        if require_round_training:
+        if (
+            require_round_training
+            and client_runtime.model_profile.training_backend != "transformers"
+        ):
             client_runtime.require_round_training(manifest)
 
         reference_content = await coordinator.reference_dataset(
@@ -364,7 +368,13 @@ def create_app(
                 content=reference_content,
             )
 
-        package = client_runtime.create_knowledge_package(manifest)
+        if client_runtime.model_profile.training_backend == "transformers":
+            package = await run_exclusive_ml(
+                client_runtime.create_knowledge_package,
+                manifest,
+            )
+        else:
+            package = client_runtime.create_knowledge_package(manifest)
         receipt = await coordinator.submit(
             package,
             client_runtime.package_artifact_path(package),

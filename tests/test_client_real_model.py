@@ -15,6 +15,7 @@ from client.training import (
     execution_profile_from_environment,
 )
 from shared.crypto import Ed25519Identity, sha256_hex
+from shared.knowledge_artifact import load_package_samples
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import (
     LoraProfile,
@@ -170,7 +171,51 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 manifest=manifest,
                 content=reference_path.read_bytes(),
             )
-            knowledge = restarted.generate_knowledge_samples(manifest)
+            package = restarted.create_knowledge_package(manifest)
+            artifact_path = restarted.package_artifact_path(package)
+            artifact_before_retry = artifact_path.read_bytes()
+            knowledge = load_package_samples(
+                artifact_path,
+                package,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            retry = restarted.create_knowledge_package(manifest)
+            self.assertEqual(retry, package)
+            self.assertEqual(
+                restarted.package_artifact_path(retry).read_bytes(),
+                artifact_before_retry,
+            )
+            self.assertEqual(package.round_id, manifest.round_id)
+            self.assertEqual(package.manifest_hash, manifest.manifest_hash)
+            self.assertEqual(package.sender_id, "client-a")
+            self.assertEqual(package.sender_role, "client")
+            self.assertEqual(package.model_profile, profile)
+            self.assertEqual(
+                package.adapter_version,
+                record["result_adapter_version"],
+            )
+            self.assertEqual(package.sample_ids, manifest.sample_ids)
+            self.assertEqual(package.top_k, manifest.top_k)
+            self.assertTrue(package.verify_signature(restarted.identity.public_key_b64))
+            self.assertEqual(
+                package.artifact.sha256,
+                sha256_hex(artifact_before_retry),
+            )
+            self.assertLessEqual(
+                package.artifact.byte_size,
+                manifest.maximum_knowledge_package_bytes,
+            )
+            exported_bytes = (
+                json.dumps(
+                    package.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+                + artifact_before_retry
+            )
+            for row in rows:
+                self.assertNotIn(row["prompt"].encode("utf-8"), exported_bytes)
+                self.assertNotIn(row["answer"].encode("utf-8"), exported_bytes)
             self.assertEqual(
                 [sample.sample_id for sample in knowledge],
                 [sample.sample_id for sample in reference_samples],
@@ -211,6 +256,9 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 "knowledge_total_token_count": sum(
                     sample.attention_length for sample in knowledge
                 ),
+                "package_hash": package.package_hash,
+                "artifact_sha256": package.artifact.sha256,
+                "artifact_byte_size": package.artifact.byte_size,
                 "minimum_ce_loss": min(sample.ce_loss for sample in knowledge),
                 "maximum_ce_loss": max(sample.ce_loss for sample in knowledge),
             }

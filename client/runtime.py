@@ -453,6 +453,114 @@ class ClientRuntime:
     def _receipt_path(round_id: str) -> str:
         return f"knowledge_cache/receipts/{round_id}.json"
 
+    def _validate_package_snapshot(
+        self,
+        *,
+        manifest: RoundManifest,
+        package: KnowledgePackage,
+        snapshot_path: str,
+    ) -> dict[str, Any]:
+        if not self.store.exists(snapshot_path):
+            raise ClientRuntimeError(
+                "Knowledge Package adapter snapshot is missing"
+            )
+        snapshot = self.store.read_json(snapshot_path)
+        expected = {
+            "round_id": manifest.round_id,
+            "manifest_hash": manifest.manifest_hash,
+            "client_id": self.client_id,
+            "model_profile_id": self.model_profile.profile_id,
+            "model_profile_hash": self.model_profile.profile_hash(),
+            "adapter_version": package.adapter_version,
+            "package_hash": package.package_hash,
+            "artifact_sha256": package.artifact.sha256,
+        }
+        mismatched = [
+            name
+            for name, value in expected.items()
+            if snapshot.get(name) != value
+        ]
+        if mismatched:
+            raise ClientRuntimeError(
+                "Knowledge Package adapter snapshot differs: "
+                + ", ".join(sorted(mismatched))
+            )
+        if (
+            package.round_id != manifest.round_id
+            or package.manifest_hash != manifest.manifest_hash
+            or package.sender_id != self.client_id
+            or package.sender_role != "client"
+            or package.model_profile != self.model_profile
+            or package.reference_dataset_id != manifest.reference_dataset_id
+            or package.reference_dataset_hash != manifest.reference_dataset_hash
+            or package.sample_ids != manifest.sample_ids
+            or package.top_k != manifest.top_k
+        ):
+            raise ClientRuntimeError(
+                "cached Knowledge Package differs from its signed round"
+            )
+        if not package.verify_signature(self.identity.public_key_b64):
+            raise ClientRuntimeError(
+                "cached Knowledge Package signature is invalid"
+            )
+
+        training_path = self._local_training_record_path(manifest.round_id)
+        if not self.store.exists(training_path):
+            if self.model_profile.training_backend == "transformers":
+                raise ClientRuntimeError(
+                    "real Knowledge Package training record is missing"
+                )
+            if (
+                "local_training_record_hash" in snapshot
+                or "training_checkpoint_hash" in snapshot
+            ):
+                raise ClientRuntimeError(
+                    "Knowledge Package snapshot names a missing training record"
+                )
+            return snapshot
+
+        try:
+            record = LocalTrainingRecord.model_validate(
+                self.store.read_json(training_path)
+            )
+        except (OSError, ValueError) as exc:
+            raise ClientRuntimeError(
+                f"Knowledge Package training record is invalid: {exc}"
+            ) from exc
+        if (
+            record.round_id != manifest.round_id
+            or record.manifest_hash != manifest.manifest_hash
+            or record.client_model_profile_hash
+            != self.model_profile.profile_hash()
+            or record.result_adapter_version != package.adapter_version
+            or snapshot.get("local_training_record_hash")
+            != record.record_hash
+            or snapshot.get("training_checkpoint_hash")
+            != record.result_checkpoint_hash
+        ):
+            raise ClientRuntimeError(
+                "Knowledge Package training provenance differs"
+            )
+
+        if self.adapter_store is not None:
+            try:
+                metadata, _ = self.adapter_store.version(
+                    record.result_adapter_version
+                )
+            except (OSError, ValueError) as exc:
+                raise ClientRuntimeError(
+                    f"Knowledge Package adapter checkpoint is invalid: {exc}"
+                ) from exc
+            if (
+                metadata.checkpoint_hash != record.result_checkpoint_hash
+                or metadata.round_id != manifest.round_id
+                or metadata.manifest_hash != manifest.manifest_hash
+            ):
+                raise ClientRuntimeError(
+                    "Knowledge Package adapter checkpoint differs"
+                )
+        return snapshot
+
 
     @staticmethod
     def _reference_dataset_path(round_id: str) -> str:
@@ -735,10 +843,14 @@ class ClientRuntime:
         accepted_artifact_path = self._accepted_artifact_path(
             manifest.round_id
         )
+        accepted_snapshot_path = self._accepted_snapshot_path(
+            manifest.round_id
+        )
 
         accepted_exists = (
             self.store.exists(accepted_path),
             self.store.exists(accepted_artifact_path),
+            self.store.exists(accepted_snapshot_path),
         )
         if any(accepted_exists) and not all(accepted_exists):
             raise ClientRuntimeError(
@@ -761,6 +873,11 @@ class ClientRuntime:
                 accepted,
                 maximum_bytes=manifest.maximum_knowledge_package_bytes,
             )
+            self._validate_package_snapshot(
+                manifest=manifest,
+                package=accepted,
+                snapshot_path=accepted_snapshot_path,
+            )
 
             return accepted
 
@@ -768,10 +885,14 @@ class ClientRuntime:
         pending_artifact_path = self._pending_artifact_path(
             manifest.round_id
         )
+        pending_snapshot_path = self._pending_snapshot_path(
+            manifest.round_id
+        )
 
         pending_exists = (
             self.store.exists(pending_path),
             self.store.exists(pending_artifact_path),
+            self.store.exists(pending_snapshot_path),
         )
         if any(pending_exists) and not all(pending_exists):
             raise ClientRuntimeError(
@@ -794,18 +915,28 @@ class ClientRuntime:
                 pending,
                 maximum_bytes=manifest.maximum_knowledge_package_bytes,
             )
+            self._validate_package_snapshot(
+                manifest=manifest,
+                package=pending,
+                snapshot_path=pending_snapshot_path,
+            )
 
             return pending
 
         state = self.state()
-        adapter_version = int(state["candidate_adapter_version"])
-
-        samples = deterministic_knowledge_samples(
-            manifest=manifest,
-            participant_id=self.client_id,
-            role="client",
-            adapter_version=adapter_version,
-        )
+        training_record: LocalTrainingRecord | None = None
+        if self.model_profile.training_backend == "transformers":
+            training_record = self.require_round_training(manifest)
+            adapter_version = training_record.result_adapter_version
+            samples = self.generate_knowledge_samples(manifest)
+        else:
+            adapter_version = int(state["candidate_adapter_version"])
+            samples = deterministic_knowledge_samples(
+                manifest=manifest,
+                participant_id=self.client_id,
+                role="client",
+                adapter_version=adapter_version,
+            )
 
         try:
             descriptor = write_knowledge_artifact(
@@ -868,19 +999,23 @@ class ClientRuntime:
             "manifest_hash": manifest.manifest_hash,
             "client_id": self.client_id,
             "model_profile_id": self.model_profile.profile_id,
+            "model_profile_hash": self.model_profile.profile_hash(),
             "adapter_version": adapter_version,
             "local_training_runs": int(state["local_training_runs"]),
             "state_hash": sha256_hex(state),
             "package_hash": package.package_hash,
+            "artifact_sha256": descriptor.sha256,
             "created_at": utc_text(self.now_fn()),
         }
-        training_record_path = self._local_training_record_path(
-            manifest.round_id
-        )
-        if self.store.exists(training_record_path):
-            training_record = LocalTrainingRecord.model_validate(
-                self.store.read_json(training_record_path)
+        if training_record is None:
+            training_record_path = self._local_training_record_path(
+                manifest.round_id
             )
+            if self.store.exists(training_record_path):
+                training_record = LocalTrainingRecord.model_validate(
+                    self.store.read_json(training_record_path)
+                )
+        if training_record is not None:
             snapshot.update(
                 {
                     "local_training_record_hash": training_record.record_hash,
@@ -892,17 +1027,22 @@ class ClientRuntime:
 
         try:
             self.store.write_json_if_absent(
-                self._pending_snapshot_path(manifest.round_id),
+                pending_snapshot_path,
                 snapshot,
             )
             self.store.write_json_if_absent(
                 pending_path,
                 package.model_dump(mode="json"),
             )
+            self._validate_package_snapshot(
+                manifest=manifest,
+                package=package,
+                snapshot_path=pending_snapshot_path,
+            )
         except Exception:
             self.store.delete(pending_path)
             self.store.delete(pending_artifact_path)
-            self.store.delete(self._pending_snapshot_path(manifest.round_id))
+            self.store.delete(pending_snapshot_path)
             raise
 
         return package
@@ -951,6 +1091,11 @@ class ClientRuntime:
             maximum_bytes=manifest.maximum_knowledge_package_bytes,
         )
         snapshot = self.store.read_json(snapshot_path)
+        self._validate_package_snapshot(
+            manifest=manifest,
+            package=pending,
+            snapshot_path=snapshot_path,
+        )
 
         if pending.package_hash != package.package_hash:
             raise ClientRuntimeError(
@@ -1029,6 +1174,12 @@ class ClientRuntime:
                 accepted_snapshot_path,
                 snapshot,
             )
+
+        self._validate_package_snapshot(
+            manifest=manifest,
+            package=package,
+            snapshot_path=accepted_snapshot_path,
+        )
 
         self.store.write_json(
             self._receipt_path(manifest.round_id),
