@@ -913,6 +913,7 @@ class CoordinatorService:
                 client_packages=packages,
                 client_samples=client_samples,
                 safety_reports=reports,
+                selected_client_ids=manifest.selected_client_ids,
             )
             self.store.write_json(
                 f"rounds/{manifest.round_id}/validated_distillation_dataset.json",

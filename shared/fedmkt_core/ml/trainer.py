@@ -54,6 +54,10 @@ class FedMKTTrainer(Seq2SeqTrainer):
         self.distill_strategy = distill_strategy
 
     def compute_loss(self, model, inputs, return_outputs=False):
+        distillation_labels = inputs.get("labels")
+        if distillation_labels is None:
+            raise ValueError("answer-only distillation requires labels")
+
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
@@ -145,7 +149,18 @@ class FedMKTTrainer(Seq2SeqTrainer):
         else:
             raise ValueError(f"Not implement distill_loss_type={self.distill_loss_type}")
 
-        loss_lm = (loss_lm * inputs["attention_mask"]).sum() / inputs["attention_mask"].sum()
+        distillation_mask = (
+            distillation_labels[..., 1:].ne(-100)
+            & inputs["attention_mask"][..., 1:].bool()
+        )
+        supervised_positions = distillation_mask.sum()
+        if supervised_positions == 0:
+            raise ValueError(
+                "answer-only distillation requires at least one supervised target token"
+            )
+        loss_lm = (
+            loss_lm[..., :-1] * distillation_mask
+        ).sum() / supervised_positions
         loss = self.lm_loss_weight * loss + (1.0 - self.lm_loss_weight) * loss_lm
 
         return (loss, outputs) if return_outputs else loss

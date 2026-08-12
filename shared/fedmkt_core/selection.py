@@ -18,35 +18,40 @@ def dual_min_ce_select(
     client_packages: list[KnowledgePackage],
     client_samples: Mapping[str, list[KnowledgeSample]],
     safety_reports: Mapping[str, SafetyReport],
+    selected_client_ids: list[str],
 ) -> ValidatedDistillationDataset:
     host_by_id = {sample.sample_id: sample for sample in host_samples}
     client_by_id = {
         sender_id: {sample.sample_id: sample for sample in samples}
         for sender_id, samples in client_samples.items()
     }
+    packages_by_id = {package.sender_id: package for package in client_packages}
     selected: list[ValidatedDistillationSample] = []
 
     for sample_id in host_package.sample_ids:
         host_sample = host_by_id[sample_id]
-        candidates: list[tuple[float, str, float]] = []
-        for package in client_packages:
-            report = safety_reports[package.sender_id]
+        candidates = [
+            (host_sample.ce_loss, host_package.sender_id, 1.0, host_sample)
+        ]
+        for client_id in selected_client_ids:
+            if client_id not in packages_by_id:
+                continue
+            report = safety_reports[client_id]
             if not report.accepted or report.trust_score <= 0:
                 continue
             candidates.append(
                 (
-                    client_by_id[package.sender_id][sample_id].ce_loss,
-                    package.sender_id,
+                    client_by_id[client_id][sample_id].ce_loss,
+                    client_id,
                     report.trust_score,
+                    client_by_id[client_id][sample_id],
                 )
             )
 
-        if not candidates:
-            continue
-        teacher_loss, teacher_id, trust_weight = min(candidates, key=lambda item: item[0])
-        if teacher_loss >= host_sample.ce_loss:
-            continue
-        teacher = client_by_id[teacher_id][sample_id]
+        teacher_loss, teacher_id, trust_weight, teacher = min(
+            candidates,
+            key=lambda item: item[0],
+        )
         selected.append(
             ValidatedDistillationSample(
                 sample_id=sample_id,
