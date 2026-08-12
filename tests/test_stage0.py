@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -612,12 +613,31 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
 class StageZeroValidationTests(unittest.TestCase):
     def test_client_real_backend_is_lazy_while_host_remains_mock_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            self.assertNotIn("torch", sys.modules)
-            ClientRuntime(
-                data_dir=Path(directory) / "client",
-                model_profile=pinned_client_profile(QWEN_PROFILE_ID),
+            lazy_import = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "from pathlib import Path; "
+                        "from client.model_profiles import "
+                        "QWEN_PROFILE_ID, pinned_client_profile; "
+                        "from client.runtime import ClientRuntime; "
+                        f"ClientRuntime(data_dir=Path({str(Path(directory) / 'client')!r}), "
+                        "model_profile=pinned_client_profile(QWEN_PROFILE_ID)); "
+                        "unexpected = sorted({'torch', 'transformers', 'peft'} "
+                        "& set(sys.modules)); "
+                        "raise SystemExit(','.join(unexpected) if unexpected else 0)"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
             )
-            self.assertNotIn("torch", sys.modules)
+            self.assertEqual(
+                lazy_import.returncode,
+                0,
+                lazy_import.stderr or lazy_import.stdout,
+            )
 
             host_data = default_host_profile().model_dump(mode="json")
             host_data["training_backend"] = "transformers"

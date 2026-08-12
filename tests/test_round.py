@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
 from client.main import CoordinatorGateway, create_app as create_client_app
-from client.runtime import ClientRuntime
+from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService, HostGateway
 from host.main import create_app as create_host_app
@@ -70,7 +72,20 @@ class Stack:
         self.coordinator_transport = httpx.ASGITransport(app=self.coordinator_app)
 
     def client(self, client_id: str):
-        runtime = ClientRuntime(data_dir=self.root / client_id, client_id=client_id)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CLIENT_MODEL_PROFILE": "mock",
+                "CLIENT_TRAINING_BACKEND": "mock",
+                "CLIENT_SERVING_BACKEND": "mock",
+            },
+        ):
+            model_profile = default_client_profile()
+        runtime = ClientRuntime(
+            data_dir=self.root / client_id,
+            client_id=client_id,
+            model_profile=model_profile,
+        )
         gateway = CoordinatorGateway(
             "http://coordinator",
             self.registration_token,

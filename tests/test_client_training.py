@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import sys
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
 import httpx
 from pydantic import ValidationError
@@ -21,6 +23,7 @@ from client.model_profiles import (
 from client.runtime import ClientRuntime, ClientRuntimeError
 from client.training import (
     AdapterCheckpointStore,
+    LocalTrainingRecord,
     PrivateTrainingExample,
     TrainingExecutionProfile,
     encode_private_examples,
@@ -238,6 +241,51 @@ class PrivateTrainingContractTests(unittest.TestCase):
                 precision="bfloat16",
             )
 
+    def test_execution_profile_preserves_legacy_hash_semantics(self) -> None:
+        profile = TrainingExecutionProfile(
+            schema_version="1.0",
+            backend="mock",
+            device="cpu",
+            precision="float32",
+        )
+        payload = profile.model_dump(mode="json")
+        payload.pop("learning_rate_scheduler")
+        self.assertEqual(profile.profile_hash(), sha256_hex(payload))
+
+    def test_schema_1_0_training_record_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_path = root / "private.jsonl"
+            private_path.write_text(
+                '{"schema_version":"1.0","example_id":"legacy-1",'
+                '"prompt":"question","answer":"answer"}\n',
+                encoding="utf-8",
+            )
+            profile = mock_profile()
+            runtime = ClientRuntime(
+                data_dir=root / "client",
+                client_id="client-a",
+                model_profile=profile,
+                private_data_path=private_path,
+            )
+            record = runtime.local_train_round(manifest_for(directory, profile))
+            legacy = dict(record)
+            legacy["schema_version"] = "1.0"
+            execution = dict(legacy["training_execution_profile"])
+            execution["schema_version"] = "1.0"
+            execution.pop("learning_rate_scheduler")
+            legacy["training_execution_profile"] = execution
+            legacy["training_execution_profile_hash"] = sha256_hex(execution)
+            legacy.pop("optimizer_step_count")
+            legacy.pop("training_loss")
+            legacy["record_hash"] = sha256_hex(
+                {key: value for key, value in legacy.items() if key != "record_hash"}
+            )
+            loaded = LocalTrainingRecord.model_validate(legacy)
+            self.assertEqual(loaded.schema_version, "1.0")
+            self.assertIsNone(loaded.optimizer_step_count)
+            self.assertIsNone(loaded.training_loss)
+
 
 class AdapterCheckpointStoreTests(unittest.TestCase):
     @staticmethod
@@ -313,12 +361,37 @@ class AdapterCheckpointStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "hash"):
                 store.current()
 
+    def test_failed_candidate_is_discarded_without_moving_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pinned_client_profile(QWEN_PROFILE_ID)
+            store = AdapterCheckpointStore(directory, profile)
+            current_staging = store.staging_path("current")
+            self.write_adapter(current_staging, b"current")
+            current_metadata = store.seal(
+                current_staging,
+                version=0,
+                parent=None,
+                round_id=None,
+                manifest_hash=None,
+                execution_profile_hash=None,
+            )
+            store.promote(current_staging, current_metadata)
+
+            failed_staging = store.staging_path("failed")
+            self.write_adapter(failed_staging, b"failed-candidate")
+            store.discard_staging(failed_staging)
+
+            self.assertFalse(failed_staging.exists())
+            recovered, _ = store.current()
+            self.assertEqual(recovered.version, current_metadata.version)
+            self.assertEqual(
+                recovered.checkpoint_hash,
+                current_metadata.checkpoint_hash,
+            )
+
 
 class RoundBoundTrainingTests(unittest.TestCase):
     def test_round_record_binds_manifest_dataset_profile_and_adapter(self) -> None:
-        self.assertNotIn("torch", sys.modules)
-        self.assertNotIn("transformers", sys.modules)
-        self.assertNotIn("peft", sys.modules)
         with tempfile.TemporaryDirectory() as directory:
             private_path = Path(directory) / "private.jsonl"
             private_marker = "confidential matter alpha"
@@ -344,6 +417,13 @@ class RoundBoundTrainingTests(unittest.TestCase):
             first_manifest = manifest_for(directory, profile, round_id="round-one")
             record = runtime.local_train_round(first_manifest)
             self.assertNotIn(private_marker, json.dumps(record))
+            self.assertEqual(record["schema_version"], "1.1")
+            self.assertEqual(record["optimizer_step_count"], 0)
+            self.assertIsNone(record["training_loss"])
+            self.assertEqual(
+                record["training_execution_profile"]["learning_rate_scheduler"],
+                "linear",
+            )
             self.assertEqual(record["round_id"], "round-one")
             self.assertEqual(record["result_adapter_version"], 1)
             runtime.require_round_training(first_manifest)
@@ -360,12 +440,108 @@ class RoundBoundTrainingTests(unittest.TestCase):
             runtime.local_train_round(second_manifest)
             with self.assertRaisesRegex(ClientRuntimeError, "another local"):
                 runtime.require_round_training(first_manifest)
-        self.assertNotIn("torch", sys.modules)
-        self.assertNotIn("transformers", sys.modules)
-        self.assertNotIn("peft", sys.modules)
+
+    def test_backend_failure_preserves_the_current_adapter_and_runtime_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_path = root / "private.jsonl"
+            private_path.write_text(
+                '{"schema_version":"1.0","example_id":"private-1",'
+                '"prompt":"question","answer":"answer"}\n',
+                encoding="utf-8",
+            )
+            profile = pinned_client_profile(QWEN_PROFILE_ID)
+            store = AdapterCheckpointStore(root / "client" / "adapters", profile)
+            staging = store.staging_path("accepted-parent")
+            AdapterCheckpointStoreTests.write_adapter(staging, b"accepted-parent")
+            parent = store.seal(
+                staging,
+                version=3,
+                parent=None,
+                round_id="earlier-round",
+                manifest_hash="0" * 64,
+                execution_profile_hash="1" * 64,
+            )
+            store.promote(staging, parent)
+            runtime = ClientRuntime(
+                data_dir=root / "client",
+                client_id="client-a",
+                model_profile=profile,
+                private_data_path=private_path,
+            )
+            manifest = manifest_for(directory, profile, round_id="failed-round")
+            state_before = runtime.state()
+
+            with mock.patch(
+                "client.peft_backend.TransformersPeftTrainingBackend.train",
+                side_effect=RuntimeError("injected training failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected"):
+                    runtime.local_train_round(manifest)
+
+            recovered, _ = runtime.adapter_store.current()
+            self.assertEqual(recovered.checkpoint_hash, parent.checkpoint_hash)
+            self.assertEqual(runtime.state(), state_before)
+            self.assertFalse(
+                runtime.store.exists(runtime._local_training_record_path("failed-round"))
+            )
 
 
 class RoundBoundTrainingApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_training_runs_off_loop_and_rejects_a_concurrent_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            runtime = ClientRuntime(
+                data_dir=Path(directory) / "client-a",
+                model_profile=mock_profile(),
+            )
+            gateway = CoordinatorGateway(
+                "http://coordinator",
+                stack.registration_token,
+                transport=stack.coordinator_transport,
+            )
+            app = create_client_app(
+                runtime,
+                gateway,
+                admin_token_override=stack.client_admin_token,
+            )
+            started = threading.Event()
+            release = threading.Event()
+            original_local_train = runtime.local_train
+
+            def slow_local_train(examples):
+                started.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test training release timed out")
+                return original_local_train(examples)
+
+            runtime.local_train = slow_local_train
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                first_request = asyncio.create_task(
+                    client.post("/v1/local-train", json={"examples": ["first"]})
+                )
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    health = await client.get("/health")
+                    concurrent = await client.post(
+                        "/v1/local-train",
+                        json={"examples": ["second"]},
+                    )
+                finally:
+                    release.set()
+                first = await asyncio.wait_for(first_request, timeout=2)
+
+            self.assertEqual(health.status_code, 200, health.text)
+            self.assertEqual(concurrent.status_code, 409, concurrent.text)
+            self.assertIn("already running", concurrent.text)
+            self.assertEqual(first.status_code, 200, first.text)
+
     async def test_round_specific_training_is_required_before_participation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -387,6 +563,7 @@ class RoundBoundTrainingApiTests(unittest.IsolatedAsyncioTestCase):
             runtime = ClientRuntime(
                 data_dir=root / "client-a",
                 client_id="client-a",
+                model_profile=mock_profile(),
                 private_data_path=private_path,
             )
             gateway = CoordinatorGateway(

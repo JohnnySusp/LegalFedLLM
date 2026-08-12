@@ -9,6 +9,10 @@ from pathlib import Path
 
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
+from client.training import (
+    TrainingExecutionProfile,
+    execution_profile_from_environment,
+)
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import (
@@ -98,14 +102,56 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=2)),
             )
+            execution_values = execution_profile_from_environment(
+                "transformers"
+            ).model_dump(mode="json")
+            execution_values["verify_frozen_base_checksum"] = True
             runtime = ClientRuntime(
                 data_dir=root / "client",
                 client_id="client-a",
                 model_profile=profile,
                 private_data_path=private_path,
+                training_execution_profile=(
+                    TrainingExecutionProfile.model_validate(execution_values)
+                ),
             )
             record = runtime.local_train_round(manifest)
+            print(
+                json.dumps(
+                    {
+                        "adapter_version": record["result_adapter_version"],
+                        "checkpoint_hash": record["result_checkpoint_hash"],
+                        "optimizer_step_count": record["optimizer_step_count"],
+                        "training_loss": record["training_loss"],
+                        "trainable_parameter_count": record[
+                            "trainable_parameter_count"
+                        ],
+                        "total_parameter_count": record[
+                            "total_parameter_count"
+                        ],
+                        "frozen_base_checksum_verified": record[
+                            "training_execution_profile"
+                        ]["verify_frozen_base_checksum"],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            self.assertEqual(record["schema_version"], "1.1")
             self.assertEqual(record["checkpoint_format"], "peft-safetensors")
+            self.assertGreaterEqual(record["optimizer_step_count"], 1)
+            self.assertGreaterEqual(record["training_loss"], 0)
+            self.assertEqual(
+                record["training_execution_profile"][
+                    "learning_rate_scheduler"
+                ],
+                "linear",
+            )
+            self.assertTrue(
+                record["training_execution_profile"][
+                    "verify_frozen_base_checksum"
+                ]
+            )
             self.assertGreater(record["trainable_parameter_count"], 0)
             self.assertGreater(
                 record["total_parameter_count"],

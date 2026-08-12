@@ -253,6 +253,8 @@ class ClientRuntime:
                 dependency_versions={},
                 trainable_parameter_count=0,
                 total_parameter_count=0,
+                optimizer_step_count=0,
+                training_loss=None,
             )
         else:
             from client.peft_backend import TransformersPeftTrainingBackend
@@ -288,6 +290,8 @@ class ClientRuntime:
             dependency_versions=result.dependency_versions,
             trainable_parameter_count=result.trainable_parameter_count,
             total_parameter_count=result.total_parameter_count,
+            optimizer_step_count=result.optimizer_step_count,
+            training_loss=result.training_loss,
         )
         self.store.write_json_if_absent(
             record_path,

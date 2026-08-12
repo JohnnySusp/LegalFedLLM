@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import secrets
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -56,24 +58,29 @@ class TransformersPeftTrainingBackend:
             initial_path = self.checkpoints.staging_path(
                 f"initial-{secrets.token_hex(8)}"
             )
-            model.save_pretrained(
-                initial_path,
-                safe_serialization=True,
-                save_embedding_layers=False,
-            )
-            self._validate_adapter_tensors(safetensors, initial_path)
-            initial_metadata = self.checkpoints.seal(
-                initial_path,
-                version=self.checkpoints.next_version(0),
-                parent=None,
-                round_id=None,
-                manifest_hash=None,
-                execution_profile_hash=None,
-            )
-            initial_version_path = self.checkpoints.promote(
-                initial_path,
-                initial_metadata,
-            )
+            try:
+                model.save_pretrained(
+                    initial_path,
+                    safe_serialization=True,
+                    save_embedding_layers=False,
+                )
+                self._validate_adapter_tensors(safetensors, initial_path)
+                initial_metadata = self.checkpoints.seal(
+                    initial_path,
+                    version=self.checkpoints.next_version(0),
+                    parent=None,
+                    round_id=None,
+                    manifest_hash=None,
+                    execution_profile_hash=None,
+                )
+                initial_version_path = self.checkpoints.promote(
+                    initial_path,
+                    initial_metadata,
+                )
+            except Exception:
+                if initial_path.exists():
+                    self.checkpoints.discard_staging(initial_path)
+                raise
             current = initial_metadata, initial_version_path
         else:
             metadata, checkpoint_path = current
@@ -84,7 +91,7 @@ class TransformersPeftTrainingBackend:
             )
             self._verify_loaded_adapter(model)
 
-        parent_metadata, _ = current
+        parent_metadata, parent_path = current
         self._assert_trainable_parameters(model)
         base_checksum = None
         if self.execution_profile.verify_frozen_base_checksum:
@@ -97,133 +104,165 @@ class TransformersPeftTrainingBackend:
         )
         dataset = _ListDataset(encoded)
         collator = _AnswerOnlyCollator(torch, tokenizer.pad_token_id)
-        job_id = f"{manifest.round_id}-{secrets.token_hex(8)}"
+        job_id = f"train-{secrets.token_hex(8)}"
         output_dir = self.data_dir / "training_jobs" / job_id
         output_dir.mkdir(parents=True, exist_ok=False)
+        candidate_path: Path | None = None
 
-        if self.execution_profile.gradient_checkpointing:
-            model.config.use_cache = False
-            model.enable_input_require_grads()
+        try:
+            if self.execution_profile.gradient_checkpointing:
+                model.config.use_cache = False
+                model.enable_input_require_grads()
 
-        arguments = transformers.TrainingArguments(
-            output_dir=str(output_dir),
-            num_train_epochs=manifest.training_epochs,
-            per_device_train_batch_size=(
-                self.execution_profile.micro_batch_size
-            ),
-            gradient_accumulation_steps=(
-                self.execution_profile.gradient_accumulation_steps
-            ),
-            learning_rate=self.execution_profile.learning_rate,
-            optim="adamw_torch",
-            seed=self.execution_profile.seed,
-            data_seed=self.execution_profile.seed,
-            bf16=self.execution_profile.precision == "bfloat16",
-            fp16=self.execution_profile.precision == "float16",
-            use_cpu=self.execution_profile.device == "cpu",
-            gradient_checkpointing=(
-                self.execution_profile.gradient_checkpointing
-            ),
-            save_strategy="no",
-            eval_strategy="no",
-            logging_strategy="steps",
-            logging_steps=1,
-            report_to=[],
-            remove_unused_columns=False,
-            dataloader_pin_memory=self.execution_profile.device == "cuda",
-        )
-        trainer = transformers.Trainer(
-            model=model,
-            args=arguments,
-            train_dataset=dataset,
-            data_collator=collator,
-        )
-
-        trainer.train()
-        model = trainer.accelerator.unwrap_model(
-            trainer.model_wrapped,
-            keep_fp32_wrapper=False,
-        )
-
-        trainable_count, total_count = self._assert_trainable_parameters(model)
-        if base_checksum is not None and (
-            self._frozen_parameter_checksum(torch, model) != base_checksum
-        ):
-            raise RuntimeError("a frozen base-model parameter changed during training")
-        probe_ids = encoded[0].input_ids[:32]
-        expected_logits = self._probe_logits(torch, model, probe_ids)
-
-        candidate_path = self.checkpoints.staging_path(job_id)
-        model.save_pretrained(
-            candidate_path,
-            safe_serialization=True,
-            save_embedding_layers=False,
-        )
-        self._validate_adapter_tensors(safetensors, candidate_path)
-        candidate_metadata = self.checkpoints.seal(
-            candidate_path,
-            version=self.checkpoints.next_version(parent_metadata.version + 1),
-            parent=parent_metadata,
-            round_id=manifest.round_id,
-            manifest_hash=manifest.manifest_hash,
-            execution_profile_hash=self.execution_profile.profile_hash(),
-        )
-
-        del trainer, model, base_model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        reloaded_base = self._load_base_model(torch, transformers)
-        reloaded = peft.PeftModel.from_pretrained(
-            reloaded_base,
-            candidate_path,
-            is_trainable=False,
-        )
-        self._verify_loaded_adapter(reloaded)
-
-        actual_logits = self._probe_logits(torch, reloaded, probe_ids)
-
-        if not torch.allclose(
-            expected_logits,
-            actual_logits,
-            rtol=0,
-            atol=1e-4,
-        ):
-            difference = (expected_logits - actual_logits).abs()
-            maximum_index = int(difference.argmax().item())
-            expected_value = expected_logits.flatten()[maximum_index].item()
-            actual_value = actual_logits.flatten()[maximum_index].item()
-            raise RuntimeError(
-                "reloaded PEFT adapter does not preserve probe logits: "
-                f"max_abs_difference={difference.max().item():.8g}, "
-                f"mean_abs_difference={difference.mean().item():.8g}, "
-                f"expected_at_max={expected_value:.8g}, "
-                f"actual_at_max={actual_value:.8g}"
+            arguments = transformers.TrainingArguments(
+                output_dir=str(output_dir),
+                num_train_epochs=manifest.training_epochs,
+                per_device_train_batch_size=(
+                    self.execution_profile.micro_batch_size
+                ),
+                gradient_accumulation_steps=(
+                    self.execution_profile.gradient_accumulation_steps
+                ),
+                learning_rate=self.execution_profile.learning_rate,
+                lr_scheduler_type=(
+                    self.execution_profile.learning_rate_scheduler
+                ),
+                optim="adamw_torch",
+                seed=self.execution_profile.seed,
+                data_seed=self.execution_profile.seed,
+                bf16=self.execution_profile.precision == "bfloat16",
+                fp16=self.execution_profile.precision == "float16",
+                use_cpu=self.execution_profile.device == "cpu",
+                gradient_checkpointing=(
+                    self.execution_profile.gradient_checkpointing
+                ),
+                save_strategy="no",
+                eval_strategy="no",
+                logging_strategy="steps",
+                logging_steps=1,
+                report_to=[],
+                remove_unused_columns=False,
+                dataloader_pin_memory=self.execution_profile.device == "cuda",
+            )
+            trainer = transformers.Trainer(
+                model=model,
+                args=arguments,
+                train_dataset=dataset,
+                data_collator=collator,
             )
 
-        del reloaded, reloaded_base
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            train_output = trainer.train()
+            optimizer_step_count = int(trainer.state.global_step)
+            training_loss = float(train_output.training_loss)
+            if optimizer_step_count < 1:
+                raise RuntimeError("real PEFT training completed no optimizer step")
+            if not math.isfinite(training_loss) or training_loss < 0:
+                raise RuntimeError("real PEFT training produced a non-finite loss")
+            model = trainer.accelerator.unwrap_model(
+                trainer.model_wrapped,
+                keep_fp32_wrapper=False,
+            )
 
-        self.checkpoints.promote(candidate_path, candidate_metadata)
-        return BackendTrainingResult(
-            parent_version=parent_metadata.version,
-            parent_checkpoint_hash=parent_metadata.checkpoint_hash,
-            result_version=candidate_metadata.version,
-            result_checkpoint_hash=candidate_metadata.checkpoint_hash,
-            checkpoint_format="peft-safetensors",
-            dependency_versions={
-                "torch": torch.__version__,
-                "transformers": transformers.__version__,
-                "peft": peft.__version__,
-                "safetensors": safetensors.__version__,
-                "cuda": torch.version.cuda or "none",
-            },
-            trainable_parameter_count=trainable_count,
-            total_parameter_count=total_count,
-        )
+            trainable_count, total_count = self._assert_trainable_parameters(model)
+            if base_checksum is not None and (
+                self._frozen_parameter_checksum(torch, model) != base_checksum
+            ):
+                raise RuntimeError(
+                    "a frozen base-model parameter changed during training"
+                )
+            probe_ids = encoded[0].input_ids[:32]
+            expected_logits = self._probe_logits(torch, model, probe_ids)
+
+            candidate_path = self.checkpoints.staging_path(job_id)
+            model.save_pretrained(
+                candidate_path,
+                safe_serialization=True,
+                save_embedding_layers=False,
+            )
+            self._validate_adapter_tensors(safetensors, candidate_path)
+            self._assert_lora_tensors_changed(
+                torch,
+                safetensors,
+                parent_path,
+                candidate_path,
+            )
+            candidate_metadata = self.checkpoints.seal(
+                candidate_path,
+                version=self.checkpoints.next_version(
+                    parent_metadata.version + 1
+                ),
+                parent=parent_metadata,
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                execution_profile_hash=self.execution_profile.profile_hash(),
+            )
+
+            del trainer, model, base_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            reloaded_base = self._load_base_model(torch, transformers)
+            reloaded = peft.PeftModel.from_pretrained(
+                reloaded_base,
+                candidate_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(reloaded)
+
+            actual_logits = self._probe_logits(torch, reloaded, probe_ids)
+
+            if not torch.allclose(
+                expected_logits,
+                actual_logits,
+                rtol=0,
+                atol=1e-4,
+            ):
+                difference = (expected_logits - actual_logits).abs()
+                maximum_index = int(difference.argmax().item())
+                expected_value = expected_logits.flatten()[maximum_index].item()
+                actual_value = actual_logits.flatten()[maximum_index].item()
+                raise RuntimeError(
+                    "reloaded PEFT adapter does not preserve probe logits: "
+                    f"max_abs_difference={difference.max().item():.8g}, "
+                    f"mean_abs_difference={difference.mean().item():.8g}, "
+                    f"expected_at_max={expected_value:.8g}, "
+                    f"actual_at_max={actual_value:.8g}"
+                )
+
+            del reloaded, reloaded_base
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            self.checkpoints.promote(candidate_path, candidate_metadata)
+            return BackendTrainingResult(
+                parent_version=parent_metadata.version,
+                parent_checkpoint_hash=parent_metadata.checkpoint_hash,
+                result_version=candidate_metadata.version,
+                result_checkpoint_hash=candidate_metadata.checkpoint_hash,
+                checkpoint_format="peft-safetensors",
+                dependency_versions={
+                    "torch": torch.__version__,
+                    "transformers": transformers.__version__,
+                    "peft": peft.__version__,
+                    "safetensors": safetensors.__version__,
+                    "cuda": torch.version.cuda or "none",
+                },
+                trainable_parameter_count=trainable_count,
+                total_parameter_count=total_count,
+                optimizer_step_count=optimizer_step_count,
+                training_loss=training_loss,
+            )
+        except Exception:
+            if candidate_path is not None and candidate_path.exists():
+                self.checkpoints.discard_staging(candidate_path)
+            raise
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any, Any]:
@@ -416,6 +455,45 @@ class TransformersPeftTrainingBackend:
         }
         if found != targets:
             raise RuntimeError("adapter checkpoint is missing configured targets")
+
+    @staticmethod
+    def _assert_lora_tensors_changed(
+        torch: Any,
+        safetensors: Any,
+        parent_path: Path,
+        candidate_path: Path,
+    ) -> None:
+        parent_tensor_path = parent_path / "adapter_model.safetensors"
+        candidate_tensor_path = candidate_path / "adapter_model.safetensors"
+        with safetensors.safe_open(
+            parent_tensor_path,
+            framework="pt",
+            device="cpu",
+        ) as parent_handle:
+            with safetensors.safe_open(
+                candidate_tensor_path,
+                framework="pt",
+                device="cpu",
+            ) as candidate_handle:
+                parent_keys = set(parent_handle.keys())
+                candidate_keys = set(candidate_handle.keys())
+                if parent_keys != candidate_keys:
+                    raise RuntimeError(
+                        "candidate LoRA tensor keys differ from its parent"
+                    )
+                for key in sorted(parent_keys):
+                    parent_tensor = parent_handle.get_tensor(key)
+                    candidate_tensor = candidate_handle.get_tensor(key)
+                    if (
+                        parent_tensor.shape != candidate_tensor.shape
+                        or parent_tensor.dtype != candidate_tensor.dtype
+                    ):
+                        raise RuntimeError(
+                            "candidate LoRA tensor structure differs from its parent"
+                        )
+                    if not torch.equal(parent_tensor, candidate_tensor):
+                        return
+        raise RuntimeError("real PEFT training did not change any LoRA tensor")
 
     def _probe_logits(self, torch: Any, model: Any, token_ids: list[int]) -> Any:
         model.eval()

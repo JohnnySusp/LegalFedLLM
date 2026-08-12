@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 from pathlib import Path
@@ -258,6 +259,16 @@ def create_app(
     app = FastAPI(title="LegalFedLLM Client Agent", version="0.2.0")
     app.state.runtime = client_runtime
     app.state.gateway = coordinator
+    app.state.training_lock = asyncio.Lock()
+
+    async def run_exclusive_training(call, *args) -> dict[str, Any]:
+        if app.state.training_lock.locked():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="another local training job is already running",
+            )
+        async with app.state.training_lock:
+            return await asyncio.to_thread(call, *args)
 
     def require_client_admin_token(
         x_client_admin_token: str | None = Header(default=None),
@@ -304,7 +315,10 @@ def create_app(
     )
     async def local_train(request: LocalTrainRequest) -> dict[str, Any]:
         try:
-            return client_runtime.local_train(request.examples)
+            return await run_exclusive_training(
+                client_runtime.local_train,
+                request.examples,
+            )
         except (ClientRuntimeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -325,7 +339,10 @@ def create_app(
     async def local_train_round(round_id: str) -> dict[str, Any]:
         manifest = await verified_manifest(round_id)
         try:
-            return client_runtime.local_train_round(manifest)
+            return await run_exclusive_training(
+                client_runtime.local_train_round,
+                manifest,
+            )
         except (ClientRuntimeError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

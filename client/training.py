@@ -74,7 +74,7 @@ def private_dataset_semantic_hash(
 
 
 class TrainingExecutionProfile(TrainingContract):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "1.1"] = "1.1"
     backend: Literal["mock", "transformers"]
     device: Literal["cuda", "cpu"]
     precision: Literal["bfloat16", "float16", "float32"]
@@ -82,6 +82,7 @@ class TrainingExecutionProfile(TrainingContract):
     micro_batch_size: int = Field(default=1, ge=1, le=1024)
     gradient_accumulation_steps: int = Field(default=8, ge=1, le=65536)
     optimizer: Literal["adamw"] = "adamw"
+    learning_rate_scheduler: Literal["linear"] = "linear"
     learning_rate: float = Field(default=2e-4, gt=0)
     seed: int = Field(default=42, ge=0, le=2**32 - 1)
     gradient_checkpointing: bool = False
@@ -102,7 +103,10 @@ class TrainingExecutionProfile(TrainingContract):
         return self
 
     def profile_hash(self) -> str:
-        return sha256_hex(self.model_dump(mode="json"))
+        payload = self.model_dump(mode="json")
+        if self.schema_version == "1.0":
+            payload.pop("learning_rate_scheduler")
+        return sha256_hex(payload)
 
 
 def execution_profile_from_environment(
@@ -276,6 +280,15 @@ class AdapterCheckpointStore:
         path.mkdir(parents=False, exist_ok=False)
         return path
 
+    def discard_staging(self, path: str | Path) -> None:
+        import shutil
+
+        candidate = Path(path).resolve()
+        staging_root = (self.root / "staging").resolve()
+        if candidate.parent != staging_root:
+            raise ValueError("adapter staging directory is outside its store")
+        shutil.rmtree(candidate, ignore_errors=True)
+
     def version_path(self, version: int) -> Path:
         return self.root / "versions" / f"v{version:06d}"
 
@@ -408,7 +421,7 @@ class AdapterCheckpointStore:
 
 
 class LocalTrainingRecord(TrainingContract):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "1.1"] = "1.1"
     round_id: str
     manifest_hash: str = Field(pattern=HASH_PATTERN)
     client_model_profile_hash: str = Field(pattern=HASH_PATTERN)
@@ -430,6 +443,8 @@ class LocalTrainingRecord(TrainingContract):
     dependency_versions: dict[str, str] = Field(default_factory=dict)
     trainable_parameter_count: int = Field(ge=0)
     total_parameter_count: int = Field(ge=0)
+    optimizer_step_count: int | None = Field(default=None, ge=0)
+    training_loss: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     record_hash: str = Field(pattern=HASH_PATTERN)
 
     @model_validator(mode="after")
@@ -439,16 +454,29 @@ class LocalTrainingRecord(TrainingContract):
             != self.training_execution_profile.profile_hash()
         ):
             raise ValueError("training execution profile hash does not match")
-        expected = sha256_hex(
-            self.model_dump(mode="json", exclude={"record_hash"})
-        )
+        payload = self.model_dump(mode="json", exclude={"record_hash"})
+        if self.schema_version == "1.0":
+            payload.pop("optimizer_step_count")
+            payload.pop("training_loss")
+            if self.training_execution_profile.schema_version == "1.0":
+                payload["training_execution_profile"].pop(
+                    "learning_rate_scheduler"
+                )
+        elif self.checkpoint_format == "peft-safetensors":
+            if not self.optimizer_step_count:
+                raise ValueError(
+                    "real PEFT training must record an optimizer step"
+                )
+            if self.training_loss is None:
+                raise ValueError("real PEFT training must record its loss")
+        expected = sha256_hex(payload)
         if self.record_hash != expected:
             raise ValueError("local training record hash does not match")
         return self
 
     @classmethod
     def create(cls, **values: Any) -> "LocalTrainingRecord":
-        payload = {**values, "schema_version": "1.0"}
+        payload = {**values, "schema_version": "1.1"}
         execution_profile = payload.get("training_execution_profile")
         if isinstance(execution_profile, TrainingExecutionProfile):
             payload["training_execution_profile"] = (
@@ -468,3 +496,5 @@ class BackendTrainingResult:
     dependency_versions: dict[str, str]
     trainable_parameter_count: int
     total_parameter_count: int
+    optimizer_step_count: int
+    training_loss: float | None
