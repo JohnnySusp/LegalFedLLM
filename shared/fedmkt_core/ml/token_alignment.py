@@ -52,6 +52,9 @@ def token_levenshtein_distance(
 def dtw(series_1, series_2, norm_func=np.linalg.norm):
     """code refer to: https://github.com/fanqiwan/FuseAI/blob/main/FuseLLM/src/utils/others.py#L318"""
 
+    if len(series_1) == 0 or len(series_2) == 0:
+        raise ValueError("DTW requires two non-empty token sequences")
+
     matrix = np.zeros((len(series_1) + 1, len(series_2) + 1))
     matrix[0, :] = np.inf
     matrix[:, 0] = np.inf
@@ -93,101 +96,6 @@ def dtw(series_1, series_2, norm_func=np.linalg.norm):
     return matches, matrix[-1, -1], mappings_series_1, mappings_series_2, matrix
 
 
-def greedy_dynamic_matching(base_model_tokens, blending_model_tokens, base_model_sp_t, blending_model_sp_t):
-    l1 = len(base_model_tokens)
-    l2 = len(blending_model_tokens)
-
-    base_model_tokens = [token.replace(base_model_sp_t, "") for token in base_model_tokens]
-    blending_model_tokens = [token.replace(blending_model_sp_t, "") for token in blending_model_tokens]
-
-    dp = np.full((l1 + 1, l2 + 1), -1000000000, dtype="int32")
-    matched_left = np.full((l1, l2), -1, dtype="int32")
-    matched_right = np.full((l1, l2), -1, dtype="int32")
-    trans_left = np.full((l1 + 1, l2 + 1), -1, dtype="int32")
-    trans_right = np.full((l1 + 1, l2 + 1), -1, dtype="int32")
-
-    # this can be optimizer use suffix data structure, but naive implemented for fast trial , it will be optimize later.
-    for i in range(l1):
-        for j in range(l2):
-            if base_model_tokens[i] == blending_model_tokens[j]:
-                matched_left[i][j] = 1
-                matched_right[i][j] = 1
-                continue
-
-            i2, j2 = i, j
-            t1 = ""
-            t2 = ""
-            sq_l1, sq_l2 = 0, 0
-            while i2 >= 0 and j2 >= 0:
-                if len(t1) > len(t2):
-                    t2 = blending_model_tokens[j2] + t2
-                    sq_l2 += 1
-                    j2 -= 1
-                elif len(t1) < len(t2):
-                    t1 = base_model_tokens[i2] + t1
-                    sq_l1 += 1
-                    i2 -= 1
-                else:
-                    if sq_l1 == 0:
-                        sq_l1 += 1
-                        sq_l2 += 1
-                        t1 += base_model_tokens[i2]
-                        t2 += blending_model_tokens[j2]
-                        i2 -= 1
-                        j2 -= 1
-                        continue
-                    if t1 == t2:
-                        matched_left[i][j] = sq_l1
-                        matched_right[i][j] = sq_l2
-                    break
-
-    """
-    always shortest matching
-    """
-    for i in range(0, l1 + 1):
-        dp[i][0] = 0
-
-    for j in range(0, l2 + 1):
-        dp[0][j] = 1
-
-    for i in range(0, l1):
-        for j in range(0, l2):
-            if matched_left[i][j] == -1:
-                dp[i + 1][j + 1] = max(dp[i + 1][j], dp[i][j + 1])
-                if dp[i + 1][j + 1] == dp[i + 1][j]:
-                    trans_right[i + 1][j + 1] = j
-                else:
-                    trans_left[i + 1][j + 1] = i
-            else:
-                l_len = matched_left[i][j]
-                r_len = matched_right[i][j]
-                dp[i + 1][j + 1] = max(max(dp[i + 1][j], dp[i][j + 1]), dp[i + 1 - l_len][j + 1 - r_len] + l_len)
-                if dp[i + 1][j + 1] == dp[i + 1 - l_len][j + 1 - r_len] + l_len:
-                    trans_left[i + 1][j + 1] = i + 1 - l_len
-                    trans_right[i + 1][j + 1] = j + 1 - r_len
-                    assert l_len > 0 and r_len > 0
-                elif dp[i + 1][j + 1] == dp[i + 1][j]:
-                    trans_right[i + 1][j + 1] = j
-                else:
-                    trans_left[i + 1][j + 1] = i
-
-    i, j = l1, l2
-    matches = []
-    while i > 0 and j > 0:
-        if trans_left[i][j] != -1 and trans_right[i][j] != -1:
-            l = trans_left[i][j]
-            r = trans_right[i][j]
-            matches.append([(l, i - 1), (r, j - 1)])
-            i, j = l, r
-        elif trans_left[i][j] < 0:
-            j -= 1
-        else:
-            i -= 1
-
-    matches.reverse()
-    return matches
-
-
 def align_blending_model_logits_with_base_model_logits(base_examples,
                                                        indices,
                                                        blending_examples,
@@ -196,7 +104,7 @@ def align_blending_model_logits_with_base_model_logits(base_examples,
                                                        blending_tokenizer,
                                                        blending_model_index,
                                                        skip_align=False,
-                                                       align_strategy="greedy_dp"):
+                                                       align_strategy="dtw"):
     """modified from https://github.com/fanqiwan/FuseAI/blob/main/FuseLLM/src/utils/token_alignment.py#L101"""
     base_features = [{key: base_examples[key][i] for key in base_examples} for i in
                      range(len(base_examples[next(iter(base_examples))]))]
@@ -307,57 +215,6 @@ def transform_step_logits(base_model_tokenizer: transformers.tokenization_utils_
                 base_token = base_model_tokens[i]
                 aligned_blending_model_per_step_index.append(base_model_vocab[base_token])
                 aligned_blending_model_per_step_logit.append(1.0)
-            aligned_blending_model_per_step_indices.append(aligned_blending_model_per_step_index)
-            aligned_blending_model_per_step_logits.append(aligned_blending_model_per_step_logit)
-    elif align_strategy == "greedy_dp":
-        matches = greedy_dynamic_matching(base_model_tokens, blending_model_tokens, base_model_special_token, blending_model_special_token)
-        fusion_logits = [[] for _ in range(len(matches))]
-        fusion_indices = [[] for _ in range(len(matches))]
-        match_pos = [-1] * len(base_model_tokens)
-        used = [False] * len(matches)
-
-        for idx, ((start_pos_1, end_pos_1), (start_pos_2, end_pos_2)) in enumerate(matches):
-            fusion_dict = dict()
-            fusion_counter_dict = dict()
-            for blending_pos in range(start_pos_2, end_pos_2 + 1):
-                for blending_logit, blending_index in zip(blending_model_per_step_logits[blending_pos],
-                                                          blending_model_per_step_indices[blending_pos]):
-                    if blending_index not in fusion_dict:
-                        fusion_dict[blending_index] = 0
-                        fusion_counter_dict[blending_index] = 0
-                    fusion_dict[blending_index] += blending_logit
-                    fusion_counter_dict[blending_index] += 1
-
-            for j in range(start_pos_1, end_pos_1 + 1):
-                match_pos[j] = idx
-
-            for token_index, token_logit in fusion_dict.items():
-                fusion_logits[idx].append(token_logit / fusion_counter_dict[token_index])
-                fusion_indices[idx].append(token_index)
-
-        for i in range(len(base_model_tokens)):
-            aligned_blending_model_per_step_logit = []
-            aligned_blending_model_per_step_index = []
-            if match_pos[i] == -1 or used[match_pos[i]]:
-                base_token = base_model_tokens[i]
-                aligned_blending_model_per_step_index.append(base_model_vocab[base_token])
-                aligned_blending_model_per_step_logit.append(1.0)
-            else:
-                pos = match_pos[i]
-                used[pos] = True
-                for blending_logit, blending_index in zip(fusion_logits[pos],
-                                                          fusion_indices[pos]):
-                    # the token corresponds to the logit and indices
-                    blending_t = blending_model_tokenizer.convert_ids_to_tokens([blending_index])[0].replace(
-                        blending_model_special_token, base_model_special_token)
-                    blending_t = blending_to_base_mapping[blending_t]
-                    if blending_t in base_model_vocab:
-                        aligned_index = base_model_vocab[blending_t]  # the index of the token in base model vocab
-                        if aligned_index not in aligned_blending_model_per_step_index:
-                            aligned_blending_model_per_step_index.append(aligned_index)
-                            aligned_blending_model_per_step_logit.append(blending_logit)
-                    else:
-                        logger.warning(f"blending_t: {blending_t} not in base_model_vocab!")
             aligned_blending_model_per_step_indices.append(aligned_blending_model_per_step_index)
             aligned_blending_model_per_step_logits.append(aligned_blending_model_per_step_logit)
     else:

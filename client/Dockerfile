@@ -26,4 +26,5 @@ COPY tests/__init__.py /app/tests/__init__.py
 COPY tests/test_client_knowledge.py /app/tests/test_client_knowledge.py
 COPY tests/test_client_real_model.py /app/tests/test_client_real_model.py
 COPY tests/test_fedmkt_selection.py /app/tests/test_fedmkt_selection.py
+COPY tests/test_fedmkt_token_alignment.py /app/tests/test_fedmkt_token_alignment.py
 COPY tests/test_fedmkt_trainer.py /app/tests/test_fedmkt_trainer.py

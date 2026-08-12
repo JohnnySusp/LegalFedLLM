@@ -221,8 +221,12 @@ class DistillationConfig(ContractModel):
 
 
 class AlignmentConfig(ContractModel):
-    strategy: Literal["mock_identity", "dtw", "greedy_dp"] = "mock_identity"
-    profile_version: str = "1"
+    strategy: Literal["mock_identity", "dtw"] = "mock_identity"
+    profile_version: str = Field(default="1", min_length=1, max_length=128)
+
+    @property
+    def profile_id(self) -> str:
+        return f"{self.strategy}:{self.profile_version}"
 
 
 class RoundCreateRequest(ContractModel):

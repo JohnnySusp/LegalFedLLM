@@ -25,3 +25,9 @@ Guest/Host/Arbiter channels, FATE-Flow and aggregation wrappers are not included
 The protocol-first selection and safety modules remain dependency-free. Install
 `requirements.txt` before importing the upstream-derived `shared.fedmkt_core.ml`
 modules.
+
+The reviewed behavior contract and approved LegalFedLLM adaptations are recorded
+in [`PARITY.md`](PARITY.md). Fixed golden tests preserve the pinned upstream
+DTW/MinED path, mappings, cost matrix and per-step logit-transformation behavior.
+LegalFedLLM removes the unused `greedy_dp` alternative and explicitly rejects
+empty token sequences, for which upstream has no defined result.

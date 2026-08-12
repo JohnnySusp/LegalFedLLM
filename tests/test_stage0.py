@@ -14,17 +14,20 @@ from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService
+from host.model_profiles import pinned_host_profile
 from host.runtime import (
     HostRuntime,
     HostRuntimeError,
     default_host_profile,
 )
-from shared.crypto import canonical_json_bytes, sha256_hex
+from shared.alignment_profiles import POC_DTW_PROFILE_VERSION
+from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.knowledge_artifact import (
     load_package_samples,
     serialize_knowledge_artifact,
 )
 from shared.protocol import (
+    ClientRegistrationRequest,
     DifferentialPrivacyPolicy,
     DifferentialPrivacyReport,
     KnowledgePackage,
@@ -118,6 +121,46 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(response.status_code, 409, response.text)
+
+    async def test_pinned_dtw_pair_remains_blocked_before_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(directory)
+            stack.host_runtime.model_profile = pinned_host_profile()
+            client_identity = Ed25519Identity.load_or_create(
+                Path(directory) / "qwen-client.pem"
+            )
+            stack.coordinator_service.register_client(
+                ClientRegistrationRequest(
+                    client_id="client-a",
+                    public_key=client_identity.public_key_b64,
+                    model_profile=pinned_client_profile(QWEN_PROFILE_ID),
+                )
+            )
+
+            response = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "reference",
+                    "reference_dataset_hash": sha256_hex(b"reference"),
+                    "sample_ids": ["s1"],
+                    "prompt_template": "{question} {answer}",
+                    "top_k": 2,
+                    "alignment": {
+                        "strategy": "dtw",
+                        "profile_version": POC_DTW_PROFILE_VERSION,
+                    },
+                },
+            )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn(
+                "real alignment execution is not yet available",
+                response.json()["detail"],
+            )
 
     async def test_accepted_client_cache_is_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

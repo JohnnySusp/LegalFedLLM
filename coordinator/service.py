@@ -11,6 +11,10 @@ import httpx
 
 from coordinator.reference_data import CoordinatorReferenceData
 
+from shared.alignment_profiles import (
+    UnsupportedAlignmentProfile,
+    validate_alignment_pair,
+)
 from shared.crypto import Ed25519Identity
 from shared.fedmkt_core import dual_min_ce_select, inspect_knowledge_package
 from shared.knowledge_artifact import load_package_samples
@@ -358,12 +362,6 @@ class CoordinatorService:
         async with self._lock:
             request = self._resolve_round_request(request)
 
-            if request.alignment.strategy != "mock_identity":
-                raise ConflictError(
-                    "only alignment.strategy=mock_identity is available "
-                    "in the protocol-first milestone"
-                )
-
             registrations = {
                 client_id: self.get_registration(client_id)
                 for client_id in request.selected_client_ids
@@ -377,6 +375,23 @@ class CoordinatorService:
             host_identity = await self._host_identity(refresh=True)
             if host_identity.model_profile is None or host_identity.adapter_version is None:
                 raise ConflictError("Host identity is missing its model profile or adapter")
+
+            if request.alignment.strategy != "mock_identity":
+                try:
+                    for registration in registrations.values():
+                        validate_alignment_pair(
+                            request.alignment.profile_id,
+                            client_profile=registration.model_profile,
+                            host_profile=host_identity.model_profile,
+                        )
+                except UnsupportedAlignmentProfile as exc:
+                    raise ConflictError(str(exc)) from exc
+                raise ConflictError(
+                    f"alignment profile {request.alignment.profile_id!r} is "
+                    "recognized, but real alignment execution is not yet "
+                    "available"
+                )
+
             counter = 0
             if self.store.exists("rounds/counter.json"):
                 counter = int(self.store.read_json("rounds/counter.json")["value"])
