@@ -1,167 +1,278 @@
 # LegalFedLLM
 
-LegalFedLLM is a protocol-first implementation of a FedMKT-centered architecture
-for bidirectional knowledge transfer between heterogeneous language models.
+LegalFedLLM is a protocol-first proof of concept for bidirectional, FedMKT-style
+knowledge transfer between heterogeneous language models in legal environments.
+Participants keep private examples and model-native LoRA tensors local. They
+exchange signed Knowledge Packages containing outputs over a shared public
+reference dataset instead of attempting to average structurally incompatible
+adapters.
 
-The repository now contains four connected pieces:
+The repository currently combines:
 
-1. a deterministic protocol-first control plane using mock FedMKT knowledge;
-2. a real generic shared-reference-dataset boundary with canonical JSONL data,
-   semantic dataset identity, Coordinator-owned round snapshots, selected-Client
-   download, Client verification and caching, and Host verification of both
-   reference and validation data;
-3. a deterministic source-specific importer for the pinned 2012 Greek Law Digest
-   thesis copy, producing canonical LegalFedLLM Q&A records for the selected
-   printed-page range; and
-4. a scalable Knowledge Package implementation in which signed canonical JSON
-   metadata binds an exact `safetensors` artifact that is streamed, validated,
-   stored and exchanged in both directions during a complete mock round.
+1. a deterministic mock backend for fast protocol, persistence and security
+   testing;
+2. a real canonical shared-reference-dataset boundary;
+3. a deterministic importer for the pinned 2012 Greek Law Digest thesis copy;
+4. signed schema 2.0 Knowledge Packages with exact `safetensors` artifacts; and
+5. one real Client path using a pinned Transformers model and PEFT LoRA.
 
-The default execution path remains mock-first. No model download, GPU, Ollama
-installation, FATE-Flow deployment, or live public server is required to test the
-current implementation.
+Steps 0 through 3 are complete at the current Client boundary. The authoritative
+Step 3 run trained a real Qwen LoRA candidate, performed teacher-forced inference
+over all 565 accepted D^P samples, produced real top-k logits and answer-only
+cross-entropy losses, created a signed schema 2.0 package and validated the
+existing Coordinator intake path. Host-side token alignment and real selective
+distillation begin in Step 4 and remain unimplemented.
 
-The GLD importer is offline tooling. The copyrighted source PDF and generated
-derivatives remain under the Git-ignored `data/` tree and are not part of the
-runtime repository.
+The copyrighted GLD source PDF, generated datasets, private Client examples,
+downloaded model files and trained adapters remain local and are excluded from
+Git.
 
-## Current development snapshot
+## Current implementation boundary
 
-The current round flow is:
+The real Client path is:
 
 ```text
-Optional canonical D^P and D^V JSONL files
+signed round manifest
         ↓
-Coordinator loads and validates both datasets
+verified, frozen D^P sample order
         ↓
-Coordinator derives the real D^P ID, hash and ordered sample IDs
+private Client JSONL examples
         ↓
-Coordinator publishes a signed round manifest
+pinned base model and tokenizer
         ↓
-Coordinator stores immutable round-specific D^P and D^V snapshots
+answer-only PEFT LoRA training
         ↓
-Selected Clients download D^P
+adapter-only checkpoint validation and atomic promotion
         ↓
-Each Client verifies the dataset ID, semantic hash and sample order
+teacher-forced inference over D^P
         ↓
-Each Client caches the verified D^P and creates a signed mock Knowledge Package
+raw top-k token IDs and logits + answer-only CE per sample
         ↓
-Coordinator verifies, stores and safety-checks each package
+deterministic safetensors Knowledge Artifact
         ↓
-Coordinator waits for quorum or deadline
+signed schema 2.0 Client Knowledge Package
         ↓
-Accepted Client set is sealed
-        ↓
-Host receives and independently verifies D^P and D^V
-        ↓
-DualMinCE selects the best Client teacher per reference sample
-        ↓
-Private Host runtime creates and validates candidate ω(t+1)
-        ↓
-Candidate is promoted or ω(t) is retained
-        ↓
-Host publishes a signed Host Knowledge Package
-        ↓
-Clients selectively apply the Host package through mock reverse distillation
+bounded multipart Coordinator intake and immutable persistence
 ```
 
-The dataset boundary is real: JSONL records, identities, hashes, snapshots,
-download and cache verification operate on actual files.
+The complete mock round continues beyond this point through deterministic
+DualMinCE selection, Host candidate promotion or rollback, signed Host package
+publication and Client reverse synchronization. Those mock stages prove the
+protocol and service behavior, not real Host or reverse-Client learning.
 
-The model-learning path is still mocked. The tensors, logits and losses used by
-the current Knowledge Packages are deterministic protocol fixtures. They prove
-the service, security, persistence, selection, rollback and bidirectional message
-flow; they do not yet represent useful model training.
-
-The package path itself is real. Client and Host Knowledge Packages use schema
-2.0: a signed JSON envelope contains a descriptor for the exact binary artifact,
-and bounded multipart transport carries both parts as one logical package. Step 2
-is complete; real Client inference begins in Step 3.
+No Client LoRA tensor is sent to the Coordinator or Host. Private prompt and
+answer text is absent from the signed package metadata and numerical artifact.
 
 ## Implemented milestones
 
-- **Early prototype:** direct LoRA-delta exchange between participants. This
-  approach was removed because heterogeneous model architectures cannot safely
-  aggregate arbitrary adapter parameters.
-- **Step 0 protocol-first baseline:** signed manifests and Knowledge Packages,
+- **Step 0 — protocol-first baseline:** signed manifests and Knowledge Packages,
   bounded asynchronous rounds, filesystem persistence, replay protection,
-  DualMinCE selection, Host validation and rollback, Client synchronization and
-  an Ollama serving boundary.
-- **Step 1A reference-dataset boundary:** canonical reference samples, shared
-  prompt rendering, JSONL I/O, deterministic semantic hashing, per-section
-  D^P/D^V splitting, Coordinator snapshots, selected-Client delivery, Client
-  verification/caching and Host D^P/D^V verification.
-- **Step 1B GLD importer:** deterministic parsing of the pinned 2012 Greek Law
-  Digest thesis copy, reviewed follow-up handling, subsection-context
-  disambiguation, text-hygiene hardening, corpus auditing and reproducible D^P/D^V
-  generation.
-- **Step 2.1 Knowledge Artifact contract:** fixed descriptor fields, tensor names,
-  dtypes, dimensions and hash relationships.
-- **Step 2.2 deterministic artifact I/O:** `safetensors` serialization, atomic
-  writing, bounded loading, reconstruction and malformed-artifact rejection.
-- **Step 2.3 scalable signed package integration:** schema 2.0 Knowledge Packages,
-  artifact descriptors, multipart Client/Host transport, immutable Coordinator
-  storage and Host-to-Client reverse synchronization.
-- **Step 2.4 security and transport verification:** metadata/artifact tampering,
-  binding, replay/restart, transfer-failure and persistence regressions; complete
-  round assertions; reproducible package-size measurement; and readiness-gated
-  Compose startup.
-
-Steps 1 and 2 are complete. The accepted corpus identities and Step 2 package
-measurements are recorded below.
+  deterministic DualMinCE selection, Host validation and rollback, Client
+  synchronization and an Ollama serving boundary.
+- **Step 1A — shared dataset boundary:** canonical samples, JSONL I/O, semantic
+  identity, deterministic D^P/D^V splitting, Coordinator snapshots, selected-
+  Client delivery and independent Client/Host verification.
+- **Step 1B — GLD importer:** deterministic extraction from the pinned source,
+  reviewed follow-up handling, subsection disambiguation, text-hygiene checks,
+  corpus auditing and reproducible D^P/D^V generation.
+- **Step 2 — scalable signed packages:** schema 2.0 JSON envelopes, schema 1.0
+  `safetensors` artifacts, exact descriptor binding, bounded multipart transport,
+  immutable persistence, security regressions and complete mock-round use in both
+  directions.
+- **Step 3.1 — pinned real Client contracts:** exact model/tokenizer revisions,
+  strict private-data schema, answer-only labels and manifest-bound training
+  settings.
+- **Step 3.2 — checkpoint lifecycle:** round-specific training records,
+  adapter-only checkpoints, validation, atomic promotion and restart recovery.
+- **Step 3.3 — real PEFT execution:** CUDA/BF16 Transformers training, fresh
+  save/reload validation and deterministic probe-logit equivalence.
+- **Step 3.4 — training hardening:** optimizer-step and finite-loss checks,
+  changed-LoRA verification, optional frozen-base checksum, failure cleanup and
+  one process-local ML lock.
+- **Step 3.5 — real D^P knowledge generation:** exact signed sample order,
+  overlength rejection, batched no-grad inference, raw top-k extraction and
+  answer-only causal CE.
+- **Step 3.6 — real package submission:** existing artifact writer, signature and
+  multipart intake reused without a parallel real-only protocol; immutable retry
+  and exact training/checkpoint provenance are enforced.
 
 ## Repository layout
 
 ```text
 LegalFedLLM/
+├── client/
+│   ├── Dockerfile              Lightweight and ML image targets
+│   ├── main.py                 Client HTTP API and shared ML lock
+│   ├── runtime.py              Client state, package and round integration
+│   ├── model_profiles.py       Exact pinned Client model profiles
+│   ├── training.py             Data contracts and checkpoint lifecycle
+│   ├── peft_backend.py         Real Transformers/PEFT execution
+│   └── knowledge.py            D^P encoding and KnowledgeSample conversion
 ├── coordinator/
 │   ├── main.py                 Public federation API
 │   ├── service.py              Round orchestration and Host gateway
 │   └── reference_data.py       Coordinator-owned D^P/D^V boundary
 ├── host/
 │   ├── main.py                 Private internal Host API
-│   └── runtime.py              Host state, dataset cache and mock distillation
-├── client/
-│   ├── main.py                 Local Client API and Coordinator gateway
-│   └── runtime.py              Client state, D^P cache and mock knowledge flow
+│   └── runtime.py              Host state and mock distillation path
 ├── shared/
 │   ├── protocol.py             Manifests, profiles and package schemas
 │   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
 │   ├── knowledge_transport.py  Bounded streaming multipart transport
-│   ├── reference_dataset.py    Canonical schema, JSONL I/O, hashing and splitting
+│   ├── reference_dataset.py    Canonical schema, JSONL I/O and hashing
 │   ├── prompt.py               Shared reference-prompt renderer
-│   ├── crypto.py               Ed25519 signatures and canonical SHA-256 hashing
-│   ├── storage.py              Atomic cross-platform filesystem persistence
-│   ├── ollama.py               Ollama HTTP connector
-│   ├── fedmkt_runtime.py       Mock/real FedMKT runtime boundary
+│   ├── crypto.py               Ed25519 and canonical SHA-256 helpers
+│   ├── storage.py              Atomic cross-platform persistence
+│   ├── ollama.py               Optional Ollama serving connector
+│   ├── fedmkt_runtime.py       Mock/real FedMKT boundary
 │   └── fedmkt_core/
 │       ├── selection.py        Dependency-free DualMinCE selection
-│       ├── safety.py           Protocol-first package safety checks
-│       └── ml/                 Extracted optional FATE-LLM FedMKT core
-├── tools/
-│   └── datasets/
-│       ├── inspect_gld_layout.py
-│       │                        Offline PDF layout-inspection utility
-│       └── gld_pdf_to_jsonl.py
-│                                Deterministic pinned-GLD canonical importer
+│       ├── safety.py           Protocol-first safety checks
+│       ├── UPSTREAM.md         FATE-LLM extraction and adaptation record
+│       └── ml/                 Adapted optional FedMKT components
+├── tools/datasets/
+│   ├── inspect_gld_layout.py   Offline PDF layout inspection
+│   └── gld_pdf_to_jsonl.py     Deterministic pinned-GLD importer
 ├── tests/
-│   ├── test_gld_importer.py    GLD extraction, grouping and audit tests
-│   ├── test_knowledge_artifact.py
-│   │                            Artifact determinism and rejection tests
-│   ├── test_knowledge_security.py
-│   │                            Package tampering and binding regressions
-│   ├── test_knowledge_transport.py
-│   │                            Multipart boundaries and cleanup regressions
-│   └── ...                     Protocol, dataset, round, rollback and Ollama tests
+│   ├── test_client_training.py
+│   ├── test_client_knowledge.py
+│   ├── test_client_real_package.py
+│   ├── test_client_real_model.py
+│   └── ...                     Dataset, package, transport and round tests
 ├── scripts/
-│   ├── demo_round.py           One complete containerized mock round
+│   ├── demo_round.py           Containerized mock-round driver
 │   └── measure_knowledge_packages.py
-│                                Reproducible Client/Host representation measurement
+├── .env.example
 ├── compose.yaml
 ├── requirements.txt
-├── requirements-tools.txt      Optional offline dataset tooling
-└── requirements-ml.txt         Optional real-model dependencies
+└── THIRD_PARTY_NOTICES.md
 ```
+
+All Python dependencies are consolidated in `requirements.txt`. Heavy ML imports
+remain lazy where practical so the ordinary test suite does not load a model or
+require a GPU.
+
+## Pinned real Client profile
+
+The authoritative Step 3 profile is:
+
+| Field | Value |
+| --- | --- |
+| Profile | `qwen3-1.7b-lora-v1` |
+| Model/tokenizer | `Qwen/Qwen3-1.7B` |
+| Revision | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
+| Model class | `Qwen3ForCausalLM` |
+| Tokenizer class | `Qwen2TokenizerFast` |
+| Vocabulary | 151,936 tokens |
+| Chat mode | Qwen non-thinking |
+| LoRA rank / alpha / dropout | 8 / 16 / 0.05 |
+| LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
+| Precision | BF16 |
+| Quantization | none |
+
+The repository also defines `llama-3.2-1b-instruct-lora-v1` at exact revision
+`9213176726f574b556790deb65791e0c5aa438b6`, but the accepted Step 3 run used Qwen.
+An arbitrary Hugging Face or Ollama model is not automatically a supported
+training profile.
+
+Relevant dependency pins are:
+
+```text
+accelerate==1.14.0
+peft==0.20.0
+rapidfuzz==3.14.5
+safetensors==0.8.0
+sentencepiece==0.2.2
+torch==2.13.0
+transformers==4.57.6
+PyMuPDF==1.28.0
+```
+
+The adapted FedMKT code uses RapidFuzz Levenshtein distance in place of
+`editdistance` for Python 3.14 wheel compatibility. See
+`shared/fedmkt_core/UPSTREAM.md` and `THIRD_PARTY_NOTICES.md`.
+
+## Private Client training data
+
+The real Client reads local UTF-8 JSONL. Each line has exactly this logical form:
+
+```json
+{
+  "schema_version": "1.0",
+  "example_id": "private-example-001",
+  "prompt": "A private local instruction or question.",
+  "answer": "The private local target answer."
+}
+```
+
+Requirements include:
+
+- unique non-empty example IDs;
+- non-empty prompt and answer strings;
+- one consistent supported schema;
+- deterministic order and dataset hashing;
+- no truncation of examples that exceed the signed sequence limit; and
+- answer-only supervision under `chat_sft_answer_only_v1`.
+
+Compose mounts the host directory configured by `CLIENT_PRIVATE_DATA_DIR` as
+read-only `/private`, with the training file expected at `/private/train.jsonl`.
+The examples and their text never enter Coordinator storage. Training records
+persist only identity hashes, counts, settings and measured execution results.
+
+## Round-bound training and checkpoints
+
+For real training, the signed manifest fixes:
+
+- the selected Client and exact model-profile hash;
+- D^P identity and ordered sample IDs;
+- prompt-template and label-format identity;
+- maximum sequence length and `truncation_policy=reject`;
+- training epochs and top-k; and
+- DP-policy report fields.
+
+The execution profile fixes the local device, precision, micro-batch size,
+gradient accumulation, learning rate, seed, scheduler and optional frozen-base
+checksum.
+
+A candidate is promoted only when all of the following succeed:
+
+- at least one optimizer step ran;
+- training loss is finite and non-negative;
+- at least one LoRA tensor differs from its parent;
+- the checkpoint contains adapter files rather than full base-model weights;
+- metadata, tensor shapes, ranks and target modules match the pinned profile;
+- an optional full frozen-base checksum remains unchanged; and
+- a fresh base-model-plus-adapter reload matches the in-memory probe logits at
+  strict `atol=1e-4`.
+
+Candidate and Trainer staging directories are removed after success or failure.
+A failed run cannot advance the current-adapter pointer or create a completed
+round record.
+
+The Client uses one process-local ML lock for both real training and real knowledge
+generation. Work runs outside FastAPI's event loop, `/health` stays responsive and
+a concurrent training or generation request receives HTTP 409.
+
+## Real D^P knowledge contract
+
+Every reference sample is rendered with the same pinned chat and answer-only
+label contract used for private training.
+
+```text
+input              rendered public prompt + gold answer + tokenizer terminator
+stored positions   every non-padding source position
+top-k              highest raw model logits at each stored position
+sample metric      causal CE averaged over supervised answer targets only
+padding            allowed for batches, removed from stored samples
+inference          eval mode, no gradients, use_cache=False
+order              exact signed D^P sample order
+overlength         reject; never truncate
+```
+
+The package generator loads the archived round-specific adapter named by the
+validated training record, not whichever adapter happens to be current later.
+Pending retries reuse the exact signed package and exact artifact bytes without a
+second inference run.
 
 ## Reference dataset boundary
 
@@ -185,9 +296,18 @@ A canonical reference sample contains:
 }
 ```
 
-The authoritative runtime format is UTF-8 JSONL with one sample per line.
-A separate pretty JSON copy may be generated for human inspection, but JSONL
-remains authoritative.
+The authoritative runtime format is UTF-8 JSONL with one sample per line. Pretty
+JSON files are generated only for human inspection.
+
+The semantic dataset hash covers the schema, dataset ID/version and ordered
+`sample_id`, `chapter`, `section`, `question` and `gold_answer` fields. Source page
+metadata is provenance and is excluded from the semantic hash.
+
+The generic split groups samples by `(chapter, section)` and preserves source
+order. A one-sample section belongs entirely to D^P. Otherwise D^P receives the
+first `floor(0.8 * n)` samples and D^V receives the remainder. GLD-dependent
+follow-up pairs are grouped by the source-specific importer before this generic
+split, so a base question and its dependent follow-up cannot be separated.
 
 The shared prompt renderer produces:
 
@@ -201,240 +321,95 @@ Question: {question}
 Answer:
 ```
 
-The `gold_answer` remains a separate target and is never inserted into the input
-prompt.
+`gold_answer` remains a separate target and is not inserted into this public
+prompt string.
 
-### Canonical dataset identity
+### Accepted GLD corpus identity
 
-The semantic dataset hash covers:
+The authoritative importer run used PyMuPDF 1.28.0 and the pinned 713-page Greek
+Law Digest source.
 
-```text
-schema_version
-dataset_id
-dataset_version
-ordered samples:
-    sample_id
-    chapter
-    section
-    question
-    gold_answer
-```
+| Dataset | Samples | Semantic SHA-256 |
+| --- | ---: | --- |
+| Complete corpus | 738 | `cf5c81dcecaab58848c1afb0e99f86bcf5fd32823c2aaee34a65f6f4a2ccd0e8` |
+| D^P reference corpus | 565 | `5d855a429d43b70eb146aeb11cda1f675c05d6465bea0792796fdcd8d6ceb231` |
+| D^V validation corpus | 173 | `1e40a74799b9900ff8b9a9e05dd379fd0c00226370625f7da1fdca13142b83b5` |
 
-It does not include PDF page numbers or other source-provenance fields. Therefore,
-changing the semantic sample content or sample order changes the hash, while
-correcting only source-page metadata does not.
-
-### Deterministic D^P/D^V split
-
-Samples are grouped by `(chapter, section)` and retain their source order.
-
-For a section containing `n` samples:
-
-```python
-if n == 1:
-    D_P = all samples
-    D_V = []
-else:
-    cut = floor(0.8 * n)
-    D_P = samples[:cut]
-    D_V = samples[cut:]
-```
-
-Sample IDs are not renumbered after splitting.
-
-For GLD specifically, dependent top-level follow-up Q&A pairs are grouped by the
-source-specific importer **before** this generic split runs. The original question
-and answer wording is preserved and concatenated in source order. This prevents a
-base question and its dependent follow-up from being separated between D^P and
-D^V without changing the generic `ReferenceSample` schema.
-
-Where a GLD section contains repeated short questions under different internal
-subheadings, approved source subheadings are appended to the canonical `section`
-value so that the resulting prompts remain unambiguous.
-
-### Real-data and mock-data modes
-
-When the Coordinator is configured with real dataset paths, it:
-
-- loads and validates both D^P and D^V;
-- requires matching dataset IDs and versions;
-- rejects overlap between D^P and D^V;
-- derives the manifest dataset metadata from the real D^P;
-- ignores fabricated dataset metadata supplied by a round-creation request;
-- snapshots both files for the specific round.
-
-When no real dataset is configured, the deterministic mock fixture path remains
-available. In that mode, the round request supplies mock dataset metadata and the
-reference-dataset download endpoint returns `204 No Content`.
-
-## What can be tested now
-
-The current implementation can test:
-
-- canonical reference-sample validation;
-- JSONL loading, writing and human-readable JSON generation;
-- Unicode and paragraph preservation;
-- duplicate and mixed-version rejection;
-- canonical dataset hashing;
-- deterministic per-section D^P/D^V splitting;
-- deterministic GLD question-style recognition;
-- multiline and black-bold GLD question extraction;
-- exclusion of non-question GLD captions;
-- preservation of embedded question-mark sentences inside answers;
-- grouping of consecutive source questions that share one answer;
-- reviewed GLD follow-up grouping without rewriting source wording;
-- stable source-question IDs after grouping;
-- approved subsection-context disambiguation;
-- contributing-firm running-matter filtering;
-- GLD corpus audits for duplicate prompts, profile contamination and scope;
-- pinned GLD source SHA-256 and page-count verification;
-- deterministic binary Knowledge Artifact serialization;
-- variable-length sample flattening and reconstruction;
-- artifact byte-size, SHA-256 and ordered-sample-ID binding;
-- strict tensor-name, dtype, shape, offset and top-k validation;
-- rejection of oversized, truncated, trailing, malformed and non-finite artifacts;
-- signed manifest creation and verification;
-- Ed25519 Client and Host Knowledge Package signatures over complete schema 2.0
-  package metadata;
-- package-hash binding from signed metadata to the artifact descriptor and from
-  its byte size and SHA-256 to the exact tensor bytes;
-- rejection of rehashed metadata, substituted artifacts, invalid signatures and
-  re-signed but round-inconsistent packages;
-- valid reuse of byte-identical artifacts by independently signed packages;
-- bounded streaming multipart upload and download;
-- rejection and cleanup of missing, duplicated, malformed, truncated or oversized
-  transfer parts;
-- nonce, duplicate and replay checks that survive Coordinator restart;
-- package-size and timestamp checks;
-- independent Client submissions;
-- quorum-triggered sealing;
-- deadline-based round skipping;
-- Coordinator-owned real dataset metadata;
-- immutable per-round D^P and D^V snapshots;
-- selected-Client D^P download authorization;
-- Client D^P hash, ID and order verification;
-- rejection of tampered Client dataset downloads;
-- Client round-bound dataset caching;
-- Host D^P and D^V verification and caching;
-- D^P/D^V dataset-version and overlap checks;
-- deterministic DualMinCE selection;
-- Host candidate promotion;
-- Host rollback when validation fails;
-- Host Knowledge Package publication;
-- Client-side package verification and mock reverse distillation;
-- persistence across Coordinator restart;
-- authenticated Client administrative endpoints;
-- immutable accepted Client package and adapter-snapshot binding;
-- replay detection for authenticated packages rejected later;
-- strict Host identity, round, dataset and adapter-version verification;
-- explicit rejection of unintegrated real training and alignment backends;
-- reproducible Client and Host Knowledge Package size measurement over the frozen
-  565-sample D^P;
-- Ollama list, inspect and generation boundaries through mocks.
-
-Run the lightweight protocol/runtime test environment locally:
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m unittest discover -v
-```
-
-`tests/test_gld_importer.py` contains 29 importer tests and does not require opening
-the real PDF. It imports PyMuPDF lazily, so the ordinary unit-test path remains
-independent of the offline PDF tooling. `tests/test_knowledge_artifact.py` contains
-16 artifact-contract and validation tests. Security and transport regressions are
-kept in `tests/test_knowledge_security.py` and
-`tests/test_knowledge_transport.py`.
-
-The repository-wide suite contains 105 tests after Step 2. Confirm the count with
-the command above in the local environment.
-
-The default test suite does not import PyTorch or Transformers. PyMuPDF is required
-only when the real PDF importer or layout-inspection utility is executed.
+The accepted audit reported zero unresolved follow-ups, duplicate canonical
+prompts, contributing-firm/profile contamination, out-of-scope samples and
+blocking issues.
 
 ## Knowledge Package and Artifact contract
 
-The architecture's Client and Host package fields are sufficient as the logical
-content model: round/manifest binding, sender and model/tokenizer identity,
-alignment profile, reference-dataset identity, ordered samples, top-k token IDs
-and logits, CE losses, privacy report where applicable, nonce/timestamp, package
-hash and signature. The wire contract additionally makes protocol/package schema,
-sender role and adapter version explicit. Exact source input IDs and attention
-lengths are carried as artifact tensors so later token alignment is bound to the
-sequence that actually produced the logits.
+Knowledge Package schema 2.0 is one signed logical object with two transported
+parts:
 
-Knowledge Package schema 2.0 replaces embedded numerical arrays with a
-serialization descriptor for the numerical artifact:
+```text
+canonical signed JSON envelope
+        +
+exact safetensors numerical artifact
+```
+
+The envelope's descriptor binds the exact artifact bytes:
 
 ```json
 {
   "format": "safetensors",
   "schema_version": "1.0",
-  "byte_size": 123456,
+  "byte_size": 4809632,
   "sha256": "<SHA-256 of exact artifact bytes>",
   "sample_count": 565,
   "sample_ids_sha256": "<SHA-256 of the canonical ordered ID list>",
-  "total_token_count": 289280,
-  "top_k": 20
+  "total_token_count": 133336,
+  "top_k": 4
 }
 ```
 
-Schema version 1.0 contains exactly six tensors. `N` is the sample count, `T` is
-the total number of source tokens and `K` is top-k.
+The byte size and token count above are from the accepted real Step 3 package;
+run-specific hashes are deliberately not frozen as project constants.
+
+Artifact schema 1.0 contains exactly six tensors. `N` is the sample count, `T`
+the total stored token count and `K` top-k.
 
 | Tensor | Dtype | Shape | Purpose |
 | --- | --- | --- | --- |
-| `sample_offsets` | `int64` | `[N + 1]` | Boundaries of variable-length samples |
-| `source_input_ids` | `int32` | `[T]` | Flattened sender-tokenizer input IDs |
-| `attention_lengths` | `int32` | `[N]` | Unmasked token count per sample |
+| `sample_offsets` | `int64` | `[N + 1]` | Variable-length sample boundaries |
+| `source_input_ids` | `int32` | `[T]` | Sender-tokenizer input IDs |
+| `attention_lengths` | `int32` | `[N]` | Unmasked length per sample |
 | `top_k_token_ids` | `int32` | `[T, K]` | Sender-tokenizer top-k IDs |
-| `top_k_logits` | `float32` | `[T, K]` | Top-k logits |
+| `top_k_logits` | `float32` | `[T, K]` | Raw top-k logits |
 | `ce_losses` | `float32` | `[N]` | Per-sample cross-entropy loss |
-
-Sample IDs remain in deterministic order in the signed JSON envelope. They are
-not duplicated in the binary file; `sample_ids_sha256` binds that ordered list to
-the descriptor. The loader rejects missing or unknown tensors, dtype/shape/offset
-mismatches, negative token IDs or losses, non-finite values, size/hash/order
-mismatches and malformed or trailing file content. It never accepts pickle or
-arbitrary Python object deserialization.
-
-`shared/knowledge_artifact.py` can now serialize, atomically write, size-bound,
-validate and reconstruct these artifacts. `shared/knowledge_transport.py` carries
-the package metadata and artifact as a bounded streaming multipart message without
-loading the complete artifact into application memory.
 
 The verification chain is:
 
 ```text
 Ed25519 signature
-    → signed Knowledge Package fields and package hash
+    → signed package metadata and package hash
     → artifact descriptor
-    → artifact byte size and SHA-256
-    → validated exact tensor bytes
+    → exact artifact byte size and SHA-256
+    → strict tensor, shape, dtype, order and finite-number validation
 ```
 
-This representation remains one cryptographically signed logical Knowledge
-Package. Client uploads, immutable Coordinator submissions, Host processing,
-Host publication, Client download and reverse synchronization all use it.
+Multipart upload/download is bounded and streaming. Rejected or interrupted
+transfers are cleaned up. Accepted Coordinator submissions are immutable:
 
-## Step 2 representation measurement
+```text
+rounds/<round-id>/submissions/<client-id>/package.json
+rounds/<round-id>/submissions/<client-id>/knowledge.safetensors
+```
 
-Run the measurement utility against the accepted 565-sample D^P:
+### Step 2 representation measurement
+
+The retained measurement utility compares schema 2.0 metadata plus the exact
+artifact with the former embedded-JSON representation:
 
 ```bash
 python scripts/measure_knowledge_packages.py \
   --reference data/derived/gld2012/reference.jsonl
 ```
 
-The utility refuses a dataset whose sample count or semantic hash differs from the
-accepted corpus. It compares the current package-plus-artifact representation with
-an equivalent schema 1.0 package containing the same deterministic mock samples in
-canonical JSON. It also sends the generated multipart body through the real
-receiver at the configured limit, the exact logical size and one byte below it.
-
-The accepted run used top-k 20 and the frozen D^P hash recorded below:
+It refuses a reference dataset whose count or semantic hash differs from the
+accepted 565-sample D^P. The accepted deterministic mock run used top-k 20:
 
 | Representation | Client | Host |
 | --- | ---: | ---: |
@@ -445,50 +420,167 @@ The accepted run used top-k 20 and the frozen D^P hash recorded below:
 | Equivalent embedded JSON | 2,159,947 B | 2,160,046 B |
 | Size reduction | 47.3277% | 47.3307% |
 
-The logical size is canonical package JSON plus artifact bytes. Multipart size
-adds body framing and excludes HTTP headers. The manifest's default 25 MiB limit
-accepted both packages; the exact logical size was accepted and one byte below was
-rejected. These are representation measurements of deterministic mock knowledge,
-not model-quality, training-time, memory or privacy results.
+These are representation measurements of deterministic mock knowledge, not
+model-quality, training-time, memory or privacy results.
+
+## Step 3 authoritative acceptance
+
+The accepted environment reported:
+
+```text
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU
+PyTorch: 2.13.0+cu130
+CUDA runtime: 13.0
+CUDA available: true
+BF16 supported: true
+model profile: qwen3-1.7b-lora-v1
+model revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+```
+
+The frozen D^P exposed 37 samples longer than 512 Qwen tokens. The largest was
+1,814 tokens, so the accepted signed sequence limit was 2,048 with rejection
+rather than truncation.
+
+The full real package reported:
+
+| Measurement | Observed value |
+| --- | ---: |
+| D^P samples | 565 |
+| Stored source tokens | 133,336 |
+| Artifact size | 4,809,632 bytes |
+| Minimum answer-only CE | 1.5879086256027222 |
+| Maximum answer-only CE | 17.829463958740234 |
+| Trainable LoRA parameters | 3,211,264 |
+| Total model parameters | 1,723,786,240 |
+| Optimizer steps | 1 |
+| Frozen-base checksum | verified unchanged |
+
+The artifact is below the existing 25 MiB logical package limit. Package,
+artifact and checkpoint hashes were produced and validated for each isolated run,
+but they are run-specific rather than frozen protocol constants.
+
+Peak RAM, peak VRAM and wall-clock timings were not recorded as stable thesis
+measurements in Step 3 and are not claimed here. Comparative resource and timing
+measurement belongs to the later complete heterogeneous-round experiment.
+
+## Test and verification commands
+
+### Lightweight repository suite
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -v
+```
+
+The authoritative Step 3 run reported:
+
+```text
+Ran 133 tests
+OK (skipped=2)
+```
+
+The two skips are the opt-in real-model acceptance tests. The ordinary suite
+does not download or load a language model.
+
+Focused model-free Client tests can be run with:
+
+```bash
+python -m unittest -v \
+  tests.test_client_training \
+  tests.test_client_knowledge \
+  tests.test_client_real_package
+```
+
+### Build and health-check the services
+
+Create an environment file and replace all development tokens:
+
+```bash
+cp .env.example .env
+mkdir -p data/client-private
+```
+
+For ordinary service startup, provide `data/client-private/train.jsonl` in the
+format documented above, then run:
+
+```bash
+docker compose -p legalfedllm up --build --wait --wait-timeout 180
+docker compose -p legalfedllm ps
+```
+
+Host, Coordinator and Client should all report `healthy`. The Compose Client uses
+the `client-ml` target, the Qwen profile, all available GPUs, 2 GiB shared memory,
+a persistent Hugging Face cache and a read-only private-data mount.
+
+Check the published services:
+
+```bash
+curl -s http://localhost:8000/health
+curl -s http://localhost:8001/health
+```
+
+Reset prototype state only when that destructive cleanup is intended:
+
+```bash
+docker compose -p legalfedllm down -v
+```
+
+### Focused real-model acceptance
+
+This downloads the pinned model if it is not already cached and requires a
+compatible CUDA/BF16 environment:
+
+```bash
+docker compose -p legalfedllm run --rm --no-deps -T \
+  -e LEGALFEDLLM_RUN_REAL_MODEL_TESTS=true \
+  -e LEGALFEDLLM_REAL_MODEL_PROFILE=qwen3-1.7b-lora-v1 \
+  client python -m unittest -v \
+  tests.test_client_real_model.RealClientModelAcceptanceTests.test_one_peft_step_save_reload_and_real_knowledge
+```
+
+The acceptance test creates two temporary private examples, performs one real
+LoRA optimization, validates the checkpoint, creates a two-sample real package,
+reloads it and verifies byte-identical retry behavior.
+
+### Full frozen-D^P real package
+
+The accepted GLD D^P must exist locally at
+`data/derived/gld2012/reference.jsonl`:
+
+```bash
+docker compose -p legalfedllm run --rm --no-deps -T \
+  -v "$PWD/data/derived/gld2012:/datasets:ro" \
+  -e LEGALFEDLLM_RUN_REAL_MODEL_TESTS=true \
+  -e LEGALFEDLLM_REAL_MODEL_PROFILE=qwen3-1.7b-lora-v1 \
+  -e LEGALFEDLLM_REAL_REFERENCE_DATASET_PATH=/datasets/reference.jsonl \
+  -e LEGALFEDLLM_REAL_MAX_SEQUENCE_LENGTH=2048 \
+  client python -m unittest -v \
+  tests.test_client_real_model.RealClientModelAcceptanceTests.test_full_565_sample_reference_dataset
+```
+
+The test refuses the wrong dataset identity/order, rejects overlength input before
+expensive inference and validates the generated signed package and artifact.
 
 ## Offline GLD dataset tooling
 
-The GLD tools are separate from the LegalFedLLM runtime.
-
-Install the optional tooling dependencies:
-
-```bash
-python -m pip install -r requirements-tools.txt
-```
-
-The tools expect the local source PDF at:
+Place the pinned source at:
 
 ```text
 data/private/greek_law_digest.pdf
 ```
 
-### Layout inspection
-
-Run:
+Then run:
 
 ```bash
 python tools/datasets/inspect_gld_layout.py
-```
-
-The inspection utility records page text, positions, fonts, sizes, anchor matches,
-the source-file SHA-256 and the PyMuPDF version under `data/derived/`. It exists to
-inspect the PDF layout and extraction assumptions.
-
-### Deterministic GLD importer
-
-Run:
-
-```bash
 python tools/datasets/gld_pdf_to_jsonl.py
 ```
 
-The importer is intentionally tied to the thesis copy of **Greek Law Digest
-(2012)**:
+The importer accepts only the pinned source:
 
 ```text
 expected PDF pages: 713
@@ -496,52 +588,9 @@ expected SHA-256:
 9673ee7c86b3d582e2c08e1cdd2b84f144981f31a1fe50d4216e82c5b350b77d
 ```
 
-A different PDF is rejected even if it has the same title.
-
-The initial corpus scope is fixed to complete source sections beginning at printed
-page 34 and ending before `COVERED BONDS` on printed page 306. Therefore the last
-included printed page is 305. The scope contains 46 listed sections: 44
-Q&A-structured sections are imported and two prose-structured sections are
-explicitly excluded because LegalFedLLM does not synthesize questions that are not
-present in the source.
-
-The importer:
-
-- identifies top-level GLD questions from the reviewed source formatting;
-- ignores blue captions that do not end in a question mark;
-- retains valid black-bold questions;
-- keeps ordinary question-mark sentences inside answers when they are not
-  top-level question blocks;
-- joins wrapped question lines;
-- removes reviewed running headers, footers and contributing-firm profile matter;
-- groups dependent follow-up Q&A pairs before D^P/D^V splitting;
-- preserves original source wording and order when grouping;
-- keeps source-question ordinals in sample IDs rather than renumbering after
-  grouping;
-- uses approved GLD subsection headings to disambiguate otherwise identical
-  prompts;
-- records reviewed follow-up overrides;
-- normalizes PDF bullet controls into stable ASCII list items;
-- resolves only reviewed line-wrap and inline hyphenation artifacts;
-- removes reviewed question-number and superscript-footnote noise;
-- blocks unknown control characters, hyphenation candidates and other targeted
-  text-hygiene failures;
-- audits the final canonical corpus for duplicate prompts, remaining firm/profile
-  text, extraction noise and out-of-scope samples;
-- preserves source answers that consist only of an internal cross-reference and
-  records them as warnings rather than inventing replacement text.
-
-If unresolved extraction issues or follow-up candidates remain, the run stops and
-writes:
-
-```text
-data/derived/gld2012/
-├── candidate_all.jsonl
-├── candidate_all.json
-└── review.json
-```
-
-It deliberately removes stale final corpus files in that state.
+Its fixed initial scope begins at printed page 34 and ends before `COVERED BONDS`
+on printed page 306. It imports 44 Q&A-structured sections and explicitly excludes
+two prose-only sections rather than synthesizing questions.
 
 A clean run writes:
 
@@ -557,324 +606,109 @@ data/derived/gld2012/
 └── review.json
 ```
 
-`all.jsonl`, `reference.jsonl` and `validation.jsonl` are the authoritative
-machine-readable datasets. The corresponding `.json` files are generated
-human-readable copies.
+If unresolved candidates or audit failures remain, final corpus files are removed
+and only candidate/review outputs are retained. Generated data must be regenerated
+after importer changes rather than edited manually.
 
-### Accepted Step 1 corpus identity
+## Service APIs
 
-The authoritative PyMuPDF 1.28.0 run used the pinned 713-page source above. Its
-`review.json` and corpus audit were clean, human inspection was accepted, and all
-74 tests then present passed.
-
-| Dataset | Samples | Semantic SHA-256 |
-| --- | ---: | --- |
-| Complete corpus | 738 | `cf5c81dcecaab58848c1afb0e99f86bcf5fd32823c2aaee34a65f6f4a2ccd0e8` |
-| D^P reference corpus | 565 | `5d855a429d43b70eb146aeb11cda1f675c05d6465bea0792796fdcd8d6ceb231` |
-| D^V validation corpus | 173 | `1e40a74799b9900ff8b9a9e05dd379fd0c00226370625f7da1fdca13142b83b5` |
-
-The generated datasets and source PDF remain local and Git-ignored. These hashes
-identify semantic corpus content and order; they are not hashes of the JSONL file
-bytes.
-
-`review.json` records source identity, extraction-tool version, scope, per-section
-boundaries, warnings, reviewed follow-up decisions and the corpus audit.
-`identity.json` records the source identity plus semantic identities/hashes for the
-full corpus, D^P and D^V.
-
-The `data/` directory is ignored by Git. The GLD source PDF and generated
-derivatives remain local and must not be committed unless the required
-distribution permission is obtained.
-
-PyMuPDF is an optional offline dependency and is dual-licensed under the GNU
-AGPL-3.0 or an Artifex commercial licence. See `THIRD_PARTY_NOTICES.md`.
-
-## Run with Docker Compose
-
-Create the environment file and replace the development tokens:
-
-```bash
-cp .env.example .env
-```
-
-Start the services:
-
-```bash
-docker compose up --build --wait --wait-timeout 180
-```
-
-Host, Coordinator and Client all define `/health` checks. `--wait` prevents an
-external demo command from racing a container whose process has started but whose
-API is not ready. Confirm that all three services report `healthy`:
-
-```bash
-docker compose ps
-```
-
-Check the two published services:
-
-```bash
-curl -s http://localhost:8000/health
-curl -s http://localhost:8001/health
-```
-
-Run one complete mock round:
-
-```bash
-. .env
-python scripts/demo_round.py
-```
-
-Reset all prototype state:
-
-```bash
-docker compose down -v
-```
-
-Only the Coordinator and Client agent publish host ports. The Host runtime is
-reachable only through the private Compose network.
-
-## Configure real reference and validation JSONL files
-
-Set both paths for the Coordinator process:
-
-```env
-COORDINATOR_REFERENCE_DATASET_PATH=/datasets/reference.jsonl
-COORDINATOR_VALIDATION_DATASET_PATH=/datasets/validation.jsonl
-```
-
-Both variables must be configured together. Startup fails if only one is set or
-if the files are malformed, inconsistent or overlapping. The paths must be visible
-inside the Coordinator environment. The supplied Compose demo intentionally does
-not mount the Git-ignored GLD corpus, so using it with real data requires an
-explicit local bind mount and matching container paths.
-
-The signed manifest binds the round to D^P through:
-
-```text
-reference_dataset_id
-reference_dataset_hash
-ordered sample_ids
-```
-
-D^V is retained by the Coordinator and Host and is not exposed through the
-public Client download endpoint.
-
-## Service boundaries
-
-### Federated Coordinator — port 8000
-
-The Coordinator owns the public federation protocol:
+### Coordinator — published port 8000
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Coordinator status |
-| `GET` | `/v1/identity` | Coordinator and Host public keys |
-| `POST` | `/v1/clients/register` | Register a Client model profile and public key |
+| `GET` | `/health` | Service status |
+| `GET` | `/v1/identity` | Coordinator and Host public identity |
+| `POST` | `/v1/clients/register` | Register a Client profile and public key |
 | `POST` | `/v1/rounds` | Create and sign a round manifest |
-| `GET` | `/v1/rounds/current` | Retrieve the active manifest |
+| `GET` | `/v1/rounds/current` | Retrieve the current manifest |
 | `GET` | `/v1/rounds/{id}/manifest` | Retrieve one manifest |
-| `GET` | `/v1/rounds/{id}/reference-dataset` | Download the round D^P as JSONL |
-| `POST` | `/v1/rounds/{id}/knowledge` | Upload signed package JSON plus `safetensors` artifact |
+| `GET` | `/v1/rounds/{id}/reference-dataset` | Download selected round D^P |
+| `POST` | `/v1/rounds/{id}/knowledge` | Upload package JSON plus artifact |
 | `GET` | `/v1/rounds/{id}/status` | Poll round state |
-| `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed Host package JSON plus artifact |
-| `POST` | `/v1/generate` | Proxy a direct Host consultation request |
+| `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed Host package |
+| `POST` | `/v1/generate` | Proxy direct Host consultation |
 
-The D^P endpoint requires a valid registration token and a registered Client ID.
-The Client must also be selected in the signed round manifest. D^V has no public
-download endpoint.
-
-Registration requires `X-Registration-Token`. Round creation requires
-`X-Admin-Token`. Public internet deployment must place HTTPS and stronger identity
-bootstrap in front of these APIs.
-
-### Host runtime — private port 8002
-
-The Host runtime owns:
-
-- current Host adapter metadata;
-- private D^P and D^V loading;
-- independent dataset verification;
-- per-round dataset caching;
-- reference-dataset Host knowledge generation;
-- candidate Host adapter creation;
-- validation and rollback;
-- accepted adapter versioning;
-- signed Host Knowledge Package generation;
-- optional Ollama-backed inference.
-
-Its private API includes:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/internal/v1/identity` | Host identity and model profile |
-| `POST` | `/internal/v1/reference-data` | Load and verify round D^P and D^V |
-| `POST` | `/internal/v1/reference-knowledge` | Stream signed Host reference package and artifact |
-| `POST` | `/internal/v1/distill` | Run mock distillation and stream its signed result |
-
-These endpoints are protected by `X-Internal-Token` and are not published by
-`compose.yaml`.
-
-### Client agent — port 8001
-
-The Client agent owns local state:
+### Client — loopback-published port 8001
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Client state and backend status |
 | `POST` | `/v1/register` | Register with the Coordinator |
-| `POST` | `/v1/local-train` | Mock local training independent of a round |
-| `POST` | `/v1/participate` | Verify manifest, download/cache D^P and submit knowledge |
-| `POST` | `/v1/rounds/{id}/sync` | Verify and selectively consume Host knowledge |
+| `POST` | `/v1/local-train` | Local training outside a round |
+| `POST` | `/v1/rounds/{id}/local-train` | Train against one signed round |
+| `POST` | `/v1/participate` | Legacy current-round participation |
+| `POST` | `/v1/rounds/{id}/participate` | Generate and submit the round package |
+| `POST` | `/v1/rounds/{id}/sync` | Consume verified Host knowledge |
 | `POST` | `/v1/generate` | Local mock or Ollama inference |
 | `GET` | `/v1/ollama/models` | List installed Ollama models |
 | `POST` | `/v1/ollama/inspect` | Inspect one Ollama model |
 
-The administrative endpoints require `X-Client-Admin-Token`. `/health` and
+Client administrative endpoints require `X-Client-Admin-Token`. `/health` and
 `/v1/generate` remain outside that administrative gate.
 
-Raw examples passed to `/v1/local-train` remain inside the Client service. Only a
-local content hash and example count are persisted. The Coordinator receives only
-the signed Knowledge Package.
+### Host — private port 8002
 
-## Bounded asynchronous round state
+The Host API is reachable only inside the Compose network and is protected by
+`X-Internal-Token`. It owns dataset verification, current Host adapter metadata,
+mock selection/distillation, validation and rollback, signed Host publication and
+optional Ollama inference.
 
-```text
-COLLECTING
-    ↓ trusted quorum reached
-SEALED
-    ↓
-DISTILLING
-    ↓
-COMPLETED
-```
+## Persistence and retry behavior
 
-A round becomes `SKIPPED` when its deadline passes without the required trusted
-quorum. It becomes `ABORTED` if a sealed Host job fails. Late packages and second
-submissions from the same Client are rejected.
+No database is required. Each service owns a local filesystem state tree.
 
-The first Client may submit and disconnect while the Coordinator waits for the
-remaining Clients. The accepted set is frozen before the Host job starts, so late
-arrivals cannot alter an in-progress distillation job.
-
-## Filesystem persistence
-
-No database is required. Each service creates its own state tree under its
-configured data directory.
+Client state distinguishes:
 
 ```text
-Coordinator data
-├── identity/
-├── clients/
-├── host/
-├── rounds/
-│   └── <round-id>/
-│       ├── manifest.json
-│       ├── state.json
-│       ├── datasets/
-│       │   ├── reference.jsonl
-│       │   ├── validation.jsonl
-│       │   └── identity.json
-│       ├── submissions/
-│       │   └── <client-id>/
-│       │       ├── package.json
-│       │       └── knowledge.safetensors
-│       ├── safety/
-│       └── host_knowledge/
-│           ├── package.json
-│           └── knowledge.safetensors
-└── audit/events.jsonl
-
-Host data
-├── identity/
-├── adapters/
-└── rounds/
-    └── <round-id>/
-        ├── datasets/
-        │   ├── reference.jsonl
-        │   ├── validation.jsonl
-        │   └── identity.json
-        └── ...
-
-Client data
-├── identity/
-├── state.json
-├── reference_datasets/
-│   └── <round-id>/
-│       ├── reference.jsonl
-│       └── identity.json
-├── knowledge_cache/
-│   ├── pending/<round-id>/
-│   │   ├── package.json
-│   │   └── knowledge.safetensors
-│   ├── accepted/<round-id>/
-│   │   ├── package.json
-│   │   └── knowledge.safetensors
-│   ├── host/<round-id>/
-│   │   ├── package.json
-│   │   └── knowledge.safetensors
-│   └── receipts/
-└── adapter_snapshots/
-    ├── pending/
-    └── accepted/
+identity and active state
+round-specific training records
+versioned PEFT adapter checkpoints
+verified D^P caches
+pending Knowledge Packages
+accepted Knowledge Packages
+Host package caches
+submission receipts
+pending and accepted adapter snapshots
 ```
 
-A downloaded Client dataset is written to a temporary path and accepted only
-after schema, dataset ID, semantic hash and sample-order verification. The cache
-identity is bound to the round ID and manifest hash.
+For a real package, the adapter version and checkpoint hash come from the signed-
+round training record, not mutable current state. Pending and accepted package
+state is revalidated against the round, model profile, training record, checkpoint,
+package signature and artifact before reuse.
 
-A Client Knowledge Package and artifact are first written as pending state. Only
-after a matching Coordinator receipt is returned are the exact pair and its
-round-bound adapter snapshot committed as accepted state. Accepted package,
-artifact and snapshot sets are immutable for that round. Host packages are cached
-only after signature, round, manifest, dataset, adapter and artifact verification.
-
-Streaming uploads and downloads use temporary artifact paths and remove them after
-failure or after immutable persistence. Other writes use temporary files followed
-by atomic replacement. Direct execution defaults to `./data/...`; Compose
-overrides these paths with `/data/...` volume mounts.
+A retry while pending reuses the exact JSON and artifact bytes. After Coordinator
+acceptance, the local package/artifact/snapshot set is immutable. A second accepted
+submission is rejected rather than processed twice.
 
 ## Security included now
 
 The current implementation includes:
 
 - Ed25519 identities and signatures;
-- canonical JSON signing;
-- SHA-256 manifest, package, dataset and candidate-artifact hashes;
-- registered Client public keys;
-- signed Coordinator manifests;
-- signed Client and Host Knowledge Packages;
-- signed artifact descriptors containing exact byte size, SHA-256, tensor schema,
-  sample count, ordered-sample-ID hash, token count and top-k;
-- round-bound manifest hashes;
-- nonces and timestamp-skew checks;
-- duplicate Client submission rejection;
-- persistent replay tracking for seen nonces and package hashes, including
-  authenticated packages that fail later policy checks;
-- logical package-size limits plus separately bounded multipart framing;
-- bounded streaming transport and rejected-transfer temporary-file cleanup;
-- exact model-profile verification;
-- exact dataset ID, semantic hash and sample-order verification;
+- canonical JSON hashing and signing;
+- exact artifact size and SHA-256 binding;
+- registered Client public keys and signed Coordinator manifests;
+- round, manifest, dataset, sample-order, model, tokenizer, adapter and DP-report
+  binding;
+- persistent nonce and package-hash replay protection;
 - selected-Client authorization for D^P download;
-- Client cache binding to the round and manifest;
-- Host verification of D^P against the signed manifest;
-- Host verification of D^V identity, version and separation from D^P;
-- strict Host identity, signature, manifest and adapter-version verification;
-- authenticated Client administrative endpoints;
-- immutable accepted Client package and adapter-snapshot binding;
-- immutable Coordinator package/artifact storage and verified Host-package cache;
-- finite-number and shape validation;
-- a minimal Knowledge Package Safety Probe;
+- bounded logical-package and multipart sizes;
+- strict artifact names, dtypes, shapes, offsets and finite-number checks;
+- temporary-file cleanup and immutable accepted storage;
+- round-specific training/checkpoint provenance;
+- a minimal deterministic Knowledge Package safety gate; and
 - append-only JSONL audit events.
 
-This does not replace HTTPS. Signatures prove package origin and integrity but do
-not encrypt network traffic. The current registration and internal tokens are
-development credentials, not production-grade per-service identity.
+Ed25519 proves origin and integrity; it does not encrypt traffic. Compose uses
+plain HTTP on its development network. Registration, administrative and internal
+tokens are development credentials rather than production identities.
 
-## Ollama boundary and Windows baseline
+The current DP report checks policy and protocol consistency. Real training is
+ordinary LoRA training, not DP-SGD, and no formal privacy accountant is claimed.
 
-The default backend remains `mock`. To use an existing Ollama installation for
-normal inference, set:
+## Ollama boundary
+
+Ollama remains an optional serving boundary. It is not the real training runtime.
 
 ```env
 CLIENT_SERVING_BACKEND=ollama
@@ -882,162 +716,85 @@ CLIENT_OLLAMA_MODEL=<installed model name>
 OLLAMA_BASE_URL=http://host.docker.internal:11434
 ```
 
-The intended first Windows environment is:
-
-```text
-Windows 10/11
-├── native Ollama
-└── Docker Desktop with WSL2 Linux containers
-    ├── Coordinator
-    ├── Host runtime
-    └── Client agent
-```
-
-When Compose is run through Podman and Ollama is on the host, use:
+For Bazzite/Podman with host Ollama, use:
 
 ```env
 OLLAMA_BASE_URL=http://host.containers.internal:11434
 ```
 
-Ollama is currently a serving boundary only. The real FedMKT training path will
-use Transformers and PEFT, then publish accepted model-specific adapters into a
-verified Ollama model profile. An arbitrary Ollama model is not automatically a
-supported training model.
+LegalFedLLM trains through Transformers/PEFT. Automatic export of a promoted PEFT
+adapter into an Ollama model profile is future work.
 
 ## Extracted FedMKT core
 
-The optional machine-learning files under `shared/fedmkt_core/ml/` are adapted
+Optional ML modules under `shared/fedmkt_core/ml/` were extracted and adapted
 from FATE-LLM commit:
 
 ```text
 0c63377e468f0f62a9bdf5fb32424688b9478553
 ```
 
-Included components are:
-
-- `FedMKTTrainer`;
-- `DataCollatorForFedMKT`;
-- top-k logit and CE-loss generation;
-- token alignment;
-- vocabulary mapping;
-- FedMKT constants.
-
-FATE Context, FATE communication roles, FATE-Flow and FATE aggregation wrappers
-are not included. LegalFedLLM supplies the HTTP, security, storage and round
-layers.
-
-Install the optional machine-learning environment only when moving to real models:
-
-```bash
-python -m pip install -r requirements-ml.txt
-```
-
-The current protocol services import these dependencies lazily, so the default
-mock workflow stays small.
-
-See `shared/fedmkt_core/UPSTREAM.md`, `shared/fedmkt_core/LICENSE`, and
-`THIRD_PARTY_NOTICES.md`.
+Included components cover top-k/CE generation, token alignment, vocabulary
+mapping, `DataCollatorForFedMKT`, `FedMKTTrainer` and constants. FATE Context,
+FATE communication roles, FATE-Flow and aggregation wrappers are not included.
+LegalFedLLM supplies the HTTP, security, persistence and round layers.
 
 ## Current limitations
 
-The repository does not yet perform:
+LegalFedLLM does not yet provide:
 
-- real private LoRA training;
-- teacher-forced model inference on D^P;
-- real top-k logit and CE-loss extraction;
-- real cross-tokenizer alignment inside a live round;
-- real Host or Client knowledge distillation;
-- formal differential-privacy accounting;
-- learned malicious-package detection;
-- encrypted artifact storage;
-- production authentication or certificate provisioning;
-- HTTPS termination;
-- a graphical Windows application;
-- automatic export of accepted PEFT adapters into Ollama.
+- real Client-to-Host or Host-to-Client token/vocabulary alignment;
+- real Host baseline inference or selective LoRA distillation;
+- real D^V validation and Host adapter promotion/rollback;
+- real reverse Client distillation from a Host package;
+- a complete heterogeneous-model federation round;
+- DP-SGD or formal differential-privacy accounting;
+- a learned malicious-package detector;
+- HTTPS, production identity bootstrap or encrypted artifact storage;
+- automatic PEFT-to-Ollama adapter publication; or
+- a graphical application.
 
-The GLD-specific deterministic importer and accepted corpus identity are complete,
-but generated GLD content remains intentionally absent from the public repository.
-
-The current D^P/D^V transfer and verification boundary is real, but the Host and
-Client still generate deterministic mock knowledge rather than model-derived
-knowledge.
-
-The DP fields currently enforce protocol consistency only. The safety probe is a
-basic deterministic gate, not the final Safe-FedLLM-inspired detector.
+The deterministic mock backend must remain available while these real stages are
+added.
 
 ## Next implementation milestones
 
-### Step 3 — First real Client model
-
-Connect one small Client runtime using pinned Transformers/tokenizer revisions and
-PEFT LoRA:
-
-```text
-private Client examples
-    → PEFT LoRA training
-    → real D^P inference
-    → top-k token/logit extraction
-    → real cross-entropy losses
-    → signed real Client Knowledge Package
-```
-
 ### Step 4 — FedMKT parity and token alignment
 
-Connect and verify the extracted FedMKT components:
+Verify the extracted FedMKT behavior before connecting it to a live Host path:
 
 ```text
-Client-to-Host alignment
-Host-to-Client alignment
+Client-to-Host token alignment
+Host-to-Client token alignment
 vocabulary mapping
-DataCollatorForFedMKT
+DataCollatorForFedMKT behavior
 FedMKTTrainer behavior
 DualMinCE parity
 ```
 
-### Step 5 — Real Host distillation
+### Step 5 — real Host distillation
 
-Replace the mock Host candidate path with real baseline inference, selective
-FedMKT LoRA distillation, D^V validation and real adapter promotion or rollback.
+Add real Host baseline inference, aligned selective knowledge distillation, D^V
+validation and adapter promotion or rollback.
 
-### Step 6 — Real reverse Client distillation
+### Step 6 — real reverse Client distillation
 
-Verify the real Host Knowledge Package, align Host outputs into the Client token
-space, select samples where the Host CE is lower and distil those targets into the
-Client-specific LoRA.
+Verify and align Host knowledge, select samples where the Host teacher is better
+and distil them into a Client-specific LoRA.
 
-### Step 7 — Complete heterogeneous-model round
+### Step 7 — complete heterogeneous-model round
 
-Run multiple real Clients against a heterogeneous Host and measure execution
-time, VRAM/RAM, communication volume, selected teaching samples, validation
+Run multiple real Clients against a heterogeneous Host and measure wall time,
+peak VRAM/RAM, communication volume, selected teaching samples, validation
 behavior, adapter sizes and rollback behavior.
 
-The deterministic mock backend should remain available throughout these stages.
+## Accurate project claim
 
-## Current project claim
+LegalFedLLM now demonstrates a real, pinned Client model that can learn a local
+LoRA adapter from private examples and turn its outputs over the complete frozen
+565-sample D^P into a signed, validated and transportable Knowledge Package.
+Private examples and Client-native LoRA tensors remain local.
 
-The repository currently demonstrates:
-
-- a working protocol-first control plane for FedMKT-style heterogeneous knowledge
-  transfer;
-- a canonical and cryptographically identified shared-reference-dataset format;
-- a deterministic source-specific importer for the pinned 2012 Greek Law Digest
-  thesis copy;
-- reviewed handling of GLD question styles, dependent follow-ups and internal
-  subsection context;
-- a frozen 738-sample GLD corpus with recorded D^P/D^V identities;
-- corpus-level structural and text-hygiene auditing before GLD D^P/D^V files are
-  accepted;
-- Coordinator-owned D^P/D^V round snapshots;
-- authorized D^P delivery to selected Clients;
-- independent Client and Host dataset verification and caching;
-- signed schema 2.0 Client and Host Knowledge Packages whose descriptors bind
-  exact `safetensors` artifacts;
-- bounded streaming artifact transport, immutable persistence, restart recovery
-  and reverse synchronization in the live mock round;
-- measured representation size for the frozen 565-sample D^P, including a roughly
-  47.33% reduction from the equivalent embedded-JSON mock representation;
-- deterministic mock bidirectional FedMKT message flow.
-
-It does **not** yet demonstrate a completed real-model FedMKT round, formal
-differential privacy, a complete Safe-FedLLM defense, encrypted transport/storage
-or production-ready deployment.
+It does **not** yet demonstrate real heterogeneous Host learning, reverse real
+Client learning, a completed real-model federation round, formal differential
+privacy, a complete Safe-FedLLM defense or production-ready deployment.
