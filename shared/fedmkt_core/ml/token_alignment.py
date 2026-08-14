@@ -104,7 +104,9 @@ def align_blending_model_logits_with_base_model_logits(base_examples,
                                                        blending_tokenizer,
                                                        blending_model_index,
                                                        skip_align=False,
-                                                       align_strategy="dtw"):
+                                                       align_strategy="dtw",
+                                                       base_model_special_token=None,
+                                                       blending_model_special_token=None):
     """modified from https://github.com/fanqiwan/FuseAI/blob/main/FuseLLM/src/utils/token_alignment.py#L101"""
     base_features = [{key: base_examples[key][i] for key in base_examples} for i in
                      range(len(base_examples[next(iter(base_examples))]))]
@@ -130,7 +132,9 @@ def align_blending_model_logits_with_base_model_logits(base_examples,
                 blending_model_per_step_logits=blending_feature[PER_STEP_LOGITS],
                 blending_model_per_step_indices=blending_feature[PER_STEP_INDICES],
                 blending_to_base_mapping=blending_to_base_mapping,
-                align_strategy=align_strategy
+                align_strategy=align_strategy,
+                base_model_special_token=base_model_special_token,
+                blending_model_special_token=blending_model_special_token,
             )
 
         aligned_per_step_logits_list.append(aligned_blending_model_per_step_logits)
@@ -156,14 +160,22 @@ def transform_step_logits(base_model_tokenizer: transformers.tokenization_utils_
                           blending_model_per_step_logits: List[List[float]],
                           blending_model_per_step_indices: List[List[int]],
                           blending_to_base_mapping: Dict[str, str] = None,
-                          align_strategy: str = "dtw"
+                          align_strategy: str = "dtw",
+                          base_model_special_token: str | None = None,
+                          blending_model_special_token: str | None = None,
                           ):
     """modified from https://github.com/fanqiwan/FuseAI/blob/main/FuseLLM/src/utils/others.py#L364"""
     """Align blending model per step logits & indices with base model."""
     base_model_tokens = base_model_tokenizer.convert_ids_to_tokens(base_model_input_ids)
     blending_model_tokens = blending_model_tokenizer.convert_ids_to_tokens(blending_model_input_ids)
-    base_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[base_model_tokenizer.__class__]
-    blending_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[blending_model_tokenizer.__class__]
+    if base_model_special_token is None:
+        base_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
+            base_model_tokenizer.__class__
+        ]
+    if blending_model_special_token is None:
+        blending_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
+            blending_model_tokenizer.__class__
+        ]
 
     aligned_blending_model_per_step_logits, aligned_blending_model_per_step_indices = [], []
     if align_strategy == "dtw":
@@ -234,6 +246,8 @@ def token_align(
     preprocessing_num_workers=4,
     skip_align=False,
     align_strategy="dtw",
+    base_model_special_token=None,
+    blending_model_special_token=None,
 ):
     assert len(base_model_logits_datasets) == len(blending_model_logits_dataset)
     base_model_blending_model_logits_datasets = base_model_logits_datasets.map(
@@ -249,7 +263,9 @@ def token_align(
                    "blending_tokenizer": blending_tokenizer,
                    "blending_model_index": blending_model_index,
                    "skip_align": skip_align,
-                   "align_strategy": align_strategy},
+                   "align_strategy": align_strategy,
+                   "base_model_special_token": base_model_special_token,
+                   "blending_model_special_token": blending_model_special_token},
         keep_in_memory=True,
         desc="Align blending model's logits with base model's logits.",
     )

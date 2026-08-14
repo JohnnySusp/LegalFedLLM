@@ -25,6 +25,14 @@ class BlendingTokenizer(BaseTokenizer):
     pass
 
 
+class UnregisteredBaseTokenizer(BaseTokenizer):
+    pass
+
+
+class UnregisteredBlendingTokenizer(BaseTokenizer):
+    pass
+
+
 @unittest.skipUnless(
     token_alignment is not None,
     f"optional ML dependencies are unavailable: {ML_IMPORT_ERROR}",
@@ -138,6 +146,25 @@ class FedMKTTokenAlignmentParityTests(unittest.TestCase):
 
         self.assertEqual(logits, [[1.0]])
         self.assertEqual(indices, [[7]])
+
+    def test_profile_markers_do_not_require_a_class_registry_entry(self) -> None:
+        logits, indices = token_alignment.transform_step_logits(
+            base_model_tokenizer=UnregisteredBaseTokenizer({0: "Ġlaw"}),
+            blending_model_tokenizer=UnregisteredBlendingTokenizer(
+                {10: "Ġlaw"}
+            ),
+            base_model_vocab={"Ġlaw": 0},
+            base_model_input_ids=[0],
+            blending_model_input_ids=[10],
+            blending_model_per_step_logits=[[0.9]],
+            blending_model_per_step_indices=[[10]],
+            blending_to_base_mapping={"Ġlaw": "Ġlaw"},
+            base_model_special_token="Ġ",
+            blending_model_special_token="Ġ",
+        )
+
+        self.assertEqual(logits, [[0.9]])
+        self.assertEqual(indices, [[0]])
 
     def test_greedy_dp_implementation_is_removed(self) -> None:
         self.assertFalse(

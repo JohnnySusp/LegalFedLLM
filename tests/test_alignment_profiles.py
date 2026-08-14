@@ -66,6 +66,10 @@ class AlignmentProfileContractTests(unittest.TestCase):
             ).profile_id,
             POC_DTW_PROFILE_ID,
         )
+        self.assertEqual(profile.client.word_boundary_marker, "Ġ")
+        self.assertEqual(profile.host.word_boundary_marker, "Ġ")
+        self.assertEqual(profile.client.tokenizer_vocabulary_size, 151669)
+        self.assertEqual(profile.host.tokenizer_vocabulary_size, 49159)
 
     def test_exact_qwen_to_granite_pair_is_accepted(self) -> None:
         profile = validate_alignment_pair(

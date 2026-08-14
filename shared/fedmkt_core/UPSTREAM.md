@@ -33,3 +33,11 @@ in [`PARITY.md`](PARITY.md). Fixed golden tests preserve the pinned upstream
 DTW/MinED path, mappings, cost matrix and per-step logit-transformation behavior.
 LegalFedLLM removes the unused `greedy_dp` alternative and explicitly rejects
 empty token sequences, for which upstream has no defined result.
+
+The upstream eager, plain-JSON full-vocabulary mapper remains available only as
+a parity reference. LegalFedLLM's Step 4 operational prerequisite uses the
+demand-driven mapper in `shared/vocabulary_mapping.py`: cache identities bind
+both exact tokenizer artifacts, direction, rules and demanded source-ID set;
+equal-distance candidates deterministically choose the lowest target token ID.
+The DTW transformation accepts the exact validated profile boundary markers
+directly while retaining the upstream class registry as a parity fallback.

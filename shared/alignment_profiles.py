@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 from shared.protocol import ModelProfile
 
@@ -27,6 +27,22 @@ class TokenizerEndpoint:
     vocabulary_size: int
     tokenizer_chat_template_hash: str
     chat_template_mode: str
+    tokenizer_artifact_sha256: str
+    tokenizer_base_vocabulary_size: int
+    tokenizer_vocabulary_size: int
+    tokenizer_max_token_id: int
+    word_boundary_marker: str
+    bos_token: str | None
+    bos_token_id: int | None
+    eos_token: str | None
+    eos_token_id: int | None
+    pad_token: str | None
+    pad_token_id: int | None
+    unk_token: str | None
+    unk_token_id: int | None
+    additional_special_token_ids: tuple[int, ...]
+    model_max_length: int
+    padding_side: str
 
     def mismatches(self, profile: ModelProfile) -> tuple[str, ...]:
         actual = {
@@ -46,9 +62,7 @@ class TokenizerEndpoint:
             "chat_template_mode": profile.chat_template_mode,
         }
         return tuple(
-            item.name
-            for item in fields(self)
-            if actual[item.name] != getattr(self, item.name)
+            name for name, value in actual.items() if value != getattr(self, name)
         )
 
 
@@ -82,6 +96,24 @@ POC_DTW_PROFILE = BidirectionalAlignmentProfile(
             "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
         ),
         chat_template_mode="qwen_non_thinking",
+        tokenizer_artifact_sha256=(
+            "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        ),
+        tokenizer_base_vocabulary_size=151643,
+        tokenizer_vocabulary_size=151669,
+        tokenizer_max_token_id=151668,
+        word_boundary_marker="Ġ",
+        bos_token=None,
+        bos_token_id=None,
+        eos_token="<|im_end|>",
+        eos_token_id=151645,
+        pad_token="<|endoftext|>",
+        pad_token_id=151643,
+        unk_token=None,
+        unk_token_id=None,
+        additional_special_token_ids=tuple(range(151644, 151657)),
+        model_max_length=131072,
+        padding_side="right",
     ),
     host=TokenizerEndpoint(
         role="host",
@@ -98,6 +130,24 @@ POC_DTW_PROFILE = BidirectionalAlignmentProfile(
             "6bc46d1fc4c69468e21e79809662cc0a5c4a1e3e979ecb3de0dd51d4788191a0"
         ),
         chat_template_mode="standard",
+        tokenizer_artifact_sha256=(
+            "91168e938f05796aa6dcca7e485e4b30ab52785320c7a6391ecef86e6c84681e"
+        ),
+        tokenizer_base_vocabulary_size=49152,
+        tokenizer_vocabulary_size=49159,
+        tokenizer_max_token_id=49158,
+        word_boundary_marker="Ġ",
+        bos_token="<|end_of_text|>",
+        bos_token_id=0,
+        eos_token="<|end_of_text|>",
+        eos_token_id=0,
+        pad_token="<|end_of_text|>",
+        pad_token_id=0,
+        unk_token="<|end_of_text|>",
+        unk_token_id=0,
+        additional_special_token_ids=tuple(range(49152, 49159)),
+        model_max_length=9223372036854775807,
+        padding_side="left",
     ),
     client_to_host_owner="coordinator",
     host_to_client_owner="client",
