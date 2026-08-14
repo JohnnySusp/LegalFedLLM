@@ -9,7 +9,7 @@ services:
       HOST_TRAINING_BACKEND: ${HOST_TRAINING_BACKEND:-mock}
       HOST_SERVING_BACKEND: ${HOST_SERVING_BACKEND:-mock}
       HOST_MODEL_ID: ${HOST_MODEL_ID:-legalfedllm/mock-host}
-      HOST_OLLAMA_MODEL: ${HOST_OLLAMA_MODEL:-llama3.2:3b}
+      HOST_OLLAMA_MODEL: ${HOST_OLLAMA_MODEL:-granite3.3:2b}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-development-internal-token}
     expose:
@@ -60,7 +60,7 @@ services:
       CLIENT_TRAINING_BACKEND: transformers
       CLIENT_SERVING_BACKEND: ${CLIENT_SERVING_BACKEND:-mock}
       CLIENT_MODEL_ID: ${CLIENT_MODEL_ID:-legalfedllm/mock-client}
-      CLIENT_OLLAMA_MODEL: ${CLIENT_OLLAMA_MODEL:-llama3.2:1b}
+      CLIENT_OLLAMA_MODEL: ${CLIENT_OLLAMA_MODEL:-qwen3:1.7b}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       COORDINATOR_URL: http://coordinator:8000
       COORDINATOR_TIMEOUT_SECONDS: ${COORDINATOR_TIMEOUT_SECONDS:-60}

@@ -1,6 +1,7 @@
 # Environment / secrets
 .env
 .env.*
+compose.yaml.*
 !.env.example
 
 # Python environments and caches

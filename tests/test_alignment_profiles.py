@@ -5,13 +5,12 @@ import unittest
 from pydantic import ValidationError
 
 from client.model_profiles import (
-    LLAMA_PROFILE_ID,
     QWEN_PROFILE_ID,
     pinned_client_profile,
 )
 from host.model_profiles import (
-    LLAMA_3_2_3B_HOST_PROFILE_ID,
-    LLAMA_3_2_3B_REVISION,
+    GRANITE_3_3_2B_HOST_PROFILE_ID,
+    GRANITE_3_3_2B_REVISION,
     pinned_host_profile,
 )
 from shared.alignment_profiles import (
@@ -29,15 +28,23 @@ class HostModelProfileTests(unittest.TestCase):
     def test_host_profile_is_exact_and_immutable(self) -> None:
         profile = pinned_host_profile()
 
-        self.assertEqual(profile.profile_id, LLAMA_3_2_3B_HOST_PROFILE_ID)
-        self.assertEqual(profile.model_id, "meta-llama/Llama-3.2-3B-Instruct")
-        self.assertEqual(profile.model_revision, LLAMA_3_2_3B_REVISION)
+        self.assertEqual(profile.profile_id, GRANITE_3_3_2B_HOST_PROFILE_ID)
+        self.assertEqual(
+            profile.model_id,
+            "ibm-granite/granite-3.3-2b-instruct",
+        )
+        self.assertEqual(profile.model_revision, GRANITE_3_3_2B_REVISION)
         self.assertEqual(profile.model_revision, profile.tokenizer_revision)
-        self.assertEqual(profile.model_class, "LlamaForCausalLM")
-        self.assertEqual(profile.tokenizer_class, "PreTrainedTokenizerFast")
-        self.assertEqual(profile.vocabulary_size, 128256)
+        self.assertEqual(profile.model_class, "GraniteForCausalLM")
+        self.assertEqual(profile.model_type, "granite")
+        self.assertEqual(profile.tokenizer_class, "GPT2TokenizerFast")
+        self.assertEqual(profile.vocabulary_size, 49159)
         self.assertEqual(profile.training_backend, "transformers")
         self.assertEqual(profile.lora.rank, 8)
+        self.assertEqual(
+            pinned_host_profile(serving_backend="ollama").ollama.model,
+            "granite3.3:2b",
+        )
         self.assertEqual(
             profile.profile_hash(),
             pinned_host_profile(serving_backend="ollama").profile_hash(),
@@ -60,7 +67,7 @@ class AlignmentProfileContractTests(unittest.TestCase):
             POC_DTW_PROFILE_ID,
         )
 
-    def test_exact_qwen_to_llama_pair_is_accepted(self) -> None:
+    def test_exact_qwen_to_granite_pair_is_accepted(self) -> None:
         profile = validate_alignment_pair(
             POC_DTW_PROFILE_ID,
             client_profile=pinned_client_profile(QWEN_PROFILE_ID),
@@ -80,13 +87,17 @@ class AlignmentProfileContractTests(unittest.TestCase):
             AlignmentConfig(strategy="greedy_dp")
 
     def test_unapproved_client_tokenizer_fails_closed(self) -> None:
+        values = pinned_client_profile(QWEN_PROFILE_ID).model_dump(mode="json")
+        values["profile_id"] = "unapproved-client-v1"
+        unapproved = ModelProfile.model_validate(values)
+
         with self.assertRaisesRegex(
             UnsupportedAlignmentProfile,
             "Client profile_id",
         ):
             validate_alignment_pair(
                 POC_DTW_PROFILE_ID,
-                client_profile=pinned_client_profile(LLAMA_PROFILE_ID),
+                client_profile=unapproved,
                 host_profile=pinned_host_profile(),
             )
 

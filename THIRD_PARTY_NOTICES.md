@@ -14,9 +14,9 @@ License and `safetensors` under the Apache License 2.0.
 Multipart Knowledge Package transport uses `python-multipart` under the
 Apache License 2.0.
 
-## Optional Client model training
+## Optional model training
 
-The optional real Client path uses PyTorch, Transformers, PEFT, Accelerate,
+The optional real-model path uses PyTorch, Transformers, PEFT, Accelerate,
 SentencePiece and RapidFuzz. They are pinned with the other project dependencies
 in `requirements.txt`. The mock path does not import the optional model-training
 modules. Consult each dependency's distributed licence and notice files.
@@ -25,14 +25,10 @@ The supported Qwen proof-of-concept profile identifies
 [`Qwen/Qwen3-1.7B`](https://huggingface.co/Qwen/Qwen3-1.7B). Qwen3 is made available under
 the Apache License 2.0. LegalFedLLM does not bundle its weights.
 
-The optional Llama proof-of-concept profile identifies
-[`meta-llama/Llama-3.2-1B-Instruct`](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct).
-It is governed by the Llama 3.2 Community License and Acceptable Use Policy,
-not Apache 2.0. The checkpoint is gated.
-Each tester must accept Meta's terms and obtain it independently.
-LegalFedLLM does not bundle Llama weights, credentials, trained adapters or
-merged Ollama models. See Meta's
-[Llama 3.2 license and policy](https://www.llama.com/llama3_2/license/).
+The Host proof-of-concept profile identifies
+[`ibm-granite/granite-3.3-2b-instruct`](https://huggingface.co/ibm-granite/granite-3.3-2b-instruct).
+Granite 3.3 is made available under the Apache License 2.0. LegalFedLLM does not
+bundle Granite weights, trained adapters or merged Ollama models.
 
 ## Optional dataset tooling
 

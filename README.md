@@ -20,8 +20,10 @@ Steps 0 through 3 are complete at the current Client boundary. The authoritative
 Step 3 run trained a real Qwen LoRA candidate, performed teacher-forced inference
 over all 565 accepted D^P samples, produced real top-k logits and answer-only
 cross-entropy losses, created a signed schema 2.0 package and validated the
-existing Coordinator intake path. Host-side token alignment and real selective
-distillation begin in Step 4 and remain unimplemented.
+existing Coordinator intake path. Step 4.1 now pins the Qwen–Granite alignment
+contract and Step 4.2 preserves the reviewed FedMKT DTW/MinED behavior with
+golden tests. Operational vocabulary mapping, real tokenizer validation and the
+live alignment paths remain for Steps 4.3 and 4.4.
 
 The copyrighted GLD source PDF, generated datasets, private Client examples,
 downloaded model files and trained adapters remain local and are excluded from
@@ -95,6 +97,12 @@ answer text is absent from the signed package metadata and numerical artifact.
 - **Step 3.6 — real package submission:** existing artifact writer, signature and
   multipart intake reused without a parallel real-only protocol; immutable retry
   and exact training/checkpoint provenance are enforced.
+- **Step 4.1 — pinned heterogeneous pair:** exact Qwen 3 1.7B Client and Granite
+  3.3 2B Host model/tokenizer identities, revisions and bidirectional alignment
+  ownership fail closed through one signed profile.
+- **Step 4.2 — FedMKT alignment parity:** the approved DTW path, tie behavior,
+  bidirectional mappings, cumulative cost matrix and sparse logit transformation
+  are protected by fixed golden tests.
 
 ## Repository layout
 
@@ -114,8 +122,10 @@ LegalFedLLM/
 │   └── reference_data.py       Coordinator-owned D^P/D^V boundary
 ├── host/
 │   ├── main.py                 Private internal Host API
-│   └── runtime.py              Host state and mock distillation path
+│   ├── runtime.py              Host state and mock distillation path
+│   └── model_profiles.py       Exact pinned Granite Host profile
 ├── shared/
+│   ├── alignment_profiles.py   Approved Qwen–Granite alignment contract
 │   ├── protocol.py             Manifests, profiles and package schemas
 │   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
 │   ├── knowledge_transport.py  Bounded streaming multipart transport
@@ -170,10 +180,31 @@ The authoritative Step 3 profile is:
 | Precision | BF16 |
 | Quantization | none |
 
-The repository also defines `llama-3.2-1b-instruct-lora-v1` at exact revision
-`9213176726f574b556790deb65791e0c5aa438b6`, but the accepted Step 3 run used Qwen.
-An arbitrary Hugging Face or Ollama model is not automatically a supported
-training profile.
+Qwen 3 1.7B is the sole approved real Client profile. An arbitrary Hugging Face
+or Ollama model is not automatically a supported training profile.
+
+## Pinned real Host and alignment profile
+
+The approved proof-of-concept Host is:
+
+| Field | Value |
+| --- | --- |
+| Profile | `granite-3.3-2b-instruct-host-lora-v1` |
+| Model/tokenizer | `ibm-granite/granite-3.3-2b-instruct` |
+| Revision | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
+| Model class/type | `GraniteForCausalLM` / `granite` |
+| Tokenizer class | `GPT2TokenizerFast` |
+| Vocabulary | 49,159 tokens |
+| Chat mode | Standard Granite instruct template |
+| LoRA rank / alpha / dropout | 8 / 16 / 0.05 |
+| LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
+| Ollama base | `granite3.3:2b` |
+
+The signed pair is
+`dtw:qwen3-1.7b--granite3.3-2b-v1`. The public Granite checkpoint is licensed
+under Apache 2.0 and does not require gated model access. Granite 3.3 8B can be
+added later through a separate pinned Host profile, but it requires its own
+adapter and acceptance run; a 2B adapter is not compatible with the 8B base.
 
 Relevant dependency pins are:
 
@@ -476,10 +507,10 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-The authoritative Step 3 run reported:
+With the complete pinned requirements installed, the current suite reports:
 
 ```text
-Ran 133 tests
+Ran 152 tests
 OK (skipped=2)
 ```
 
@@ -490,6 +521,7 @@ Focused model-free Client tests can be run with:
 
 ```bash
 python -m unittest -v \
+  tests.test_alignment_profiles \
   tests.test_client_training \
   tests.test_client_knowledge \
   tests.test_client_real_package
@@ -712,7 +744,9 @@ Ollama remains an optional serving boundary. It is not the real training runtime
 
 ```env
 CLIENT_SERVING_BACKEND=ollama
-CLIENT_OLLAMA_MODEL=<installed model name>
+CLIENT_OLLAMA_MODEL=qwen3:1.7b
+HOST_SERVING_BACKEND=ollama
+HOST_OLLAMA_MODEL=granite3.3:2b
 OLLAMA_BASE_URL=http://host.docker.internal:11434
 ```
 
@@ -723,7 +757,8 @@ OLLAMA_BASE_URL=http://host.containers.internal:11434
 ```
 
 LegalFedLLM trains through Transformers/PEFT. Automatic export of a promoted PEFT
-adapter into an Ollama model profile is future work.
+adapter into an Ollama model profile, including the Granite adapter conversion
+and import path, is future work.
 
 ## Extracted FedMKT core
 
@@ -743,7 +778,7 @@ LegalFedLLM supplies the HTTP, security, persistence and round layers.
 
 LegalFedLLM does not yet provide:
 
-- real Client-to-Host or Host-to-Client token/vocabulary alignment;
+- operational Client-to-Host or Host-to-Client token/vocabulary alignment;
 - real Host baseline inference or selective LoRA distillation;
 - real D^V validation and Host adapter promotion/rollback;
 - real reverse Client distillation from a Host package;
@@ -761,7 +796,10 @@ added.
 
 ### Step 4 — FedMKT parity and token alignment
 
-Verify the extracted FedMKT behavior before connecting it to a live Host path:
+Steps 4.1 and 4.2 pin the Qwen–Granite pair and verify the extracted FedMKT
+alignment behavior. Steps 4.3 and 4.4 will connect that contract to real
+tokenizers, persistent vocabulary mappings and the operational sparse-target
+paths:
 
 ```text
 Client-to-Host token alignment
@@ -792,8 +830,10 @@ behavior, adapter sizes and rollback behavior.
 
 LegalFedLLM now demonstrates a real, pinned Client model that can learn a local
 LoRA adapter from private examples and turn its outputs over the complete frozen
-565-sample D^P into a signed, validated and transportable Knowledge Package.
-Private examples and Client-native LoRA tensors remain local.
+565-sample D^P into a signed, validated and transportable Knowledge Package. It
+also pins the Granite 3.3 2B Host contract and preserves the approved FedMKT
+DTW/MinED behavior with golden tests. Private examples and Client-native LoRA
+tensors remain local.
 
 It does **not** yet demonstrate real heterogeneous Host learning, reverse real
 Client learning, a completed real-model federation round, formal differential

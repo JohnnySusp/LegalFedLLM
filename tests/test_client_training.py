@@ -14,11 +14,10 @@ from pydantic import ValidationError
 
 from client.main import CoordinatorGateway, create_app as create_client_app
 from client.model_profiles import (
-    LLAMA_PROFILE_ID,
-    LLAMA_REVISION,
     QWEN_PROFILE_ID,
     QWEN_REVISION,
     pinned_client_profile,
+    supported_profile_ids,
 )
 from client.runtime import ClientRuntime, ClientRuntimeError
 from client.training import (
@@ -109,12 +108,10 @@ def manifest_for(
 
 
 class ClientModelProfileTests(unittest.TestCase):
-    def test_pinned_profiles_are_exact_and_share_the_approved_lora(self) -> None:
-        llama = pinned_client_profile(LLAMA_PROFILE_ID)
+    def test_pinned_profile_is_exact_and_uses_the_approved_lora(self) -> None:
         qwen = pinned_client_profile(QWEN_PROFILE_ID)
-        self.assertEqual(llama.model_revision, LLAMA_REVISION)
+        self.assertEqual(supported_profile_ids(), (QWEN_PROFILE_ID,))
         self.assertEqual(qwen.model_revision, QWEN_REVISION)
-        self.assertEqual(llama.model_revision, llama.tokenizer_revision)
         self.assertEqual(qwen.model_revision, qwen.tokenizer_revision)
         self.assertEqual(qwen.chat_template_mode, "qwen_non_thinking")
         self.assertEqual(
@@ -125,19 +122,18 @@ class ClientModelProfileTests(unittest.TestCase):
             ).profile_hash(),
         )
         self.assertEqual(
-            llama.prompt_template_hash,
+            qwen.prompt_template_hash,
             sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
         )
-        for profile in (llama, qwen):
-            self.assertEqual(profile.training_backend, "transformers")
-            self.assertEqual(profile.lora.rank, 8)
-            self.assertEqual(profile.lora.alpha, 16)
-            self.assertEqual(profile.lora.dropout, 0.05)
-            self.assertEqual(
-                profile.lora.target_modules,
-                ("q_proj", "k_proj", "v_proj", "o_proj"),
-            )
-            self.assertEqual(profile.lora.modules_to_save, ())
+        self.assertEqual(qwen.training_backend, "transformers")
+        self.assertEqual(qwen.lora.rank, 8)
+        self.assertEqual(qwen.lora.alpha, 16)
+        self.assertEqual(qwen.lora.dropout, 0.05)
+        self.assertEqual(
+            qwen.lora.target_modules,
+            ("q_proj", "k_proj", "v_proj", "o_proj"),
+        )
+        self.assertEqual(qwen.lora.modules_to_save, ())
 
     def test_transformers_profile_rejects_a_moving_revision(self) -> None:
         values = pinned_client_profile(QWEN_PROFILE_ID).model_dump(mode="json")
@@ -229,7 +225,7 @@ class PrivateTrainingContractTests(unittest.TestCase):
                     )
                 ],
                 tokenizer=FakeTokenizer(),
-                model_profile=pinned_client_profile(LLAMA_PROFILE_ID),
+                model_profile=pinned_client_profile(QWEN_PROFILE_ID),
                 maximum_sequence_length=5,
             )
 

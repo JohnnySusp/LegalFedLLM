@@ -12,7 +12,9 @@ LegalFedLLM changes imports from the FATE package namespace to this local packag
 uses `AutoTokenizer` instead of the FATE tokenizer factory, and makes logit extraction
 device-neutral. It also replaces the upstream `editdistance.eval` calls with
 `rapidfuzz.distance.Levenshtein.distance` so Python 3.14 installations can use a
-prebuilt wheel. The logit-generation adaptation disables the model cache, stores
+prebuilt wheel. Unused tokenizer-class entries are removed from the extracted
+special-token lookup. The logit-generation adaptation disables the model cache,
+stores
 selected logits as float32, and normalizes CE over supervised non-padding labels
 rather than every attended token. The latter preserves upstream whole-sequence CE
 when all labels are supervised and correctly supports LegalFedLLM's signed

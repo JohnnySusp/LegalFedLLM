@@ -5,7 +5,7 @@ from dataclasses import dataclass, fields
 from shared.protocol import ModelProfile
 
 
-POC_DTW_PROFILE_VERSION = "qwen3-1.7b--llama3.2-3b-v1"
+POC_DTW_PROFILE_VERSION = "qwen3-1.7b--granite3.3-2b-v1"
 POC_DTW_PROFILE_ID = f"dtw:{POC_DTW_PROFILE_VERSION}"
 
 
@@ -85,17 +85,17 @@ POC_DTW_PROFILE = BidirectionalAlignmentProfile(
     ),
     host=TokenizerEndpoint(
         role="host",
-        profile_id="llama-3.2-3b-instruct-host-lora-v1",
-        model_id="meta-llama/Llama-3.2-3B-Instruct",
-        model_revision="0cb88a4f764b7a12671c53f0838cd831a0843b95",
-        model_class="LlamaForCausalLM",
-        model_type="llama",
-        tokenizer_id="meta-llama/Llama-3.2-3B-Instruct",
-        tokenizer_revision="0cb88a4f764b7a12671c53f0838cd831a0843b95",
-        tokenizer_class="PreTrainedTokenizerFast",
-        vocabulary_size=128256,
+        profile_id="granite-3.3-2b-instruct-host-lora-v1",
+        model_id="ibm-granite/granite-3.3-2b-instruct",
+        model_revision="652c333dc5066f2a1764854a1bcd0ce67163d74f",
+        model_class="GraniteForCausalLM",
+        model_type="granite",
+        tokenizer_id="ibm-granite/granite-3.3-2b-instruct",
+        tokenizer_revision="652c333dc5066f2a1764854a1bcd0ce67163d74f",
+        tokenizer_class="GPT2TokenizerFast",
+        vocabulary_size=49159,
         tokenizer_chat_template_hash=(
-            "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+            "6bc46d1fc4c69468e21e79809662cc0a5c4a1e3e979ecb3de0dd51d4788191a0"
         ),
         chat_template_mode="standard",
     ),

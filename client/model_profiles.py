@@ -5,15 +5,10 @@ from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import LoraProfile, ModelProfile, OllamaProfile
 
 
-LLAMA_PROFILE_ID = "llama-3.2-1b-instruct-lora-v1"
 QWEN_PROFILE_ID = "qwen3-1.7b-lora-v1"
 
-LLAMA_REVISION = "9213176726f574b556790deb65791e0c5aa438b6"
 QWEN_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 
-LLAMA_CHAT_TEMPLATE_HASH = (
-    "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
-)
 QWEN_CHAT_TEMPLATE_HASH = (
     "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
 )
@@ -36,19 +31,7 @@ def pinned_client_profile(
     *,
     serving_backend: str = "mock",
 ) -> ModelProfile:
-    if profile_id == LLAMA_PROFILE_ID:
-        values = {
-            "model_id": "meta-llama/Llama-3.2-1B-Instruct",
-            "revision": LLAMA_REVISION,
-            "model_class": "LlamaForCausalLM",
-            "model_type": "llama",
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "vocabulary_size": 128256,
-            "chat_template_hash": LLAMA_CHAT_TEMPLATE_HASH,
-            "chat_template_mode": "standard",
-            "ollama_model": "llama3.2:1b",
-        }
-    elif profile_id == QWEN_PROFILE_ID:
+    if profile_id == QWEN_PROFILE_ID:
         values = {
             "model_id": "Qwen/Qwen3-1.7B",
             "revision": QWEN_REVISION,
@@ -93,4 +76,4 @@ def pinned_client_profile(
 
 
 def supported_profile_ids() -> tuple[str, ...]:
-    return LLAMA_PROFILE_ID, QWEN_PROFILE_ID
+    return (QWEN_PROFILE_ID,)

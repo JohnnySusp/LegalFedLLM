@@ -37,7 +37,7 @@ class HostRuntimeError(RuntimeError):
 
 def default_host_profile() -> ModelProfile:
     serving_backend = os.getenv("HOST_SERVING_BACKEND", "mock").strip().lower()
-    ollama_model = os.getenv("HOST_OLLAMA_MODEL", "llama3.2:3b")
+    ollama_model = os.getenv("HOST_OLLAMA_MODEL", "granite3.3:2b")
     return ModelProfile(
         profile_id=os.getenv("HOST_PROFILE_ID", "host-mock-v1"),
         role="host",

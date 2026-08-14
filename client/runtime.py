@@ -61,7 +61,7 @@ def default_client_profile() -> ModelProfile:
             serving_backend=serving_backend,
         )
 
-    ollama_model = os.getenv("CLIENT_OLLAMA_MODEL", "llama3.2:1b")
+    ollama_model = os.getenv("CLIENT_OLLAMA_MODEL", "qwen3:1.7b")
     return ModelProfile(
         profile_id=os.getenv("CLIENT_PROFILE_ID", "client-mock-v1"),
         role="client",

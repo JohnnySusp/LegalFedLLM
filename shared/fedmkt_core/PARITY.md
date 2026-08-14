@@ -25,10 +25,10 @@ The proof of concept supports exactly one real heterogeneous tokenizer pair:
 | Role | Profile | Model and tokenizer | Immutable revision |
 | --- | --- | --- | --- |
 | Client | `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
-| Host | `llama-3.2-3b-instruct-host-lora-v1` | `meta-llama/Llama-3.2-3B-Instruct` | `0cb88a4f764b7a12671c53f0838cd831a0843b95` |
+| Host | `granite-3.3-2b-instruct-host-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
 
 The signed alignment identifier is
-`dtw:qwen3-1.7b--llama3.2-3b-v1`. Client-to-Host alignment is owned by the
+`dtw:qwen3-1.7b--granite3.3-2b-v1`. Client-to-Host alignment is owned by the
 Coordinator; Host-to-Client alignment is owned by the Client flow. Both directions
 must use the same shared pure alignment component and profile identity.
 
@@ -50,5 +50,5 @@ upstream defines no meaningful result for them. `mock_identity` remains availabl
 only for the deterministic mock federation path.
 
 Real Coordinator DTW execution remains blocked while persistent vocabulary
-mapping, Qwen–Llama tokenizer validation and the operational sparse-target path
+mapping, Qwen–Granite tokenizer validation and the operational sparse-target path
 are incomplete.
