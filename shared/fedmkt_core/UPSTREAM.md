@@ -35,9 +35,18 @@ LegalFedLLM removes the unused `greedy_dp` alternative and explicitly rejects
 empty token sequences, for which upstream has no defined result.
 
 The upstream eager, plain-JSON full-vocabulary mapper remains available only as
-a parity reference. LegalFedLLM's Step 4 operational prerequisite uses the
+a parity reference. LegalFedLLM's operational vocabulary-mapping path uses the
 demand-driven mapper in `shared/vocabulary_mapping.py`: cache identities bind
 both exact tokenizer artifacts, direction, rules and demanded source-ID set;
 equal-distance candidates deterministically choose the lowest target token ID.
 The DTW transformation accepts the exact validated profile boundary markers
 directly while retaining the upstream class registry as a parity fallback.
+
+The upstream dense `DataCollatorForFedMKT` also remains available only as a
+small-fixture target-construction oracle. LegalFedLLM's operational sparse-target
+primitive stores token IDs, probabilities and validity flags at
+`[batch, sequence, top-k]`, computes CE or KL from gathered model
+log-probabilities, and applies the existing answer-only causal mask without
+creating a `[batch, sequence, vocabulary]` target tensor. Duplicate suppression,
+temperature softmax, empty-row base fallback, one-hot alignment fallback and
+padding targets preserve the pinned upstream semantics.

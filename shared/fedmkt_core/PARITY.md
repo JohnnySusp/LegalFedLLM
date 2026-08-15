@@ -18,7 +18,7 @@ from FATE-LLM commit `0c63377e468f0f62a9bdf5fb32424688b9478553`.
 These are intentional LegalFedLLM adaptations around the imported machine-learning
 core. They must not be treated as accidental drift during later upstream reviews.
 
-## Step 4.1 pinned alignment profile
+## Pinned alignment profile
 
 The proof of concept supports exactly one real heterogeneous tokenizer pair:
 
@@ -49,7 +49,7 @@ protocol option are removed. Empty token sequences raise `ValueError` because
 upstream defines no meaningful result for them. `mock_identity` remains available
 only for the deterministic mock federation path.
 
-## Steps 4.3 and 4.4 mapping/tokenizer boundary
+## Vocabulary mapping and tokenizer validation
 
 Vocabulary mapping is demand-driven in both approved directions. A cache entry
 contains only the sorted unique source token IDs requested for that identity;
@@ -72,10 +72,10 @@ The pinned runtime tokenizer facts are:
 Validation also checks the exact runtime class, dense addressable ID range,
 special-token state, model maximum length, padding side and existing chat-
 template hash. Granite intentionally uses `<|end_of_text|>` as its BOS, EOS,
-padding and unknown token at ID 0; Step 4.4 preserves that pinned state rather
-than inventing or replacing special tokens. Qwen model-output IDs 151669 through
-151935 have no tokenizer entry and are rejected explicitly if demanded rather
-than silently discarded.
+padding and unknown token at ID 0; The tokenizer-validation contract preserves that 
+pinned state rather than inventing or replacing special tokens. Qwen model-output 
+IDs 151669 through 151935 have no tokenizer entry and are rejected explicitly if 
+demanded rather than silently discarded.
 
 The inherited class-to-marker table remains only as a parity fallback. The
 approved operational interface supplies the validated profile markers directly,
@@ -85,3 +85,28 @@ profile family list.
 Real Coordinator DTW execution remains blocked while the operational sparse-
 target path and integrated execution are incomplete. Steps 4.3 and 4.4 add no
 live-round service behavior.
+
+## Sparse-target construction and loss
+
+The inherited dense target collator remains unchanged as a small-fixture parity
+oracle. Operational target construction uses fixed-width sparse tensors for
+target token IDs, probabilities and validity flags with shape
+`[batch, sequence, top-k]`; it never allocates a target tensor over the complete
+model vocabulary.
+
+Sparse construction applies the inherited temperature-scaled softmax only over
+the retained logits. Mapping collisions keep the first occurrence in incoming
+top-k order before softmax, matching the duplicate suppression in the pinned
+alignment transform. An empty aligned row uses its supplied base-model row, and
+the inherited one-token alignment fallback remains a probability-one target.
+Padding positions retain the upstream one-hot padding target so dense and sparse
+fixtures agree before the answer-only causal mask is applied.
+
+Sparse CE and KL use gathered model log-probabilities and are mathematically
+equivalent to the corresponding dense FedMKT losses. Target IDs, shapes,
+probabilities, masks, row sums and duplicate state fail explicitly when invalid.
+Dense materialization is guarded by a fixture-size limit and is not an
+operational interface.
+
+Step 4.5 does not connect DTW alignment, teacher selection or sparse loss to the
+running services. That integrated execution remains Step 4.6.
