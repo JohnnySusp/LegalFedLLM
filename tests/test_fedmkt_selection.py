@@ -72,6 +72,7 @@ class FedMKTSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual([value.sample_id for value in dataset.samples], sample_ids)
+        self.assertEqual(dataset.accepted_client_ids, ["client-b", "client-a"])
         selected = {value.sample_id: value for value in dataset.samples}
         self.assertEqual(selected["host-best"].teacher_id, "host")
         self.assertEqual(selected["host-tie"].teacher_id, "host")
@@ -101,7 +102,39 @@ class FedMKTSelectionTests(unittest.TestCase):
 
         self.assertEqual(len(dataset.samples), 1)
         self.assertEqual(dataset.samples[0].teacher_id, "host")
-        self.assertEqual(dataset.samples[0].trust_weight, 1.0)
+        self.assertEqual(dataset.samples[0].trust_score, 1.0)
+
+    def test_eligibility_requires_hard_acceptance_and_threshold_score(self) -> None:
+        host = package("host", ["sample-1"])
+        packages = [
+            package("below", ["sample-1"]),
+            package("boundary", ["sample-1"]),
+            package("hard-rejected", ["sample-1"]),
+        ]
+        dataset = dual_min_ce_select(
+            host_package=host,
+            host_samples=[sample("sample-1", 0.50, 10)],
+            client_packages=packages,
+            client_samples={
+                "below": [sample("sample-1", 0.01, 20)],
+                "boundary": [sample("sample-1", 0.10, 30)],
+                "hard-rejected": [sample("sample-1", 0.05, 40)],
+            },
+            safety_reports={
+                "below": SafetyReport(accepted=True, trust_score=0.49),
+                "boundary": SafetyReport(accepted=True, trust_score=0.50),
+                "hard-rejected": SafetyReport(
+                    accepted=False,
+                    trust_score=0.99,
+                    reasons=["hard check failed"],
+                ),
+            },
+            selected_client_ids=["below", "boundary", "hard-rejected"],
+        )
+
+        self.assertEqual(dataset.accepted_client_ids, ["boundary"])
+        self.assertEqual(dataset.samples[0].teacher_id, "boundary")
+        self.assertEqual(dataset.samples[0].trust_score, 0.5)
 
 
 if __name__ == "__main__":

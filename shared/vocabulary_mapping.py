@@ -209,30 +209,11 @@ def _build_entries(
 
     entries: list[VocabularyMappingEntry] = []
     for source_token_id in requested_token_ids:
-        if source_token_id >= source.endpoint.vocabulary_size:
-            raise UnaddressableTokenId(
-                f"source token ID {source_token_id} exceeds the model-output "
-                f"vocabulary for {source.endpoint.profile_id!r}"
-            )
-        try:
-            converted = source.tokenizer.convert_ids_to_tokens([source_token_id])
-        except Exception as exc:
-            raise UnaddressableTokenId(
-                f"source token ID {source_token_id} cannot be converted by "
-                f"{source.endpoint.profile_id!r}"
-            ) from exc
-        if (
-            not isinstance(converted, list)
-            or len(converted) != 1
-            or not isinstance(converted[0], str)
-            or source_vocab.get(converted[0]) != source_token_id
-        ):
-            raise UnaddressableTokenId(
-                f"source token ID {source_token_id} is not addressable by "
-                f"{source.endpoint.profile_id!r}"
-            )
-
-        source_token = converted[0]
+        source_token = _addressable_source_token(
+            source,
+            source_vocab,
+            source_token_id,
+        )
         normalized = source_token.replace(
             source.endpoint.word_boundary_marker,
             target.endpoint.word_boundary_marker,
@@ -263,6 +244,49 @@ def _build_entries(
             )
         )
     return tuple(entries)
+
+
+def _addressable_source_token(
+    source: ValidatedTokenizer,
+    source_vocab: dict[str, int],
+    source_token_id: int,
+) -> str:
+    if source_token_id >= source.endpoint.vocabulary_size:
+        raise UnaddressableTokenId(
+            f"source token ID {source_token_id} exceeds the model-output "
+            f"vocabulary for {source.endpoint.profile_id!r}"
+        )
+    try:
+        converted = source.tokenizer.convert_ids_to_tokens([source_token_id])
+    except Exception as exc:
+        raise UnaddressableTokenId(
+            f"source token ID {source_token_id} cannot be converted by "
+            f"{source.endpoint.profile_id!r}"
+        ) from exc
+    if (
+        not isinstance(converted, list)
+        or len(converted) != 1
+        or not isinstance(converted[0], str)
+        or source_vocab.get(converted[0]) != source_token_id
+    ):
+        raise UnaddressableTokenId(
+            f"source token ID {source_token_id} is not addressable by "
+            f"{source.endpoint.profile_id!r}"
+        )
+    return converted[0]
+
+
+def validate_addressable_token_ids(
+    source: ValidatedTokenizer,
+    requested_token_ids: Iterable[int],
+) -> tuple[int, ...]:
+    """Validate a package's demanded IDs without creating a cache entry."""
+
+    requested = _requested_token_ids(requested_token_ids)
+    source_vocab = source.tokenizer.get_vocab()
+    for source_token_id in requested:
+        _addressable_source_token(source, source_vocab, source_token_id)
+    return requested
 
 
 class VocabularyMappingCache:

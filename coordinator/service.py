@@ -16,7 +16,11 @@ from shared.alignment_profiles import (
     validate_alignment_pair,
 )
 from shared.crypto import Ed25519Identity
-from shared.fedmkt_core import dual_min_ce_select, inspect_knowledge_package
+from shared.fedmkt_core import (
+    dual_min_ce_select,
+    inspect_knowledge_package,
+    is_eligible_for_distillation,
+)
 from shared.knowledge_artifact import load_package_samples
 from shared.knowledge_transport import receive_knowledge_transfer
 from shared.protocol import (
@@ -581,11 +585,12 @@ class CoordinatorService:
                 f"rounds/{manifest.round_id}/safety/{package.sender_id}.json",
                 safety.model_dump(mode="json"),
             )
-            if not safety.accepted:
+            if not is_eligible_for_distillation(safety):
                 self._record_package_rejection(
                     state,
                     package,
-                    safety.reasons,
+                    safety.reasons
+                    or ["trust score is below the distillation threshold"],
                 )
                 raise ConflictError(
                     "Knowledge Package failed the safety probe"
@@ -622,7 +627,12 @@ class CoordinatorService:
 
             if len(state.accepted_client_ids) >= manifest.trusted_client_quorum:
                 state.state = "SEALED"
-                state.sealed_client_ids = sorted(state.accepted_client_ids)
+                accepted = set(state.accepted_client_ids)
+                state.sealed_client_ids = [
+                    client_id
+                    for client_id in manifest.selected_client_ids
+                    if client_id in accepted
+                ]
                 state.message = "trusted quorum reached; submission set sealed"
                 state.updated_at = utc_text(self.now_fn())
                 self._write_state(state)

@@ -82,9 +82,10 @@ approved operational interface supplies the validated profile markers directly,
 which supports the exact Qwen and Granite runtime classes without broadening the
 profile family list.
 
-Real Coordinator DTW execution remains blocked while the operational sparse-
-target path and integrated execution are incomplete. Steps 4.3 and 4.4 add no
-live-round service behavior.
+The reusable integration interface can now execute validated Client-to-Host DTW
+alignment. The live Coordinator HTTP route remains gated so the deterministic
+mock federation continues to use `mock_identity` until the operational deployment
+and full-dataset validation are complete.
 
 ## Sparse-target construction and loss
 
@@ -108,5 +109,29 @@ probabilities, masks, row sums and duplicate state fail explicitly when invalid.
 Dense materialization is guarded by a fixture-size limit and is not an
 operational interface.
 
-Step 4.5 does not connect DTW alignment, teacher selection or sparse loss to the
-running services. That integrated execution remains Step 4.6.
+## Integrated operational path
+
+`integration.py` connects validated packages and pinned tokenizers to one shared
+Client-to-Host execution path. It resolves one deterministic mapping over the
+sorted union of all demanded source and top-k IDs, aligns every eligible Client
+before selection, selects the first minimum-CE teacher, and emits CPU float32
+sparse targets plus answer-only labels and attention masks.
+
+Eligibility is a gate, not a weight:
+
+```text
+eligible = all hard protocol checks passed and trust_score >= 0.5
+```
+
+Changing an eligible score does not change candidate CE or target probabilities.
+A Client package with invalid demanded IDs or an alignment failure is rejected as
+a whole, the signed accepted order is recomputed, and quorum is checked again.
+Host/profile/tokenizer or persistent-cache failures abort explicitly instead of
+silently substituting Host rows. Empty rows produced by an otherwise valid
+alignment retain the approved per-position Host fallback.
+
+The integration audit hashes the exact profile and direction, mapping identity
+and payload, source package hashes, accepted and rejected Client order, teacher
+decisions, fallback count, trainer inputs, temperature and loss type. Cache-hit
+state, cache paths, elapsed time and hardware measurements are deliberately kept
+outside this deterministic audit.

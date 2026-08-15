@@ -5,6 +5,15 @@ import math
 from shared.protocol import KnowledgePackage, KnowledgeSample, SafetyReport
 
 
+MINIMUM_TRUST_SCORE = 0.5
+
+
+def is_eligible_for_distillation(report: SafetyReport) -> bool:
+    """Return the round-level trust gate without turning trust into a weight."""
+
+    return report.accepted and report.trust_score >= MINIMUM_TRUST_SCORE
+
+
 def inspect_knowledge_package(
     package: KnowledgePackage,
     samples: list[KnowledgeSample],

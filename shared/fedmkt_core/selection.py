@@ -9,6 +9,7 @@ from shared.protocol import (
     ValidatedDistillationDataset,
     ValidatedDistillationSample,
 )
+from shared.fedmkt_core.safety import is_eligible_for_distillation
 
 
 def dual_min_ce_select(
@@ -37,7 +38,7 @@ def dual_min_ce_select(
             if client_id not in packages_by_id:
                 continue
             report = safety_reports[client_id]
-            if not report.accepted or report.trust_score <= 0:
+            if not is_eligible_for_distillation(report):
                 continue
             candidates.append(
                 (
@@ -48,7 +49,7 @@ def dual_min_ce_select(
                 )
             )
 
-        teacher_loss, teacher_id, trust_weight, teacher = min(
+        teacher_loss, teacher_id, trust_score, teacher = min(
             candidates,
             key=lambda item: item[0],
         )
@@ -62,7 +63,7 @@ def dual_min_ce_select(
                 attention_length=host_sample.attention_length,
                 aligned_top_k_token_ids=teacher.top_k_token_ids,
                 aligned_top_k_logits=teacher.top_k_logits,
-                trust_weight=trust_weight,
+                trust_score=trust_score,
             )
         )
 
@@ -70,6 +71,11 @@ def dual_min_ce_select(
         round_id=host_package.round_id,
         manifest_hash=host_package.manifest_hash,
         host_adapter_version=host_package.adapter_version,
-        accepted_client_ids=sorted(package.sender_id for package in client_packages),
+        accepted_client_ids=[
+            client_id
+            for client_id in selected_client_ids
+            if client_id in packages_by_id
+            and is_eligible_for_distillation(safety_reports[client_id])
+        ],
         samples=selected,
     )

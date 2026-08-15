@@ -625,7 +625,7 @@ class ValidatedDistillationSample(ContractModel):
     attention_length: int = Field(ge=1)
     aligned_top_k_token_ids: list[list[int]]
     aligned_top_k_logits: list[list[float]]
-    trust_weight: float = Field(gt=0, le=1)
+    trust_score: float = Field(gt=0, le=1)
 
 
 class ValidatedDistillationDataset(ContractModel):
