@@ -14,16 +14,18 @@ The repository currently combines:
 2. a real canonical shared-reference-dataset boundary;
 3. a deterministic importer for the pinned 2012 Greek Law Digest thesis copy;
 4. signed schema 2.0 Knowledge Packages with exact `safetensors` artifacts; and
-5. one real Client path using a pinned Transformers model and PEFT LoRA.
+5. one real Qwen Client path using Transformers and PEFT LoRA; and
+6. an operational CPU path from heterogeneous signed Client packages through
+   exact tokenizer validation, demand-driven vocabulary mapping, DTW alignment,
+   binary trust eligibility, minimum-CE selection and sparse trainer targets.
 
-Steps 0 through 3 are complete at the current Client boundary. The authoritative
-Step 3 run trained a real Qwen LoRA candidate, performed teacher-forced inference
-over all 565 accepted D^P samples, produced real top-k logits and answer-only
-cross-entropy losses, created a signed schema 2.0 package and validated the
-existing Coordinator intake path. Step 4.1 now pins the Qwen–Granite alignment
-contract and Step 4.2 preserves the reviewed FedMKT DTW/MinED behavior with
-golden tests. Operational vocabulary mapping, real tokenizer validation and the
-live alignment paths remain for Steps 4.3 and 4.4.
+The accepted real-Client run trained a Qwen LoRA candidate, performed teacher-
+forced inference over all 565 accepted D^P samples, produced real top-k logits
+and answer-only cross-entropy losses, created a signed schema 2.0 package and
+validated the existing Coordinator intake path. The alignment layer additionally
+supports Qwen and Granite Client identities against a temporary Granite validation
+Host. The repository includes a full-D^P acceptance runner; its authoritative
+Bazzite report remains local under the ignored `artifacts/` boundary.
 
 The copyrighted GLD source PDF, generated datasets, private Client examples,
 downloaded model files and trained adapters remain local and are excluded from
@@ -65,44 +67,50 @@ protocol and service behavior, not real Host or reverse-Client learning.
 No Client LoRA tensor is sent to the Coordinator or Host. Private prompt and
 answer text is absent from the signed package metadata and numerical artifact.
 
-## Implemented milestones
+## Implemented capabilities
 
-- **Step 0 — protocol-first baseline:** signed manifests and Knowledge Packages,
+- **Protocol-first baseline:** signed manifests and Knowledge Packages,
   bounded asynchronous rounds, filesystem persistence, replay protection,
   deterministic DualMinCE selection, Host validation and rollback, Client
   synchronization and an Ollama serving boundary.
-- **Step 1A — shared dataset boundary:** canonical samples, JSONL I/O, semantic
+- **Shared dataset boundary:** canonical samples, JSONL I/O, semantic
   identity, deterministic D^P/D^V splitting, Coordinator snapshots, selected-
   Client delivery and independent Client/Host verification.
-- **Step 1B — GLD importer:** deterministic extraction from the pinned source,
+- **GLD importer:** deterministic extraction from the pinned source,
   reviewed follow-up handling, subsection disambiguation, text-hygiene checks,
   corpus auditing and reproducible D^P/D^V generation.
-- **Step 2 — scalable signed packages:** schema 2.0 JSON envelopes, schema 1.0
+- **Scalable signed packages:** schema 2.0 JSON envelopes, schema 1.0
   `safetensors` artifacts, exact descriptor binding, bounded multipart transport,
   immutable persistence, security regressions and complete mock-round use in both
   directions.
-- **Step 3.1 — pinned real Client contracts:** exact model/tokenizer revisions,
+- **Pinned real Client contracts:** exact model/tokenizer revisions,
   strict private-data schema, answer-only labels and manifest-bound training
   settings.
-- **Step 3.2 — checkpoint lifecycle:** round-specific training records,
+- **Checkpoint lifecycle:** round-specific training records,
   adapter-only checkpoints, validation, atomic promotion and restart recovery.
-- **Step 3.3 — real PEFT execution:** CUDA/BF16 Transformers training, fresh
+- **Real PEFT execution:** CUDA/BF16 Transformers training, fresh
   save/reload validation and deterministic probe-logit equivalence.
-- **Step 3.4 — training hardening:** optimizer-step and finite-loss checks,
+- **Training hardening:** optimizer-step and finite-loss checks,
   changed-LoRA verification, optional frozen-base checksum, failure cleanup and
   one process-local ML lock.
-- **Step 3.5 — real D^P knowledge generation:** exact signed sample order,
+- **Real D^P knowledge generation:** exact signed sample order,
   overlength rejection, batched no-grad inference, raw top-k extraction and
   answer-only causal CE.
-- **Step 3.6 — real package submission:** existing artifact writer, signature and
+- **Real package submission:** existing artifact writer, signature and
   multipart intake reused without a parallel real-only protocol; immutable retry
   and exact training/checkpoint provenance are enforced.
-- **Step 4.1 — pinned heterogeneous pair:** exact Qwen 3 1.7B Client and Granite
-  3.3 2B Host model/tokenizer identities, revisions and bidirectional alignment
-  ownership fail closed through one signed profile.
-- **Step 4.2 — FedMKT alignment parity:** the approved DTW path, tie behavior,
+- **FedMKT alignment parity:** the approved DTW path, tie behavior,
   bidirectional mappings, cumulative cost matrix and sparse logit transformation
   are protected by fixed golden tests.
+- **Pinned heterogeneous profiles:** exact Qwen and Granite Client identities,
+  the temporary Granite validation Host, immutable tokenizer artifacts and two
+  fail-closed Client-to-Host alignment contracts.
+- **Operational sparse distillation inputs:** persistent hashed vocabulary maps,
+  per-Client DTW alignment, trust/quorum enforcement, deterministic minimum-CE
+  selection, answer-only labels and bounded CPU float32 sparse targets.
+- **Full-corpus validation runner:** exact D^P identity enforcement, signed
+  deterministic package round-trips, mixed-client alignment, two-pass
+  determinism checks and a machine-readable local resource report.
 
 ## Repository layout
 
@@ -125,7 +133,7 @@ LegalFedLLM/
 │   ├── runtime.py              Host state and mock distillation path
 │   └── model_profiles.py       Exact pinned Granite Host profile
 ├── shared/
-│   ├── alignment_profiles.py   Approved Qwen–Granite alignment contract
+│   ├── alignment_profiles.py   Approved per-Client alignment contracts
 │   ├── protocol.py             Manifests, profiles and package schemas
 │   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
 │   ├── knowledge_transport.py  Bounded streaming multipart transport
@@ -151,7 +159,8 @@ LegalFedLLM/
 │   └── ...                     Dataset, package, transport and round tests
 ├── scripts/
 │   ├── demo_round.py           Containerized mock-round driver
-│   └── measure_knowledge_packages.py
+│   ├── measure_knowledge_packages.py
+│   └── validate_fedmkt_alignment.py  Full-D^P alignment acceptance runner
 ├── .env.example
 ├── compose.yaml
 ├── requirements.txt
@@ -162,9 +171,9 @@ All Python dependencies are consolidated in `requirements.txt`. Heavy ML imports
 remain lazy where practical so the ordinary test suite does not load a model or
 require a GPU.
 
-## Pinned real Client profile
+## Pinned Client profiles
 
-The authoritative Step 3 profile is:
+The real training and package-generation acceptance profile is:
 
 | Field | Value |
 | --- | --- |
@@ -180,12 +189,28 @@ The authoritative Step 3 profile is:
 | Precision | BF16 |
 | Quantization | none |
 
-Qwen 3 1.7B is the sole approved real Client profile. An arbitrary Hugging Face
-or Ollama model is not automatically a supported training profile.
+Granite 3.3 2B is also pinned as a Client identity for heterogeneous alignment
+validation:
 
-## Pinned real Host and alignment profile
+| Field | Value |
+| --- | --- |
+| Profile | `granite-3.3-2b-instruct-client-lora-v1` |
+| Model/tokenizer | `ibm-granite/granite-3.3-2b-instruct` |
+| Revision | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
+| Model class/type | `GraniteForCausalLM` / `granite` |
+| Tokenizer class | `GPT2TokenizerFast` |
+| Vocabulary | 49,159 tokens |
+| Chat mode | Standard Granite instruct template |
+| Ollama base | `granite3.3:2b` |
 
-The approved proof-of-concept Host is:
+The Granite Client profile is approved for the deterministic alignment runner;
+it has not yet completed a real private-data LoRA training and package-generation
+acceptance run. An arbitrary Hugging Face or Ollama model is not automatically a
+supported training or alignment profile.
+
+## Temporary validation Host and alignment profiles
+
+The temporary alignment-validation Host is:
 
 | Field | Value |
 | --- | --- |
@@ -200,11 +225,18 @@ The approved proof-of-concept Host is:
 | LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
 | Ollama base | `granite3.3:2b` |
 
-The signed pair is
-`dtw:qwen3-1.7b--granite3.3-2b-v1`. The public Granite checkpoint is licensed
-under Apache 2.0 and does not require gated model access. Granite 3.3 8B can be
-added later through a separate pinned Host profile, but it requires its own
-adapter and acceptance run; a 2B adapter is not compatible with the 8B base.
+The approved signed pairs are:
+
+| Client | Alignment identity | Purpose |
+| --- | --- | --- |
+| Qwen 3 1.7B | `dtw:qwen3-1.7b--granite3.3-2b-v1` | Heterogeneous Qwen-to-Granite mapping and DTW |
+| Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` | Separate Client/Host identities over the same tokenizer |
+
+The public Granite checkpoint is licensed under Apache 2.0 and does not require
+gated model access. Its Host role is provisional and validates the transfer
+mechanism; it is not a production Host selection. Choosing another Host requires
+new signed Qwen-to-Host and Granite-to-Host profiles and another full acceptance
+run. An adapter for one base model or size is not compatible with another.
 
 Relevant dependency pins are:
 
@@ -429,7 +461,7 @@ rounds/<round-id>/submissions/<client-id>/package.json
 rounds/<round-id>/submissions/<client-id>/knowledge.safetensors
 ```
 
-### Step 2 representation measurement
+### Knowledge-package representation measurement
 
 The retained measurement utility compares schema 2.0 metadata plus the exact
 artifact with the former embedded-JSON representation:
@@ -454,7 +486,7 @@ accepted 565-sample D^P. The accepted deterministic mock run used top-k 20:
 These are representation measurements of deterministic mock knowledge, not
 model-quality, training-time, memory or privacy results.
 
-## Step 3 authoritative acceptance
+## Real Qwen Client authoritative acceptance
 
 The accepted environment reported:
 
@@ -491,7 +523,7 @@ artifact and checkpoint hashes were produced and validated for each isolated run
 but they are run-specific rather than frozen protocol constants.
 
 Peak RAM, peak VRAM and wall-clock timings were not recorded as stable thesis
-measurements in Step 3 and are not claimed here. Comparative resource and timing
+measurements for that run and are not claimed here. Comparative model execution
 measurement belongs to the later complete heterogeneous-round experiment.
 
 ## Test and verification commands
@@ -507,15 +539,16 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-With the complete pinned requirements installed, the current suite reports:
+With the complete pinned requirements installed, the current suite contains:
 
 ```text
-Ran 152 tests
-OK (skipped=2)
+Ran 184 tests
+OK (skipped=3)
 ```
 
-The two skips are the opt-in real-model acceptance tests. The ordinary suite
-does not download or load a language model.
+The three skips are the two opt-in real-model acceptance tests and the opt-in
+live-tokenizer acceptance. The ordinary suite does not download or load a
+language model.
 
 Focused model-free Client tests can be run with:
 
@@ -524,7 +557,9 @@ python -m unittest -v \
   tests.test_alignment_profiles \
   tests.test_client_training \
   tests.test_client_knowledge \
-  tests.test_client_real_package
+  tests.test_client_real_package \
+  tests.test_fedmkt_integration \
+  tests.test_fedmkt_validation
 ```
 
 ### Build and health-check the services
@@ -596,6 +631,70 @@ docker compose -p legalfedllm run --rm --no-deps -T \
 
 The test refuses the wrong dataset identity/order, rejects overlength input before
 expensive inference and validates the generated signed package and artifact.
+
+### Full-D^P heterogeneous alignment acceptance
+
+The acceptance runner uses the frozen D^P, the exact pinned Qwen and Granite
+tokenizer artifacts and three independently signed deterministic packages:
+
+| Participant | Model role | Trust |
+| --- | --- | ---: |
+| Temporary `host` | Granite 3.3 2B validation Host | not applicable |
+| `client-b` | Qwen 3 1.7B Client | 0.5 |
+| `client-a` | Granite 3.3 2B Client | 1.0 |
+
+The signed Client order is `client-b`, then `client-a`, and quorum is `2`.
+Eligibility requires all hard protocol checks and `trust_score >= 0.5`. Trust is
+not a teacher-selection weight. The deterministic loss schedule produces 283
+Host selections, 141 `client-b` selections and 141 `client-a` selections across
+565 samples; Host ties and signed-order Client ties are therefore exercised.
+
+Run from a fully installed local environment:
+
+```bash
+python scripts/validate_fedmkt_alignment.py \
+  --reference data/derived/gld2012/reference.jsonl \
+  --output artifacts/fedmkt-alignment-validation.json \
+  --mapping-cache artifacts/fedmkt-alignment-cache \
+  --identity-dir artifacts/fedmkt-validation-identities \
+  --maximum-sequence-length 4096 \
+  --top-k 4
+```
+
+For the authoritative Docker environment, use the LegalFedLLM Client image and
+its persistent Hugging Face cache:
+
+```bash
+mkdir -p artifacts
+docker compose -p legalfedllm build client
+docker compose -p legalfedllm run --rm --no-deps -T \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  client python scripts/validate_fedmkt_alignment.py \
+    --reference data/derived/gld2012/reference.jsonl \
+    --output artifacts/fedmkt-alignment-validation.json \
+    --mapping-cache artifacts/fedmkt-alignment-cache \
+    --identity-dir artifacts/fedmkt-validation-identities \
+    --hf-cache /models/huggingface \
+    --maximum-sequence-length 4096 \
+    --top-k 4
+```
+
+The complete JSON report and validation-only keys remain under ignored
+`artifacts/`. It records exact model/tokenizer and software revisions, package
+and mapping identities, artifact and cache sizes, selection and fallback counts,
+per-tokenizer observed token counts, two-pass hashes, wall time and peak process
+RAM. The no-truncation ceiling is 4096 because the frozen D^P includes a Granite
+encoding longer than 2048 tokens. The runner still pads only to the observed
+batch maximum; 4096 is a rejection bound, not an allocated tensor width.
+The runner uses top-k 4, matching the accepted full-D^P Qwen package, and
+retains all non-padding positions so each complete logical package remains
+within the existing 25 MiB transport bound. This validation setting does not
+change the protocol's configurable top-k field.
+Mapping, DTW and sparse-target construction run on CPU. VRAM is recorded as not
+applicable because the runner does not load model weights, perform a forward
+pass or allocate CUDA tensors. Ollama and AnythingLLM are not part of this
+acceptance path.
 
 ## Offline GLD dataset tooling
 
@@ -778,7 +877,7 @@ LegalFedLLM supplies the HTTP, security, persistence and round layers.
 
 LegalFedLLM does not yet provide:
 
-- operational Client-to-Host or Host-to-Client token/vocabulary alignment;
+- real-alignment execution through the live Coordinator/Host HTTP round;
 - real Host baseline inference or selective LoRA distillation;
 - real D^V validation and Host adapter promotion/rollback;
 - real reverse Client distillation from a Host package;
@@ -794,33 +893,17 @@ added.
 
 ## Next implementation milestones
 
-### Step 4 — FedMKT parity and token alignment
-
-Steps 4.1 and 4.2 pin the Qwen–Granite pair and verify the extracted FedMKT
-alignment behavior. Steps 4.3 and 4.4 will connect that contract to real
-tokenizers, persistent vocabulary mappings and the operational sparse-target
-paths:
-
-```text
-Client-to-Host token alignment
-Host-to-Client token alignment
-vocabulary mapping
-DataCollatorForFedMKT behavior
-FedMKTTrainer behavior
-DualMinCE parity
-```
-
-### Step 5 — real Host distillation
+### Real Host distillation
 
 Add real Host baseline inference, aligned selective knowledge distillation, D^V
 validation and adapter promotion or rollback.
 
-### Step 6 — real reverse Client distillation
+### Real reverse Client distillation
 
 Verify and align Host knowledge, select samples where the Host teacher is better
 and distil them into a Client-specific LoRA.
 
-### Step 7 — complete heterogeneous-model round
+### Complete heterogeneous-model round
 
 Run multiple real Clients against a heterogeneous Host and measure wall time,
 peak VRAM/RAM, communication volume, selected teaching samples, validation
@@ -828,12 +911,15 @@ behavior, adapter sizes and rollback behavior.
 
 ## Accurate project claim
 
-LegalFedLLM now demonstrates a real, pinned Client model that can learn a local
+LegalFedLLM now demonstrates a real, pinned Qwen Client that can learn a local
 LoRA adapter from private examples and turn its outputs over the complete frozen
-565-sample D^P into a signed, validated and transportable Knowledge Package. It
-also pins the Granite 3.3 2B Host contract and preserves the approved FedMKT
-DTW/MinED behavior with golden tests. Private examples and Client-native LoRA
-tensors remain local.
+565-sample D^P into a signed, validated and transportable Knowledge Package. Its
+shared integration core accepts independently signed Qwen and Granite Client
+packages, applies exact per-Client tokenizer mappings and DTW alignment against a
+temporary Granite validation Host, enforces binary trust eligibility and quorum,
+selects one minimum-CE teacher per sample and constructs bounded answer-only
+sparse trainer targets. Private examples and Client-native LoRA tensors remain
+local.
 
 It does **not** yet demonstrate real heterogeneous Host learning, reverse real
 Client learning, a completed real-model federation round, formal differential
