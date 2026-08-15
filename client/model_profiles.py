@@ -6,11 +6,18 @@ from shared.protocol import LoraProfile, ModelProfile, OllamaProfile
 
 
 QWEN_PROFILE_ID = "qwen3-1.7b-lora-v1"
+GRANITE_3_3_2B_CLIENT_PROFILE_ID = (
+    "granite-3.3-2b-instruct-client-lora-v1"
+)
 
 QWEN_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
 
 QWEN_CHAT_TEMPLATE_HASH = (
     "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+)
+GRANITE_3_3_2B_REVISION = "652c333dc5066f2a1764854a1bcd0ce67163d74f"
+GRANITE_3_3_2B_CHAT_TEMPLATE_HASH = (
+    "6bc46d1fc4c69468e21e79809662cc0a5c4a1e3e979ecb3de0dd51d4788191a0"
 )
 
 
@@ -42,6 +49,18 @@ def pinned_client_profile(
             "chat_template_hash": QWEN_CHAT_TEMPLATE_HASH,
             "chat_template_mode": "qwen_non_thinking",
             "ollama_model": "qwen3:1.7b",
+        }
+    elif profile_id == GRANITE_3_3_2B_CLIENT_PROFILE_ID:
+        values = {
+            "model_id": "ibm-granite/granite-3.3-2b-instruct",
+            "revision": GRANITE_3_3_2B_REVISION,
+            "model_class": "GraniteForCausalLM",
+            "model_type": "granite",
+            "tokenizer_class": "GPT2TokenizerFast",
+            "vocabulary_size": 49159,
+            "chat_template_hash": GRANITE_3_3_2B_CHAT_TEMPLATE_HASH,
+            "chat_template_mode": "standard",
+            "ollama_model": "granite3.3:2b",
         }
     else:
         raise ValueError(f"unknown pinned Client profile: {profile_id!r}")
@@ -76,4 +95,4 @@ def pinned_client_profile(
 
 
 def supported_profile_ids() -> tuple[str, ...]:
-    return (QWEN_PROFILE_ID,)
+    return (QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID)

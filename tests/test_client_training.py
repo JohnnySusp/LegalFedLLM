@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from client.main import CoordinatorGateway, create_app as create_client_app
 from client.model_profiles import (
+    GRANITE_3_3_2B_CLIENT_PROFILE_ID,
     QWEN_PROFILE_ID,
     QWEN_REVISION,
     pinned_client_profile,
@@ -110,7 +111,10 @@ def manifest_for(
 class ClientModelProfileTests(unittest.TestCase):
     def test_pinned_profile_is_exact_and_uses_the_approved_lora(self) -> None:
         qwen = pinned_client_profile(QWEN_PROFILE_ID)
-        self.assertEqual(supported_profile_ids(), (QWEN_PROFILE_ID,))
+        self.assertEqual(
+            supported_profile_ids(),
+            (QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID),
+        )
         self.assertEqual(qwen.model_revision, QWEN_REVISION)
         self.assertEqual(qwen.model_revision, qwen.tokenizer_revision)
         self.assertEqual(qwen.chat_template_mode, "qwen_non_thinking")

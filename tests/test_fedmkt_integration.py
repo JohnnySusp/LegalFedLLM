@@ -191,6 +191,24 @@ class FedMKTIntegrationTests(unittest.TestCase):
             client_to_host_owner="coordinator",
             host_to_client_owner="client",
         )
+        self.granite_client_endpoint = endpoint(
+            role="client",
+            profile_id="granite-client-test",
+            marker="▁",
+            artifact_hash="3" * 64,
+            vocabulary_size=8,
+            tokenizer_vocabulary_size=8,
+            pad_token_id=0,
+        )
+        self.granite_profile = BidirectionalAlignmentProfile(
+            profile_id="dtw:granite-test-v1",
+            strategy="dtw",
+            profile_version="granite-test-v1",
+            client=self.granite_client_endpoint,
+            host=self.host_endpoint,
+            client_to_host_owner="coordinator",
+            host_to_client_owner="client",
+        )
         self.host_tokenizer = ValidatedTokenizer(
             endpoint=self.host_endpoint,
             tokenizer=FakeTokenizer(
@@ -223,6 +241,24 @@ class FedMKTIntegrationTests(unittest.TestCase):
                 }
             ),
             artifact_sha256=self.client_endpoint.tokenizer_artifact_sha256,
+        )
+        self.granite_client_tokenizer = ValidatedTokenizer(
+            endpoint=self.granite_client_endpoint,
+            tokenizer=FakeTokenizer(
+                {
+                    "<pad>": 0,
+                    "▁a": 1,
+                    "▁b": 2,
+                    "▁c": 3,
+                    "▁d": 4,
+                    "▁x": 5,
+                    "▁y": 6,
+                    "▁z": 7,
+                }
+            ),
+            artifact_sha256=(
+                self.granite_client_endpoint.tokenizer_artifact_sha256
+            ),
         )
         self.sample_ids = [
             "host-best",
@@ -386,6 +422,71 @@ class FedMKTIntegrationTests(unittest.TestCase):
             torch.tensor(math.log(self.host_endpoint.vocabulary_size)),
         )
 
+    def test_mixed_client_profiles_use_independent_signed_mappings(self) -> None:
+        mixed_packages = [
+            package(
+                value.sender_id,
+                "client",
+                self.granite_client_endpoint,
+                self.sample_ids,
+                self.granite_profile.profile_id,
+            )
+            if value.sender_id == "client-a"
+            else value
+            for value in self.client_packages
+        ]
+        mixed_samples = dict(self.client_samples)
+        mixed_samples["client-a"] = [
+            sample(
+                sample_id,
+                ce_loss,
+                source_ids=[1, 2, 3],
+                top_k_ids=[[1, 4], [2, 4], [3, 4]],
+                logit_offset=index / 10,
+            )
+            for index, (sample_id, ce_loss) in enumerate(
+                zip(
+                    self.sample_ids,
+                    [0.40, 0.35, 0.25, 0.10],
+                )
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.integrate(
+                directory,
+                profile=None,
+                client_tokenizer=None,
+                alignment_profiles={
+                    self.profile.profile_id: self.profile,
+                    self.granite_profile.profile_id: self.granite_profile,
+                },
+                client_tokenizers={
+                    self.profile.profile_id: self.client_tokenizer,
+                    self.granite_profile.profile_id: (
+                        self.granite_client_tokenizer
+                    ),
+                },
+                client_packages=mixed_packages,
+                client_samples=mixed_samples,
+            )
+
+        self.assertEqual(result.dataset.accepted_client_ids, ["client-b", "client-a"])
+        self.assertEqual(
+            [sample.teacher_id for sample in result.dataset.samples],
+            ["host", "host", "client-b", "client-a"],
+        )
+        self.assertEqual(
+            [value.alignment_profile_id for value in result.audit.alignments],
+            [self.profile.profile_id, self.granite_profile.profile_id],
+        )
+        self.assertEqual(
+            [value.client_ids for value in result.audit.alignments],
+            [["client-b"], ["client-a"]],
+        )
+        self.assertEqual(result.dataset.samples[2].trust_score, 0.5)
+        self.assertEqual(result.dataset.samples[3].trust_score, 1.0)
+
     def test_empty_aligned_rows_use_host_fallback_and_are_audited(self) -> None:
         import torch
 
@@ -448,7 +549,7 @@ class FedMKTIntegrationTests(unittest.TestCase):
                 },
             )
             self.assertEqual(
-                result.audit.mapping_identity_sha256,
+                result.audit.alignments[0].mapping_identity_sha256,
                 expected_mapping.mapping.identity_sha256,
             )
             self.assertEqual(result.dataset.accepted_client_ids, ["client-b"])

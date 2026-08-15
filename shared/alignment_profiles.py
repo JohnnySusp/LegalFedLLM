@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from shared.protocol import ModelProfile
 
 
 POC_DTW_PROFILE_VERSION = "qwen3-1.7b--granite3.3-2b-v1"
 POC_DTW_PROFILE_ID = f"dtw:{POC_DTW_PROFILE_VERSION}"
+GRANITE_IDENTITY_DTW_PROFILE_VERSION = (
+    "granite3.3-2b-client--granite3.3-2b-host-v1"
+)
+GRANITE_IDENTITY_DTW_PROFILE_ID = (
+    f"dtw:{GRANITE_IDENTITY_DTW_PROFILE_VERSION}"
+)
+GRANITE_3_3_2B_CLIENT_PROFILE_ID = (
+    "granite-3.3-2b-instruct-client-lora-v1"
+)
 
 
 class UnsupportedAlignmentProfile(ValueError):
@@ -154,17 +163,39 @@ POC_DTW_PROFILE = BidirectionalAlignmentProfile(
 )
 
 
+GRANITE_IDENTITY_DTW_PROFILE = BidirectionalAlignmentProfile(
+    profile_id=GRANITE_IDENTITY_DTW_PROFILE_ID,
+    strategy="dtw",
+    profile_version=GRANITE_IDENTITY_DTW_PROFILE_VERSION,
+    client=replace(
+        POC_DTW_PROFILE.host,
+        role="client",
+        profile_id=GRANITE_3_3_2B_CLIENT_PROFILE_ID,
+    ),
+    host=POC_DTW_PROFILE.host,
+    client_to_host_owner="coordinator",
+    host_to_client_owner="client",
+)
+
+
+_SUPPORTED_PROFILES = {
+    POC_DTW_PROFILE_ID: POC_DTW_PROFILE,
+    GRANITE_IDENTITY_DTW_PROFILE_ID: GRANITE_IDENTITY_DTW_PROFILE,
+}
+
+
 def supported_alignment_profile_ids() -> tuple[str, ...]:
-    return (POC_DTW_PROFILE_ID,)
+    return tuple(_SUPPORTED_PROFILES)
 
 
 def resolve_alignment_profile(profile_id: str) -> BidirectionalAlignmentProfile:
-    if profile_id != POC_DTW_PROFILE_ID:
+    try:
+        return _SUPPORTED_PROFILES[profile_id]
+    except KeyError:
         supported = ", ".join(supported_alignment_profile_ids())
         raise UnsupportedAlignmentProfile(
             f"unsupported alignment profile {profile_id!r}; supported: {supported}"
-        )
-    return POC_DTW_PROFILE
+        ) from None
 
 
 def validate_alignment_pair(

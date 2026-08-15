@@ -5,8 +5,10 @@ import unittest
 from pydantic import ValidationError
 
 from client.model_profiles import (
+    GRANITE_3_3_2B_CLIENT_PROFILE_ID,
     QWEN_PROFILE_ID,
     pinned_client_profile,
+    supported_profile_ids,
 )
 from host.model_profiles import (
     GRANITE_3_3_2B_HOST_PROFILE_ID,
@@ -14,6 +16,8 @@ from host.model_profiles import (
     pinned_host_profile,
 )
 from shared.alignment_profiles import (
+    GRANITE_IDENTITY_DTW_PROFILE_ID,
+    GRANITE_IDENTITY_DTW_PROFILE_VERSION,
     POC_DTW_PROFILE_ID,
     POC_DTW_PROFILE_VERSION,
     UnsupportedAlignmentProfile,
@@ -52,8 +56,11 @@ class HostModelProfileTests(unittest.TestCase):
 
 
 class AlignmentProfileContractTests(unittest.TestCase):
-    def test_only_the_approved_poc_profile_is_advertised(self) -> None:
-        self.assertEqual(supported_alignment_profile_ids(), (POC_DTW_PROFILE_ID,))
+    def test_approved_poc_profiles_are_advertised(self) -> None:
+        self.assertEqual(
+            supported_alignment_profile_ids(),
+            (POC_DTW_PROFILE_ID, GRANITE_IDENTITY_DTW_PROFILE_ID),
+        )
         profile = resolve_alignment_profile(POC_DTW_PROFILE_ID)
         self.assertEqual(profile.strategy, "dtw")
         self.assertEqual(profile.profile_version, POC_DTW_PROFILE_VERSION)
@@ -71,6 +78,29 @@ class AlignmentProfileContractTests(unittest.TestCase):
         self.assertEqual(profile.client.tokenizer_vocabulary_size, 151669)
         self.assertEqual(profile.host.tokenizer_vocabulary_size, 49159)
 
+        granite = resolve_alignment_profile(GRANITE_IDENTITY_DTW_PROFILE_ID)
+        self.assertEqual(
+            granite.profile_version,
+            GRANITE_IDENTITY_DTW_PROFILE_VERSION,
+        )
+        self.assertEqual(granite.client.role, "client")
+        self.assertEqual(granite.host.role, "host")
+        self.assertEqual(granite.client.model_id, granite.host.model_id)
+        self.assertEqual(
+            granite.client.tokenizer_artifact_sha256,
+            granite.host.tokenizer_artifact_sha256,
+        )
+
+    def test_qwen_and_granite_are_approved_client_profiles(self) -> None:
+        self.assertEqual(
+            supported_profile_ids(),
+            (QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID),
+        )
+        granite = pinned_client_profile(GRANITE_3_3_2B_CLIENT_PROFILE_ID)
+        self.assertEqual(granite.role, "client")
+        self.assertEqual(granite.model_id, pinned_host_profile().model_id)
+        self.assertNotEqual(granite.profile_id, pinned_host_profile().profile_id)
+
     def test_exact_qwen_to_granite_pair_is_accepted(self) -> None:
         profile = validate_alignment_pair(
             POC_DTW_PROFILE_ID,
@@ -78,6 +108,16 @@ class AlignmentProfileContractTests(unittest.TestCase):
             host_profile=pinned_host_profile(),
         )
         self.assertEqual(profile.profile_id, POC_DTW_PROFILE_ID)
+
+    def test_exact_granite_client_to_granite_host_pair_is_accepted(self) -> None:
+        profile = validate_alignment_pair(
+            GRANITE_IDENTITY_DTW_PROFILE_ID,
+            client_profile=pinned_client_profile(
+                GRANITE_3_3_2B_CLIENT_PROFILE_ID
+            ),
+            host_profile=pinned_host_profile(),
+        )
+        self.assertEqual(profile.profile_id, GRANITE_IDENTITY_DTW_PROFILE_ID)
 
     def test_unknown_profile_fails_closed(self) -> None:
         with self.assertRaisesRegex(

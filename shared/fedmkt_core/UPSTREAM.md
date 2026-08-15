@@ -55,7 +55,8 @@ The operational integration layer aligns all eligible Client candidates before
 the inherited minimum-CE selection rule is applied. LegalFedLLM treats
 `accepted and trust_score >= 0.5` as a binary eligibility gate: the score is
 audited but never multiplies the selected distribution or loss. It builds one
-demand-driven mapping for the signed accepted set, rejects a Client package as a
-unit on Client-originated mapping or alignment failure, rechecks quorum, and
-aborts on Host/profile/tokenizer/cache failures. These protocol and failure-policy
-adaptations are outside the extracted FedMKT implementation.
+demand-driven mapping for each signed Client alignment profile, requires all
+profiles in a batch to terminate at one exact Host endpoint, rejects a Client
+package as a unit on Client-originated mapping or alignment failure, rechecks
+quorum, and aborts on Host/profile/tokenizer/cache failures. These protocol and
+failure-policy adaptations are outside the extracted FedMKT implementation.

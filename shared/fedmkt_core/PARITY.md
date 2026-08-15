@@ -18,19 +18,25 @@ from FATE-LLM commit `0c63377e468f0f62a9bdf5fb32424688b9478553`.
 These are intentional LegalFedLLM adaptations around the imported machine-learning
 core. They must not be treated as accidental drift during later upstream reviews.
 
-## Pinned alignment profile
+## Pinned alignment profiles
 
-The proof of concept supports exactly one real heterogeneous tokenizer pair:
+The proof of concept supports two exact Client-to-validation-Host pairs:
 
-| Role | Profile | Model and tokenizer | Immutable revision |
-| --- | --- | --- | --- |
-| Client | `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
-| Host | `granite-3.3-2b-instruct-host-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
+| Client | Validation Host | Alignment identifier |
+| --- | --- | --- |
+| Qwen 3 1.7B | Granite 3.3 2B | `dtw:qwen3-1.7b--granite3.3-2b-v1` |
+| Granite 3.3 2B | Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` |
 
-The signed alignment identifier is
-`dtw:qwen3-1.7b--granite3.3-2b-v1`. Client-to-Host alignment is owned by the
-Coordinator; Host-to-Client alignment is owned by the Client flow. Both directions
-must use the same shared pure alignment component and profile identity.
+The Qwen pair exercises heterogeneous DTW mapping. The Granite pair uses separate
+Client and Host protocol identities over the same pinned tokenizer and therefore
+produces an exact vocabulary mapping while traversing the same DTW path. Granite
+is a temporary validation Host, not the selected production Host. A future Host
+requires new signed Qwen-to-Host and Granite-to-Host profiles and a new acceptance
+run.
+
+Client-to-Host alignment is owned by the Coordinator; Host-to-Client alignment is
+owned by the Client flow. Both directions use the same shared pure alignment
+component and exact profile identities.
 
 Unknown alignment identifiers, moving revisions, tokenizer substitutions and
 role-reversed or otherwise mismatched pairs fail closed. LegalFedLLM deliberately
@@ -67,7 +73,7 @@ The pinned runtime tokenizer facts are:
 | Role | `tokenizer.json` SHA-256 | Base / addressable vocabulary | Highest addressable ID | Boundary marker |
 | --- | --- | --- | --- | --- |
 | Qwen Client | `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4` | 151643 / 151669 | 151668 | `Ġ` |
-| Granite Host | `91168e938f05796aa6dcca7e485e4b30ab52785320c7a6391ecef86e6c84681e` | 49152 / 49159 | 49158 | `Ġ` |
+| Granite Client / validation Host | `91168e938f05796aa6dcca7e485e4b30ab52785320c7a6391ecef86e6c84681e` | 49152 / 49159 | 49158 | `Ġ` |
 
 Validation also checks the exact runtime class, dense addressable ID range,
 special-token state, model maximum length, padding side and existing chat-
@@ -112,10 +118,13 @@ operational interface.
 ## Integrated operational path
 
 `integration.py` connects validated packages and pinned tokenizers to one shared
-Client-to-Host execution path. It resolves one deterministic mapping over the
-sorted union of all demanded source and top-k IDs, aligns every eligible Client
+Client-to-Host execution path. Each Client package selects its signed approved
+profile. The integration resolves one deterministic mapping per profile over the
+sorted union of that profile's demanded source and top-k IDs, requires every
+profile to terminate at the same Host endpoint, aligns every eligible Client
 before selection, selects the first minimum-CE teacher, and emits CPU float32
-sparse targets plus answer-only labels and attention masks.
+sparse targets plus answer-only labels and attention masks. The original
+single-profile call remains supported as a compatibility form.
 
 Eligibility is a gate, not a weight:
 
@@ -130,8 +139,8 @@ Host/profile/tokenizer or persistent-cache failures abort explicitly instead of
 silently substituting Host rows. Empty rows produced by an otherwise valid
 alignment retain the approved per-position Host fallback.
 
-The integration audit hashes the exact profile and direction, mapping identity
-and payload, source package hashes, accepted and rejected Client order, teacher
-decisions, fallback count, trainer inputs, temperature and loss type. Cache-hit
-state, cache paths, elapsed time and hardware measurements are deliberately kept
-outside this deterministic audit.
+The integration audit hashes the ordered per-profile directions, Client groups,
+mapping identities and payloads, source package hashes, accepted and rejected
+Client order, teacher decisions, fallback count, trainer inputs, temperature and
+loss type. Cache-hit state, cache paths, elapsed time and hardware measurements
+are deliberately kept outside this deterministic audit.

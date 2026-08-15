@@ -39,7 +39,7 @@ from shared.vocabulary_mapping import (
 )
 
 
-INTEGRATION_AUDIT_SCHEMA_VERSION = "1.0"
+INTEGRATION_AUDIT_SCHEMA_VERSION = "2.0"
 CLIENT_TO_HOST_DIRECTION = "client_to_host"
 
 
@@ -61,6 +61,14 @@ class SourcePackageAudit(ContractModel):
     package_hash: str = Field(pattern=HASH_PATTERN)
 
 
+class AlignmentMappingAudit(ContractModel):
+    alignment_profile_id: str = Field(min_length=1, max_length=256)
+    alignment_direction: Literal["client_to_host"] = CLIENT_TO_HOST_DIRECTION
+    client_ids: list[str] = Field(min_length=1)
+    mapping_identity_sha256: str = Field(pattern=HASH_PATTERN)
+    mapping_payload_sha256: str = Field(pattern=HASH_PATTERN)
+
+
 class SampleTeacherAudit(ContractModel):
     sample_id: str = Field(min_length=1, max_length=256)
     teacher_id: str = Field(min_length=1, max_length=128)
@@ -72,13 +80,10 @@ class SampleTeacherAudit(ContractModel):
 
 
 class DistillationIntegrationAudit(ContractModel):
-    schema_version: Literal["1.0"] = INTEGRATION_AUDIT_SCHEMA_VERSION
+    schema_version: Literal["2.0"] = INTEGRATION_AUDIT_SCHEMA_VERSION
     round_id: str = Field(min_length=1, max_length=128)
     dataset_hash: str = Field(pattern=HASH_PATTERN)
-    alignment_profile_id: str = Field(min_length=1, max_length=256)
-    alignment_direction: Literal["client_to_host"] = CLIENT_TO_HOST_DIRECTION
-    mapping_identity_sha256: str = Field(pattern=HASH_PATTERN)
-    mapping_payload_sha256: str = Field(pattern=HASH_PATTERN)
+    alignments: list[AlignmentMappingAudit] = Field(min_length=1)
     accepted_client_ids: list[str]
     rejected_clients: list[RejectedClientAudit]
     source_packages: list[SourcePackageAudit] = Field(min_length=1)
@@ -133,6 +138,68 @@ class PreparedDistillationBatch:
 Aligner = Callable[..., tuple[list[list[float]], list[list[int]]]]
 
 
+def _alignment_contracts(
+    *,
+    profile: BidirectionalAlignmentProfile | None,
+    client_tokenizer: ValidatedTokenizer | None,
+    alignment_profiles: Mapping[str, BidirectionalAlignmentProfile] | None,
+    client_tokenizers: Mapping[str, ValidatedTokenizer] | None,
+) -> tuple[
+    dict[str, BidirectionalAlignmentProfile],
+    dict[str, ValidatedTokenizer],
+]:
+    legacy_values = profile is not None or client_tokenizer is not None
+    heterogeneous_values = (
+        alignment_profiles is not None or client_tokenizers is not None
+    )
+    if legacy_values and heterogeneous_values:
+        raise DistillationIntegrationError(
+            "provide either one legacy alignment profile/tokenizer pair or "
+            "the per-profile mappings, not both"
+        )
+    if legacy_values:
+        if profile is None or client_tokenizer is None:
+            raise DistillationIntegrationError(
+                "the alignment profile and Client tokenizer must be provided "
+                "together"
+            )
+        profiles = {profile.profile_id: profile}
+        tokenizers = {profile.profile_id: client_tokenizer}
+    else:
+        if not alignment_profiles or not client_tokenizers:
+            raise DistillationIntegrationError(
+                "per-profile alignment contracts and Client tokenizers are "
+                "required"
+            )
+        profiles = dict(alignment_profiles)
+        tokenizers = dict(client_tokenizers)
+        if set(profiles) != set(tokenizers):
+            raise DistillationIntegrationError(
+                "alignment-profile and Client-tokenizer IDs differ"
+            )
+
+    for profile_id, value in profiles.items():
+        if profile_id != value.profile_id:
+            raise DistillationIntegrationError(
+                "alignment-profile mapping key differs from its signed ID"
+            )
+        tokenizer = tokenizers[profile_id]
+        if tokenizer.endpoint != value.client:
+            raise DistillationIntegrationError(
+                f"validated Client tokenizer differs from {profile_id!r}"
+            )
+        if value.strategy != "dtw":
+            raise DistillationIntegrationError(
+                f"alignment profile {profile_id!r} does not use DTW"
+            )
+        if value.client_to_host_owner != "coordinator":
+            raise DistillationIntegrationError(
+                f"alignment profile {profile_id!r} is not assigned to the "
+                "Coordinator"
+            )
+    return profiles, tokenizers
+
+
 def _package_hash(package: KnowledgePackage, label: str) -> str:
     value = getattr(package, "package_hash", None)
     if not isinstance(value, str) or len(value) != 64:
@@ -167,7 +234,6 @@ def _client_protocol_reasons(
     expected = {
         "round_id": host_package.round_id,
         "manifest_hash": host_package.manifest_hash,
-        "alignment_profile_id": profile.profile_id,
         "reference_dataset_id": host_package.reference_dataset_id,
         "reference_dataset_hash": host_package.reference_dataset_hash,
         "top_k": host_package.top_k,
@@ -175,6 +241,8 @@ def _client_protocol_reasons(
     for name, value in expected.items():
         if getattr(package, name, None) != value:
             reasons.append(f"{name} differs from the Host package")
+    if package.alignment_profile_id != profile.profile_id:
+        reasons.append("alignment_profile_id differs from the approved pair")
     if getattr(package, "sender_role", None) != "client":
         reasons.append("sender_role is not client")
     model_profile = getattr(package, "model_profile", None)
@@ -390,8 +458,12 @@ def _pad_trainer_inputs(
 
 def integrate_distillation_round(
     *,
-    profile: BidirectionalAlignmentProfile,
-    client_tokenizer: ValidatedTokenizer,
+    profile: BidirectionalAlignmentProfile | None = None,
+    client_tokenizer: ValidatedTokenizer | None = None,
+    alignment_profiles: Mapping[
+        str, BidirectionalAlignmentProfile
+    ] | None = None,
+    client_tokenizers: Mapping[str, ValidatedTokenizer] | None = None,
     host_tokenizer: ValidatedTokenizer,
     mapping_cache: VocabularyMappingCache,
     host_package: KnowledgePackage,
@@ -423,15 +495,33 @@ def integrate_distillation_round(
         raise DistillationIntegrationError(
             "trusted Client quorum exceeds the signed Client set"
         )
-    if client_tokenizer.endpoint != profile.client:
+    profiles, tokenizers = _alignment_contracts(
+        profile=profile,
+        client_tokenizer=client_tokenizer,
+        alignment_profiles=alignment_profiles,
+        client_tokenizers=client_tokenizers,
+    )
+    host_endpoints = {value.host for value in profiles.values()}
+    if len(host_endpoints) != 1:
         raise DistillationIntegrationError(
-            "validated Client tokenizer differs from the alignment profile"
+            "all Client alignment profiles must share one Host endpoint"
         )
+    host_endpoint = next(iter(host_endpoints))
+    if host_tokenizer.endpoint != host_endpoint:
+        raise DistillationIntegrationError(
+            "validated Host tokenizer differs from the alignment profiles"
+        )
+    try:
+        host_profile = profiles[host_package.alignment_profile_id]
+    except KeyError:
+        raise DistillationIntegrationError(
+            "Host package alignment profile is not approved for this round"
+        ) from None
     host_by_id = _validate_host_contract(
         host_package=host_package,
         host_samples=host_samples,
         host_tokenizer=host_tokenizer,
-        profile=profile,
+        profile=host_profile,
     )
     package_by_id: dict[str, KnowledgePackage] = {}
     for package in client_packages:
@@ -443,16 +533,25 @@ def integrate_distillation_round(
 
     rejected: dict[str, list[str]] = {}
     eligible: list[str] = []
+    client_profile_ids: dict[str, str] = {}
     for client_id in selected_client_ids:
         package = package_by_id.get(client_id)
         if package is None:
             _rejection(rejected, client_id, ["signed Client package is missing"])
             continue
+        client_profile = profiles.get(package.alignment_profile_id)
+        if client_profile is None:
+            _rejection(
+                rejected,
+                client_id,
+                ["alignment profile is not approved for this round"],
+            )
+            continue
         reasons = _client_protocol_reasons(
             package,
             client_samples.get(client_id),
             host_package=host_package,
-            profile=profile,
+            profile=client_profile,
         )
         report = safety_reports.get(client_id)
         if report is None:
@@ -471,46 +570,62 @@ def integrate_distillation_round(
             raise AssertionError("eligible report gate and reasons diverged")
         try:
             validate_addressable_token_ids(
-                client_tokenizer,
+                tokenizers[client_profile.profile_id],
                 _demanded_ids(client_samples[client_id]),
             )
         except UnaddressableTokenId as exc:
             _rejection(rejected, client_id, [str(exc)])
             continue
         eligible.append(client_id)
+        client_profile_ids[client_id] = client_profile.profile_id
 
     _check_quorum(eligible, trusted_client_quorum, rejected)
 
-    aligned_by_client: dict[str, dict[str, tuple[list[list[int]], list[list[float]], int]]] = {}
+    aligned_by_client: dict[
+        str,
+        dict[str, tuple[list[list[int]], list[list[float]], int]],
+    ] = {}
+    mapping_resolutions = {}
     while True:
-        requested_ids = sorted(
-            {
-                token_id
-                for client_id in eligible
-                for token_id in _demanded_ids(client_samples[client_id])
-            }
+        ordered_profile_ids = list(
+            dict.fromkeys(client_profile_ids[client_id] for client_id in eligible)
         )
-        try:
-            mapping_resolution = mapping_cache.resolve(
-                profile=profile,
-                direction=CLIENT_TO_HOST_DIRECTION,
-                source=client_tokenizer,
-                target=host_tokenizer,
-                requested_token_ids=requested_ids,
+        mapping_resolutions = {}
+        for profile_id in ordered_profile_ids:
+            requested_ids = sorted(
+                {
+                    token_id
+                    for client_id in eligible
+                    if client_profile_ids[client_id] == profile_id
+                    for token_id in _demanded_ids(client_samples[client_id])
+                }
             )
-        except VocabularyMappingCacheError as exc:
-            raise DistillationIntegrationError(
-                "persistent vocabulary-mapping cache failed validation"
-            ) from exc
-        except VocabularyMappingError as exc:
-            raise DistillationIntegrationError(
-                "Client-to-Host vocabulary mapping failed"
-            ) from exc
+            try:
+                mapping_resolutions[profile_id] = mapping_cache.resolve(
+                    profile=profiles[profile_id],
+                    direction=CLIENT_TO_HOST_DIRECTION,
+                    source=tokenizers[profile_id],
+                    target=host_tokenizer,
+                    requested_token_ids=requested_ids,
+                )
+            except VocabularyMappingCacheError as exc:
+                raise DistillationIntegrationError(
+                    "persistent vocabulary-mapping cache failed validation"
+                ) from exc
+            except VocabularyMappingError as exc:
+                raise DistillationIntegrationError(
+                    "Client-to-Host vocabulary mapping failed"
+                ) from exc
 
-        upstream_mapping = mapping_resolution.mapping.as_upstream_token_mapping()
         aligned_by_client = {}
         failed: dict[str, str] = {}
         for client_id in eligible:
+            profile_id = client_profile_ids[client_id]
+            client_profile = profiles[profile_id]
+            selected_tokenizer = tokenizers[profile_id]
+            upstream_mapping = mapping_resolutions[
+                profile_id
+            ].mapping.as_upstream_token_mapping()
             per_sample: dict[
                 str,
                 tuple[list[list[int]], list[list[float]], int],
@@ -525,16 +640,20 @@ def integrate_distillation_round(
                     client_sample = client_by_id[sample_id]
                     aligned_logits, aligned_ids = aligner(
                         base_model_tokenizer=host_tokenizer.tokenizer,
-                        blending_model_tokenizer=client_tokenizer.tokenizer,
+                        blending_model_tokenizer=selected_tokenizer.tokenizer,
                         base_model_vocab=host_tokenizer.tokenizer.get_vocab(),
                         base_model_input_ids=host_sample.source_input_ids,
                         blending_model_input_ids=client_sample.source_input_ids,
                         blending_model_per_step_logits=client_sample.top_k_logits,
                         blending_model_per_step_indices=client_sample.top_k_token_ids,
                         blending_to_base_mapping=upstream_mapping,
-                        align_strategy=profile.strategy,
-                        base_model_special_token=profile.host.word_boundary_marker,
-                        blending_model_special_token=profile.client.word_boundary_marker,
+                        align_strategy=client_profile.strategy,
+                        base_model_special_token=(
+                            client_profile.host.word_boundary_marker
+                        ),
+                        blending_model_special_token=(
+                            client_profile.client.word_boundary_marker
+                        ),
                     )
                     if (
                         len(aligned_ids) != len(host_sample.source_input_ids)
@@ -551,7 +670,7 @@ def integrate_distillation_round(
                         aligned_ids,
                         aligned_logits,
                         top_k=host_package.top_k,
-                        vocabulary_size=profile.host.vocabulary_size,
+                        vocabulary_size=host_endpoint.vocabulary_size,
                     )
                     per_sample[sample_id] = (
                         aligned_ids,
@@ -666,7 +785,7 @@ def integrate_distillation_round(
         accepted_client_ids=list(eligible),
         samples=selected_samples,
     )
-    pad_token_id = profile.host.pad_token_id
+    pad_token_id = host_endpoint.pad_token_id
     if pad_token_id is None:
         raise DistillationIntegrationError(
             "approved Host tokenizer does not define a padding token ID"
@@ -675,14 +794,14 @@ def integrate_distillation_round(
         host_samples=host_samples,
         labels_by_sample=labels_by_sample,
         pad_token_id=pad_token_id,
-        vocabulary_size=profile.host.vocabulary_size,
+        vocabulary_size=host_endpoint.vocabulary_size,
     )
     sparse_targets = build_sparse_target_batch(
         selected_ids,
         selected_logits,
         max_length=input_ids.shape[1],
         top_k=host_package.top_k,
-        vocab_size=profile.host.vocabulary_size,
+        vocab_size=host_endpoint.vocabulary_size,
         pad_token_id=pad_token_id,
         temperature=temperature,
         dtype=torch.float32,
@@ -719,10 +838,24 @@ def integrate_distillation_round(
         schema_version=INTEGRATION_AUDIT_SCHEMA_VERSION,
         round_id=host_package.round_id,
         dataset_hash=dataset.dataset_hash,
-        alignment_profile_id=profile.profile_id,
-        alignment_direction=CLIENT_TO_HOST_DIRECTION,
-        mapping_identity_sha256=mapping_resolution.mapping.identity_sha256,
-        mapping_payload_sha256=mapping_resolution.mapping.payload_sha256,
+        alignments=[
+            AlignmentMappingAudit(
+                alignment_profile_id=profile_id,
+                alignment_direction=CLIENT_TO_HOST_DIRECTION,
+                client_ids=[
+                    client_id
+                    for client_id in eligible
+                    if client_profile_ids[client_id] == profile_id
+                ],
+                mapping_identity_sha256=(
+                    mapping_resolutions[profile_id].mapping.identity_sha256
+                ),
+                mapping_payload_sha256=(
+                    mapping_resolutions[profile_id].mapping.payload_sha256
+                ),
+            )
+            for profile_id in mapping_resolutions
+        ],
         accepted_client_ids=list(eligible),
         rejected_clients=rejected_audits,
         source_packages=source_packages,
