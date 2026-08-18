@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -60,6 +61,16 @@ def create_app(
     )
     app = FastAPI(title="LegalFedLLM Host Runtime", version="0.2.0")
     app.state.runtime = host_runtime
+    app.state.ml_lock = asyncio.Lock()
+
+    async def run_exclusive_ml(call, *args):
+        if app.state.ml_lock.locked():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="another Host ML job is already running",
+            )
+        async with app.state.ml_lock:
+            return await asyncio.to_thread(call, *args)
 
     def require_internal_token(
         x_internal_token: str | None = Header(default=None),
@@ -110,7 +121,10 @@ def create_app(
     )
     async def reference_knowledge(manifest: RoundManifest):
         try:
-            package = host_runtime.generate_reference_knowledge(manifest)
+            package = await run_exclusive_ml(
+                host_runtime.generate_reference_knowledge,
+                manifest,
+            )
             return knowledge_transfer_response(
                 metadata=package,
                 artifact_path=host_runtime.knowledge_artifact_path(
@@ -128,7 +142,7 @@ def create_app(
     )
     async def distill(job: DistillationJob):
         try:
-            result = host_runtime.distill(job)
+            result = await run_exclusive_ml(host_runtime.distill, job)
             return knowledge_transfer_response(
                 metadata=result,
                 artifact_path=host_runtime.knowledge_artifact_path(

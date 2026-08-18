@@ -20,6 +20,7 @@ from client.training import (
     TrainingExecutionProfile,
     encode_private_examples,
 )
+from shared.answer_only import AnswerOnlyCollator
 from shared.adapter_checkpoint import AdapterCheckpointStore
 from shared.crypto import sha256_hex
 from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest
@@ -117,7 +118,7 @@ class TransformersPeftTrainingBackend:
             maximum_sequence_length=manifest.maximum_sequence_length,
         )
         dataset = _ListDataset(encoded)
-        collator = _AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+        collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
         job_id = f"train-{secrets.token_hex(8)}"
         output_dir = self.data_dir / "training_jobs" / job_id
         output_dir.mkdir(parents=True, exist_ok=False)
@@ -338,7 +339,7 @@ class TransformersPeftTrainingBackend:
                 raise RuntimeError("knowledge generation loaded trainable parameters")
             model.eval()
 
-            collator = _AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+            collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
             arguments = FedMKTGenerationArguments(
                 top_k_logits_keep=manifest.top_k
             )
@@ -647,27 +648,4 @@ class _ListDataset:
             "input_ids": example.input_ids,
             "attention_mask": example.attention_mask,
             "labels": example.labels,
-        }
-
-
-class _AnswerOnlyCollator:
-    def __init__(self, torch: Any, pad_token_id: int):
-        self.torch = torch
-        self.pad_token_id = pad_token_id
-
-    def __call__(self, features: list[dict[str, list[int]]]) -> dict[str, Any]:
-        maximum = max(len(feature["input_ids"]) for feature in features)
-        batch = {"input_ids": [], "attention_mask": [], "labels": []}
-        for feature in features:
-            padding = maximum - len(feature["input_ids"])
-            batch["input_ids"].append(
-                feature["input_ids"] + [self.pad_token_id] * padding
-            )
-            batch["attention_mask"].append(
-                feature["attention_mask"] + [0] * padding
-            )
-            batch["labels"].append(feature["labels"] + [-100] * padding)
-        return {
-            name: self.torch.tensor(values, dtype=self.torch.long)
-            for name, values in batch.items()
         }

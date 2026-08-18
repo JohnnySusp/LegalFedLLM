@@ -258,7 +258,7 @@ async def measure(
         )
         manifest = RoundManifest.create_signed(
             identity=coordinator_identity,
-            round_id="step-2-package-measurement",
+            round_id="legacy-package-measurement",
             coordinator_id="measurement-coordinator",
             current_host_adapter_version=0,
             host_model_profile=_measurement_profile("host"),
@@ -307,7 +307,7 @@ async def measure(
                 top_k=top_k,
                 sample_ids=manifest.sample_ids,
                 artifact=descriptor,
-                nonce=f"step-2-{role}-measurement-nonce",
+                nonce=f"legacy-{role}-measurement-nonce",
                 created_at="2026-08-10T00:00:00Z",
             )
             packages[role] = await _measure_package(
@@ -324,7 +324,7 @@ async def measure(
             "signed package metadata plus hash-bound safetensors artifact"
         ),
         "comparison": (
-            "pre-Step-2 schema 1.0 package with the same mock samples "
+            "legacy schema 1.0 package with the same mock samples "
             "embedded in canonical JSON"
         ),
         "size_definitions": {
@@ -352,7 +352,7 @@ async def measure(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure Step 2 Client and Host Knowledge Package representations "
+            "Measure Client and Host Knowledge Package representations "
             "using the frozen D^P dataset."
         )
     )

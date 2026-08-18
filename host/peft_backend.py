@@ -5,20 +5,33 @@ import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from host.training import (
     HostAdapterInitializationRecord,
-    HostStageFiveContract,
+    HostValidationRecord,
+    HostValidationSampleMetric,
+    GraniteHostTrainingContract,
     HostTrainingExecutionProfile,
 )
+from shared.answer_only import AnswerOnlyCollator
 from shared.adapter_checkpoint import (
     AdapterCheckpointMetadata,
     AdapterCheckpointStore,
     write_atomic_json,
 )
 from shared.alignment_profiles import POC_DTW_PROFILE
-from shared.protocol import ModelProfile, utc_text
+from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest, utc_text
+from shared.reference_dataset import (
+    ReferenceDatasetIdentity,
+    ReferenceSample,
+    reference_dataset_identity,
+)
+from shared.reference_knowledge import (
+    FedMKTGenerationArguments,
+    encode_reference_samples,
+    knowledge_sample_from_rows,
+)
 from shared.tokenizer_validation import load_pinned_tokenizer
 
 
@@ -33,6 +46,12 @@ class InitializedHostAdapter:
     initialization: HostAdapterInitializationRecord
 
 
+@dataclass(frozen=True, slots=True)
+class HostBaselineResult:
+    knowledge_samples: list[KnowledgeSample]
+    validation: HostValidationRecord
+
+
 class TransformersPeftHostBackend:
     def __init__(
         self,
@@ -40,6 +59,7 @@ class TransformersPeftHostBackend:
         data_dir: str | Path,
         model_profile: ModelProfile,
         execution_profile: HostTrainingExecutionProfile,
+        knowledge_batch_size: int | None = None,
     ):
         if model_profile.training_backend != "transformers":
             raise ValueError(
@@ -48,7 +68,14 @@ class TransformersPeftHostBackend:
         self.data_dir = Path(data_dir).resolve()
         self.model_profile = model_profile
         self.execution_profile = execution_profile
-        self.contract = HostStageFiveContract.create(model_profile)
+        self.contract = GraniteHostTrainingContract.create(model_profile)
+        self.knowledge_batch_size = (
+            int(os.getenv("HOST_KNOWLEDGE_BATCH_SIZE", "1"))
+            if knowledge_batch_size is None
+            else knowledge_batch_size
+        )
+        if self.knowledge_batch_size < 1:
+            raise ValueError("Host knowledge batch size must be positive")
         self.checkpoints = AdapterCheckpointStore(
             self.data_dir / "adapters",
             model_profile,
@@ -187,6 +214,215 @@ class TransformersPeftHostBackend:
             del reloaded, reloaded_base, model, base_model
             self._release_memory(torch)
 
+    def generate_baseline(
+        self,
+        reference_samples: Sequence[ReferenceSample],
+        validation_samples: Sequence[ReferenceSample],
+        validation_identity: ReferenceDatasetIdentity,
+        manifest: RoundManifest,
+        *,
+        expected_adapter_version: int,
+        expected_checkpoint_hash: str,
+    ) -> HostBaselineResult:
+        torch, transformers, peft, _ = self._dependencies()
+        from shared.fedmkt_core.ml.logit_generation import (
+            generate_pub_data_logits,
+        )
+        from shared.fedmkt_core.ml.vars_define import (
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
+
+        self._validate_device(torch)
+        transformers.set_seed(self.execution_profile.seed)
+        validated_tokenizer = load_pinned_tokenizer(
+            POC_DTW_PROFILE.host,
+            cache_dir=os.getenv("HF_HOME"),
+            token=os.getenv("HF_TOKEN") or None,
+        )
+        tokenizer = validated_tokenizer.tokenizer
+        if tokenizer.pad_token_id is None:
+            raise RuntimeError("pinned Host tokenizer has no padding token")
+
+        reference_values = list(reference_samples)
+        validation_values = list(validation_samples)
+        actual_validation_identity = reference_dataset_identity(
+            validation_values
+        )
+        if actual_validation_identity != validation_identity:
+            raise ValueError("Host validation data differs from its identity")
+
+        encoded_reference = encode_reference_samples(
+            reference_values,
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=manifest.sample_ids,
+        )
+        encoded_validation = encode_reference_samples(
+            validation_values,
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=[
+                sample.sample_id for sample in validation_values
+            ],
+            dataset_label="private D^V",
+        )
+        vocabulary_size = int(self.model_profile.vocabulary_size or 0)
+        if manifest.top_k > vocabulary_size:
+            raise ValueError("manifest top_k exceeds the Host vocabulary size")
+
+        current = self.checkpoints.current()
+        if current is None:
+            raise RuntimeError("current Host adapter checkpoint is missing")
+        metadata, checkpoint_path = current
+        if (
+            metadata.version != expected_adapter_version
+            or metadata.checkpoint_hash != expected_checkpoint_hash
+        ):
+            raise RuntimeError(
+                "current Host checkpoint differs from the round record"
+            )
+        if metadata.profile_hash != self.model_profile.profile_hash():
+            raise RuntimeError("current Host checkpoint uses another profile")
+
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                checkpoint_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(model)
+            if any(parameter.requires_grad for parameter in model.parameters()):
+                raise RuntimeError(
+                    "Host baseline inference loaded trainable parameters"
+                )
+            model.eval()
+
+            collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+            arguments = FedMKTGenerationArguments(
+                top_k_logits_keep=manifest.top_k
+            )
+            generated: list[KnowledgeSample] = []
+            for start in range(
+                0,
+                len(encoded_reference),
+                self.knowledge_batch_size,
+            ):
+                batch_values = encoded_reference[
+                    start : start + self.knowledge_batch_size
+                ]
+                result = generate_pub_data_logits(
+                    self._generation_inputs(batch_values),
+                    model,
+                    arguments,
+                    collator,
+                )
+                token_ids = result[PER_STEP_INDICES]
+                logits = result[PER_STEP_LOGITS]
+                losses = result[METRIC]
+                self._validate_fedmkt_batch(
+                    len(batch_values),
+                    token_ids,
+                    logits,
+                    losses,
+                )
+                for index, item in enumerate(batch_values):
+                    generated.append(
+                        knowledge_sample_from_rows(
+                            item,
+                            top_k_token_ids=token_ids[index].tolist(),
+                            top_k_logits=logits[index].tolist(),
+                            ce_loss=float(losses[index].item()),
+                        )
+                    )
+
+            if [sample.sample_id for sample in generated] != list(
+                manifest.sample_ids
+            ):
+                raise RuntimeError(
+                    "generated Host knowledge changed the signed D^P order"
+                )
+
+            validation_metrics: list[HostValidationSampleMetric] = []
+            for start in range(
+                0,
+                len(encoded_validation),
+                self.knowledge_batch_size,
+            ):
+                batch_values = encoded_validation[
+                    start : start + self.knowledge_batch_size
+                ]
+                result = generate_pub_data_logits(
+                    self._generation_inputs(batch_values),
+                    model,
+                    arguments,
+                    collator,
+                )
+                token_ids = result[PER_STEP_INDICES]
+                logits = result[PER_STEP_LOGITS]
+                losses = result[METRIC]
+                self._validate_fedmkt_batch(
+                    len(batch_values),
+                    token_ids,
+                    logits,
+                    losses,
+                )
+                for index, item in enumerate(batch_values):
+                    answer_token_count = sum(
+                        label != -100 for label in item.labels[1:]
+                    )
+                    validation_metrics.append(
+                        HostValidationSampleMetric(
+                            sample_id=item.sample_id,
+                            answer_token_count=answer_token_count,
+                            answer_token_ce=float(losses[index].item()),
+                        )
+                    )
+
+            validation = HostValidationRecord.create(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                validation_dataset=validation_identity,
+                host_model_profile_hash=self.model_profile.profile_hash(),
+                adapter_version=metadata.version,
+                checkpoint_hash=metadata.checkpoint_hash,
+                contract_hash=self.contract.contract_hash,
+                execution_profile_hash=self.execution_profile.profile_hash(),
+                samples=validation_metrics,
+            )
+            return HostBaselineResult(generated, validation)
+        finally:
+            del model, base_model
+            self._release_memory(torch)
+
+    @staticmethod
+    def _generation_inputs(values: Sequence[Any]) -> dict[str, list[list[int]]]:
+        return {
+            "input_ids": [item.input_ids for item in values],
+            "attention_mask": [item.attention_mask for item in values],
+            "labels": [item.labels for item in values],
+        }
+
+    @staticmethod
+    def _validate_fedmkt_batch(
+        batch_size: int,
+        token_ids: Any,
+        logits: Any,
+        losses: Any,
+    ) -> None:
+        if (
+            token_ids.size(0) != batch_size
+            or logits.size(0) != batch_size
+            or losses.numel() != batch_size
+        ):
+            raise RuntimeError("FedMKT returned an invalid Host batch shape")
+
     def _load_initialization_record(
         self,
         checkpoint_path: Path,
@@ -214,7 +450,7 @@ class TransformersPeftHostBackend:
         if record.model_profile_hash != self.model_profile.profile_hash():
             raise ValueError("Host initialization uses another model profile")
         if record.contract_hash != self.contract.contract_hash:
-            raise ValueError("Host initialization uses another Step 5 contract")
+            raise ValueError("Host initialization uses another training contract")
         if record.execution_profile_hash != self.execution_profile.profile_hash():
             raise ValueError(
                 "Host initialization uses another execution profile"

@@ -75,7 +75,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
         reference_samples = [
             ReferenceSample(
                 schema_version=1,
-                dataset_id="step36-reference",
+                dataset_id="client-real-reference",
                 dataset_version="v1",
                 sample_id="reference-1",
                 chapter="Contracts",
@@ -85,7 +85,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
             ),
             ReferenceSample(
                 schema_version=1,
-                dataset_id="step36-reference",
+                dataset_id="client-real-reference",
                 dataset_version="v1",
                 sample_id="reference-2",
                 chapter="Contracts",
@@ -159,7 +159,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
             content=reference_path.read_bytes(),
         )
 
-        staging = runtime.adapter_store.staging_path("step36-v1")
+        staging = runtime.adapter_store.staging_path("real-package-v1")
         self._write_adapter(staging, b"STEP36-ADAPTER-V1")
         metadata = runtime.adapter_store.seal(
             staging,
@@ -227,13 +227,13 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
 
     def _advance_adapter(self, runtime: ClientRuntime) -> None:
         parent, _ = runtime.adapter_store.current()
-        staging = runtime.adapter_store.staging_path("step36-v2")
+        staging = runtime.adapter_store.staging_path("real-package-v2")
         self._write_adapter(staging, b"STEP36-ADAPTER-V2")
         metadata = runtime.adapter_store.seal(
             staging,
             version=2,
             parent=parent,
-            round_id="round-after-step36",
+            round_id="round-after-real-package",
             manifest_hash="0" * 64,
             execution_profile_hash=runtime.training_execution_profile.profile_hash(),
         )
@@ -244,7 +244,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
                 "candidate_adapter_version": metadata.version,
                 "training_adapter_version": metadata.version,
                 "training_checkpoint_hash": metadata.checkpoint_hash,
-                "last_training_round": "round-after-step36",
+                "last_training_round": "round-after-real-package",
             }
         )
         runtime.store.write_json("state.json", state)

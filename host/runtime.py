@@ -9,6 +9,7 @@ from host.model_profiles import (
     pinned_host_profile,
 )
 from host.training import (
+    HostValidationRecord,
     HostTrainingExecutionProfile,
     host_execution_profile_from_environment,
 )
@@ -128,6 +129,7 @@ class HostRuntime:
             )
         self.training_execution_profile = None
         self.real_adapter = None
+        self.peft_backend = None
         if self.model_profile.training_backend == "transformers":
             self.training_execution_profile = (
                 training_execution_profile
@@ -143,6 +145,7 @@ class HostRuntime:
                         execution_profile=self.training_execution_profile,
                     )
                 self.real_adapter = peft_backend.initialize_adapter()
+                self.peft_backend = peft_backend
             except (RuntimeError, ValueError, OSError) as exc:
                 raise HostRuntimeError(
                     f"real Host adapter initialization failed: {exc}"
@@ -190,18 +193,37 @@ class HostRuntime:
     def generate_reference_knowledge(
         self, manifest: RoundManifest, *, enforce_manifest_parent: bool = True
     ) -> KnowledgePackage:
-        if self.model_profile.training_backend == "transformers":
+        if manifest.host_model_profile.profile_hash() != (
+            self.model_profile.profile_hash()
+        ):
             raise HostRuntimeError(
-                "real Host baseline inference belongs to Step 5.3 and is not "
-                "enabled by the adapter-lifecycle substep"
+                "manifest is bound to a different Host model profile"
             )
+
+        active = self.active_adapter()
+        if (
+            enforce_manifest_parent
+            and manifest.current_host_adapter_version != active["version"]
+        ):
+            raise HostRuntimeError(
+                "manifest is bound to a different Host adapter version"
+            )
+        if (
+            self.model_profile.training_backend == "transformers"
+            and not enforce_manifest_parent
+        ):
+            raise HostRuntimeError(
+                "post-distillation Host inference requires the real "
+                "distillation backend"
+            )
+
         identity_path = self._dataset_identity_path(
             manifest.round_id
         )
 
         if self.store.exists(identity_path):
             self.verify_cached_reference_data(manifest)
-        
+
         cache_name = (
             "baseline_knowledge"
             if enforce_manifest_parent
@@ -211,32 +233,77 @@ class HostRuntime:
         artifact_path = (
             f"rounds/{manifest.round_id}/{cache_name}/knowledge.safetensors"
         )
-        cached = (
+        real_baseline = (
+            self.model_profile.training_backend == "transformers"
+            and enforce_manifest_parent
+        )
+        validation_path = self._baseline_validation_path(manifest.round_id)
+        cached = [
             self.store.exists(cache_path),
             self.store.exists(artifact_path),
-        )
+        ]
+        if real_baseline:
+            cached.append(self.store.exists(validation_path))
         if any(cached) and not all(cached):
             raise HostRuntimeError("Host Knowledge Package cache is incomplete")
         if all(cached):
-            package = KnowledgePackage.model_validate(
-                self.store.read_json(cache_path)
+            package = self._load_cached_knowledge_package(
+                manifest,
+                cache_path=cache_path,
+                artifact_path=artifact_path,
+                expected_adapter_version=int(active["version"]),
             )
-            load_package_samples(
-                self.store.path(artifact_path),
-                package,
-                maximum_bytes=manifest.maximum_knowledge_package_bytes,
-            )
+            if real_baseline:
+                self.validation_baseline(manifest)
             return package
 
-        active = self.active_adapter()
-        if enforce_manifest_parent and manifest.current_host_adapter_version != active["version"]:
-            raise HostRuntimeError("manifest is bound to a different Host adapter version")
-        samples = deterministic_knowledge_samples(
-            manifest=manifest,
-            participant_id=self.host_id,
-            role="host",
-            adapter_version=active["version"],
-        )
+        validation_record = None
+        if real_baseline:
+            try:
+                receipt = self.verify_cached_reference_data(manifest)
+                reference_samples = load_reference_jsonl(
+                    self.store.path(
+                        self._reference_dataset_path(manifest.round_id)
+                    )
+                )
+                validation_samples = load_reference_jsonl(
+                    self.store.path(
+                        self._validation_dataset_path(manifest.round_id)
+                    )
+                )
+                assert self.peft_backend is not None
+                result = self.peft_backend.generate_baseline(
+                    reference_samples,
+                    validation_samples,
+                    receipt.validation_identity,
+                    manifest,
+                    expected_adapter_version=int(active["version"]),
+                    expected_checkpoint_hash=str(active["checkpoint_hash"]),
+                )
+                samples = result.knowledge_samples
+                validation_record = result.validation
+                self._validate_validation_record(
+                    manifest,
+                    validation_record,
+                    receipt=receipt,
+                    validation_samples=validation_samples,
+                    active=active,
+                )
+            except (RuntimeError, ValueError, OSError) as exc:
+                raise HostRuntimeError(
+                    f"real Host baseline inference failed: {exc}"
+                ) from exc
+        else:
+            samples = deterministic_knowledge_samples(
+                manifest=manifest,
+                participant_id=self.host_id,
+                role="host",
+                adapter_version=active["version"],
+            )
+        if [sample.sample_id for sample in samples] != manifest.sample_ids:
+            raise HostRuntimeError(
+                "Host knowledge generation changed the signed D^P order"
+            )
         try:
             descriptor = write_knowledge_artifact(
                 self.store.path(artifact_path),
@@ -270,6 +337,11 @@ class HostRuntime:
                 raise HostRuntimeError(
                     "Host Knowledge Package exceeds the manifest size limit"
                 )
+            if validation_record is not None:
+                self.store.write_json_if_absent(
+                    validation_path,
+                    validation_record.model_dump(mode="json"),
+                )
             self.store.write_json_if_absent(
                 cache_path,
                 package.model_dump(mode="json"),
@@ -277,8 +349,130 @@ class HostRuntime:
         except Exception:
             self.store.delete(cache_path)
             self.store.delete(artifact_path)
+            if validation_record is not None:
+                self.store.delete(validation_path)
             raise
         return package
+
+    def _load_cached_knowledge_package(
+        self,
+        manifest: RoundManifest,
+        *,
+        cache_path: str,
+        artifact_path: str,
+        expected_adapter_version: int,
+    ) -> KnowledgePackage:
+        try:
+            package = KnowledgePackage.model_validate(
+                self.store.read_json(cache_path)
+            )
+            expected_alignment = (
+                f"{manifest.alignment.strategy}:"
+                f"{manifest.alignment.profile_version}"
+            )
+            if package.round_id != manifest.round_id:
+                raise ValueError("cached Host package belongs to another round")
+            if package.manifest_hash != manifest.manifest_hash:
+                raise ValueError("cached Host package has a stale manifest")
+            if package.sender_id != self.host_id or package.sender_role != "host":
+                raise ValueError("cached Host package has another sender")
+            if package.model_profile.profile_hash() != (
+                self.model_profile.profile_hash()
+            ):
+                raise ValueError("cached Host package has another model profile")
+            if package.adapter_version != expected_adapter_version:
+                raise ValueError("cached Host package has another adapter")
+            if package.alignment_profile_id != expected_alignment:
+                raise ValueError("cached Host package has another alignment profile")
+            if (
+                package.reference_dataset_id != manifest.reference_dataset_id
+                or package.reference_dataset_hash
+                != manifest.reference_dataset_hash
+            ):
+                raise ValueError("cached Host package has another D^P identity")
+            if package.sample_ids != manifest.sample_ids:
+                raise ValueError("cached Host package has another D^P order")
+            if package.top_k != manifest.top_k:
+                raise ValueError("cached Host package has another top-k width")
+            if not package.verify_signature(self.identity.public_key_b64):
+                raise ValueError("cached Host package signature is invalid")
+            load_package_samples(
+                self.store.path(artifact_path),
+                package,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            return package
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise HostRuntimeError(
+                f"cached Host Knowledge Package is invalid: {exc}"
+            ) from exc
+
+    def validation_baseline(
+        self,
+        manifest: RoundManifest,
+    ) -> HostValidationRecord:
+        if self.model_profile.training_backend != "transformers":
+            raise HostRuntimeError(
+                "the mock Host does not persist a real validation baseline"
+            )
+        active = self.active_adapter()
+        path = self._baseline_validation_path(manifest.round_id)
+        try:
+            record = HostValidationRecord.model_validate(
+                self.store.read_json(path)
+            )
+            receipt = self.verify_cached_reference_data(manifest)
+            validation_samples = load_reference_jsonl(
+                self.store.path(
+                    self._validation_dataset_path(manifest.round_id)
+                )
+            )
+            self._validate_validation_record(
+                manifest,
+                record,
+                receipt=receipt,
+                validation_samples=validation_samples,
+                active=active,
+            )
+            return record
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise HostRuntimeError(
+                f"cached Host validation baseline is invalid: {exc}"
+            ) from exc
+
+    def _validate_validation_record(
+        self,
+        manifest: RoundManifest,
+        record: HostValidationRecord,
+        *,
+        receipt: HostReferenceDatasetReceipt,
+        validation_samples: list[ReferenceSample],
+        active: dict[str, Any],
+    ) -> None:
+        if record.round_id != manifest.round_id:
+            raise ValueError("Host validation belongs to another round")
+        if record.manifest_hash != manifest.manifest_hash:
+            raise ValueError("Host validation has a stale manifest")
+        if record.validation_dataset != receipt.validation_identity:
+            raise ValueError("Host validation has another D^V identity")
+        if [sample.sample_id for sample in record.samples] != [
+            sample.sample_id for sample in validation_samples
+        ]:
+            raise ValueError("Host validation has another D^V sample order")
+        if record.host_model_profile_hash != self.model_profile.profile_hash():
+            raise ValueError("Host validation has another model profile")
+        if record.adapter_version != int(active["version"]):
+            raise ValueError("Host validation has another adapter version")
+        if record.checkpoint_hash != str(active["checkpoint_hash"]):
+            raise ValueError("Host validation has another checkpoint")
+        assert self.peft_backend is not None
+        if record.contract_hash != self.peft_backend.contract.contract_hash:
+            raise ValueError("Host validation has another training contract")
+        assert self.training_execution_profile is not None
+        if record.execution_profile_hash != (
+            self.training_execution_profile.profile_hash()
+        ):
+            raise ValueError("Host validation has another execution profile")
 
     def knowledge_artifact_path(
         self,
@@ -309,8 +503,7 @@ class HostRuntime:
     def distill(self, job: DistillationJob) -> DistillationResult:
         if self.model_profile.training_backend == "transformers":
             raise HostRuntimeError(
-                "real Host distillation belongs to Step 5.5 and is not "
-                "enabled by the adapter-lifecycle substep"
+                "real Host distillation is not implemented"
             )
         manifest = job.manifest
 
@@ -412,6 +605,10 @@ class HostRuntime:
         return (
             f"rounds/{round_id}/datasets/identity.json"
         )
+
+    @staticmethod
+    def _baseline_validation_path(round_id: str) -> str:
+        return f"rounds/{round_id}/validation/baseline.json"
 
     @staticmethod
     def _validate_reference_pair(

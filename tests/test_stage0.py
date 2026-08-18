@@ -39,7 +39,7 @@ from shared.protocol import (
 from tests.test_round import Stack
 
 
-class StageZeroTests(unittest.IsolatedAsyncioTestCase):
+class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def _register(self, stack: Stack, app) -> None:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
@@ -653,7 +653,7 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(host_cache.exists())
 
 
-class StageZeroValidationTests(unittest.TestCase):
+class ProtocolValidationTests(unittest.TestCase):
     def test_client_real_backend_is_lazy_and_unpinned_host_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lazy_import = subprocess.run(
