@@ -28,3 +28,6 @@ artifacts/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Local repository delivery archives
+/LegalFedLLM*.zip

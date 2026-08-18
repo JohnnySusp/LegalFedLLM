@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: host/Dockerfile
+      target: host
     environment:
       HOST_DATA_DIR: /data/host
       HOST_ID: ${HOST_ID:-legalfedllm-host}

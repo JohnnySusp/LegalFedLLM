@@ -12,6 +12,10 @@ GRANITE_3_3_2B_CHAT_TEMPLATE_HASH = (
 )
 
 
+def supported_host_profile_ids() -> tuple[str, ...]:
+    return (GRANITE_3_3_2B_HOST_PROFILE_ID,)
+
+
 def pinned_host_profile(*, serving_backend: str = "mock") -> ModelProfile:
     if serving_backend not in {"mock", "ollama"}:
         raise ValueError("serving_backend must be mock or ollama")

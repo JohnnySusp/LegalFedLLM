@@ -4,6 +4,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+from host.model_profiles import (
+    GRANITE_3_3_2B_HOST_PROFILE_ID,
+    pinned_host_profile,
+)
+from host.training import (
+    HostTrainingExecutionProfile,
+    host_execution_profile_from_environment,
+)
 from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
@@ -37,6 +45,24 @@ class HostRuntimeError(RuntimeError):
 
 def default_host_profile() -> ModelProfile:
     serving_backend = os.getenv("HOST_SERVING_BACKEND", "mock").strip().lower()
+    training_backend = os.getenv("HOST_TRAINING_BACKEND", "mock").strip().lower()
+    selected_profile = os.getenv("HOST_MODEL_PROFILE", "mock").strip()
+    if selected_profile != "mock":
+        if selected_profile != GRANITE_3_3_2B_HOST_PROFILE_ID:
+            raise HostRuntimeError(
+                f"unsupported real Host profile: {selected_profile!r}"
+            )
+        if training_backend != "transformers":
+            raise HostRuntimeError(
+                "the pinned Granite Host requires "
+                "HOST_TRAINING_BACKEND=transformers"
+            )
+        return pinned_host_profile(serving_backend=serving_backend)
+    if training_backend != "mock":
+        raise HostRuntimeError(
+            "HOST_MODEL_PROFILE must select the pinned Granite profile when "
+            "HOST_TRAINING_BACKEND=transformers"
+        )
     ollama_model = os.getenv("HOST_OLLAMA_MODEL", "granite3.3:2b")
     return ModelProfile(
         profile_id=os.getenv("HOST_PROFILE_ID", "host-mock-v1"),
@@ -46,7 +72,7 @@ def default_host_profile() -> ModelProfile:
         tokenizer_id=os.getenv("HOST_TOKENIZER_ID", "legalfedllm/mock-tokenizer"),
         tokenizer_revision=os.getenv("HOST_TOKENIZER_REVISION", "mock-v1"),
         tokenizer_class=os.getenv("HOST_TOKENIZER_CLASS", "MockTokenizer"),
-        training_backend=os.getenv("HOST_TRAINING_BACKEND", "mock"),
+        training_backend="mock",
         serving_backend=serving_backend,
         prompt_template_id=PROMPT_TEMPLATE_ID,
         prompt_template_hash=sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
@@ -80,6 +106,8 @@ class HostRuntime:
         model_profile: ModelProfile | None = None,
         force_validation_failure: bool = False,
         ollama_client: OllamaClient | None = None,
+        training_execution_profile: HostTrainingExecutionProfile | None = None,
+        peft_backend: Any | None = None,
     ):
         self.host_id = host_id
         self.store = JsonFileStore(data_dir)
@@ -91,12 +119,6 @@ class HostRuntime:
         if self.model_profile.role != "host":
             raise ValueError("Host runtime requires a host model profile")
 
-        if self.model_profile.training_backend != "mock":
-            raise HostRuntimeError(
-                "HOST_TRAINING_BACKEND=transformers is not integrated yet; "
-                "use mock until the real FedMKT runtime is connected"
-            )
-
         self.force_validation_failure = force_validation_failure
         self.ollama = ollama_client
         if self.model_profile.serving_backend == "ollama" and self.ollama is None:
@@ -104,7 +126,29 @@ class HostRuntime:
                 os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
                 timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60")),
             )
-        self._ensure_initial_adapter()
+        self.training_execution_profile = None
+        self.real_adapter = None
+        if self.model_profile.training_backend == "transformers":
+            self.training_execution_profile = (
+                training_execution_profile
+                or host_execution_profile_from_environment()
+            )
+            try:
+                if peft_backend is None:
+                    from host.peft_backend import TransformersPeftHostBackend
+
+                    peft_backend = TransformersPeftHostBackend(
+                        data_dir=self.store.root,
+                        model_profile=self.model_profile,
+                        execution_profile=self.training_execution_profile,
+                    )
+                self.real_adapter = peft_backend.initialize_adapter()
+            except (RuntimeError, ValueError, OSError) as exc:
+                raise HostRuntimeError(
+                    f"real Host adapter initialization failed: {exc}"
+                ) from exc
+        else:
+            self._ensure_initial_adapter()
 
     def _ensure_initial_adapter(self) -> None:
         if self.store.exists("adapters/active.json"):
@@ -121,6 +165,14 @@ class HostRuntime:
         self.store.write_json("adapters/active.json", adapter)
 
     def active_adapter(self) -> dict[str, Any]:
+        if self.real_adapter is not None:
+            metadata = self.real_adapter.metadata
+            return {
+                "version": metadata.version,
+                "artifact_hash": metadata.checkpoint_hash,
+                "checkpoint_hash": metadata.checkpoint_hash,
+                "profile_hash": metadata.profile_hash,
+            }
         return self.store.read_json("adapters/active.json")
 
     @property
@@ -138,6 +190,11 @@ class HostRuntime:
     def generate_reference_knowledge(
         self, manifest: RoundManifest, *, enforce_manifest_parent: bool = True
     ) -> KnowledgePackage:
+        if self.model_profile.training_backend == "transformers":
+            raise HostRuntimeError(
+                "real Host baseline inference belongs to Step 5.3 and is not "
+                "enabled by the adapter-lifecycle substep"
+            )
         identity_path = self._dataset_identity_path(
             manifest.round_id
         )
@@ -250,6 +307,11 @@ class HostRuntime:
         return path
 
     def distill(self, job: DistillationJob) -> DistillationResult:
+        if self.model_profile.training_backend == "transformers":
+            raise HostRuntimeError(
+                "real Host distillation belongs to Step 5.5 and is not "
+                "enabled by the adapter-lifecycle substep"
+            )
         manifest = job.manifest
 
         identity_path = self._dataset_identity_path(

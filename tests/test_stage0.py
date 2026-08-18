@@ -654,7 +654,7 @@ class StageZeroTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StageZeroValidationTests(unittest.TestCase):
-    def test_client_real_backend_is_lazy_while_host_remains_mock_only(self) -> None:
+    def test_client_real_backend_is_lazy_and_unpinned_host_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lazy_import = subprocess.run(
                 [
@@ -690,7 +690,10 @@ class StageZeroValidationTests(unittest.TestCase):
             host_data["vocabulary_size"] = 1
             host_data["chat_template_mode"] = "standard"
 
-            with self.assertRaises(HostRuntimeError):
+            with self.assertRaisesRegex(
+                HostRuntimeError,
+                "exact pinned Granite Host profile",
+            ):
                 HostRuntime(
                     data_dir=Path(directory) / "host",
                     model_profile=ModelProfile.model_validate(host_data),

@@ -7,7 +7,6 @@ from typing import Any, Callable
 
 from client.model_profiles import pinned_client_profile
 from client.training import (
-    AdapterCheckpointStore,
     BackendTrainingResult,
     LocalTrainingRecord,
     TrainingExecutionProfile,
@@ -15,6 +14,7 @@ from client.training import (
     load_private_examples,
     private_dataset_semantic_hash,
 )
+from shared.adapter_checkpoint import AdapterCheckpointStore
 from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact

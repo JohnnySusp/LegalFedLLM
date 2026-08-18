@@ -14,13 +14,13 @@ from client.knowledge import (
     knowledge_sample_from_rows,
 )
 from client.training import (
-    AdapterCheckpointStore,
     BackendTrainingResult,
     EncodedTrainingExample,
     PrivateTrainingExample,
     TrainingExecutionProfile,
     encode_private_examples,
 )
+from shared.adapter_checkpoint import AdapterCheckpointStore
 from shared.crypto import sha256_hex
 from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest
 from shared.reference_dataset import ReferenceSample
