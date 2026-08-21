@@ -18,6 +18,9 @@ PROTOCOL_VERSION = "1.0"
 PACKAGE_SCHEMA_VERSION = "2.0"
 KNOWLEDGE_ARTIFACT_FORMAT = "safetensors"
 KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "1.0"
+HOST_TRAINING_ARTIFACT_SCHEMA_VERSION = "1.0"
+HOST_TRAINING_JOB_SCHEMA_VERSION = "1.0"
+HOST_CANDIDATE_RESULT_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
 BASE64_PATTERN = r"^[A-Za-z0-9+/]+={0,2}$"
 
@@ -252,11 +255,17 @@ class RoundCreateRequest(ContractModel):
     truncation_policy: Literal["right", "left", "reject"] = "right"
     top_k: int = Field(default=20, ge=1, le=4096)
     training_epochs: int = Field(default=1, ge=1, le=100)
+    host_public_data_epochs: Literal[1, 5] = 5
     alignment: AlignmentConfig = Field(default_factory=AlignmentConfig)
     distillation: DistillationConfig = Field(default_factory=DistillationConfig)
     dp_policy: DifferentialPrivacyPolicy = Field(default_factory=DifferentialPrivacyPolicy)
     maximum_knowledge_package_bytes: int = Field(
         default=25 * 1024 * 1024, ge=1024, le=2 * 1024 * 1024 * 1024
+    )
+    maximum_host_training_job_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024,
+        le=2 * 1024 * 1024 * 1024,
     )
     submission_window_seconds: int = Field(default=3600, ge=1, le=31_536_000)
 
@@ -304,10 +313,12 @@ class RoundManifest(ContractModel):
     truncation_policy: Literal["right", "left", "reject"]
     top_k: int = Field(ge=1)
     training_epochs: int = Field(ge=1)
+    host_public_data_epochs: Literal[1, 5]
     alignment: AlignmentConfig
     distillation: DistillationConfig
     dp_policy: DifferentialPrivacyPolicy
     maximum_knowledge_package_bytes: int = Field(ge=1024)
+    maximum_host_training_job_bytes: int = Field(ge=1024)
     submission_deadline: str
     round_nonce: str = Field(min_length=16, max_length=256)
     coordinator_id: str = Field(min_length=1, max_length=128)
@@ -411,10 +422,14 @@ class RoundManifest(ContractModel):
             "truncation_policy": request.truncation_policy,
             "top_k": request.top_k,
             "training_epochs": request.training_epochs,
+            "host_public_data_epochs": request.host_public_data_epochs,
             "alignment": request.alignment.model_dump(mode="json"),
             "distillation": request.distillation.model_dump(mode="json"),
             "dp_policy": request.dp_policy.model_dump(mode="json"),
             "maximum_knowledge_package_bytes": request.maximum_knowledge_package_bytes,
+            "maximum_host_training_job_bytes": (
+                request.maximum_host_training_job_bytes
+            ),
             "submission_deadline": submission_deadline,
             "round_nonce": secrets.token_urlsafe(24),
             "coordinator_id": coordinator_id,
@@ -668,6 +683,153 @@ class ValidatedDistillationDataset(ContractModel):
 class DistillationJob(ContractModel):
     manifest: RoundManifest
     dataset: ValidatedDistillationDataset
+
+
+class HostTrainingArtifactDescriptor(ContractModel):
+    format: Literal["safetensors"] = KNOWLEDGE_ARTIFACT_FORMAT
+    schema_version: Literal["1.0"] = HOST_TRAINING_ARTIFACT_SCHEMA_VERSION
+    byte_size: int = Field(ge=1, le=2 * 1024 * 1024 * 1024)
+    sha256: str = Field(pattern=HASH_PATTERN)
+    sample_count: int = Field(ge=1, le=100_000)
+    sample_ids_sha256: str = Field(pattern=HASH_PATTERN)
+    padded_sequence_length: int = Field(ge=2, le=131_072)
+    top_k: int = Field(ge=1, le=4096)
+    pad_token_id: int = Field(ge=0)
+    trainer_inputs_sha256: str = Field(pattern=HASH_PATTERN)
+
+
+class HostTrainingJob(ContractModel):
+    schema_version: Literal["1.0"] = HOST_TRAINING_JOB_SCHEMA_VERSION
+    manifest: RoundManifest
+    dataset_hash: str = Field(pattern=HASH_PATTERN)
+    integration_audit_hash: str = Field(pattern=HASH_PATTERN)
+    accepted_client_ids: list[str] = Field(min_length=1, max_length=256)
+    sample_ids: list[str] = Field(min_length=1, max_length=100_000)
+    host_adapter_version: int = Field(ge=0)
+    host_model_profile_hash: str = Field(pattern=HASH_PATTERN)
+    host_public_data_epochs: Literal[1, 5]
+    distillation: DistillationConfig
+    artifact: HostTrainingArtifactDescriptor
+    created_at: str
+    job_hash: str = Field(pattern=HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_job(self) -> "HostTrainingJob":
+        parse_utc(self.created_at)
+        manifest = self.manifest
+        if self.sample_ids != manifest.sample_ids:
+            raise ValueError("Host training sample order differs from the manifest")
+        if len(self.sample_ids) != len(set(self.sample_ids)):
+            raise ValueError("Host training sample IDs must be unique")
+        if self.artifact.sample_count != len(self.sample_ids):
+            raise ValueError("Host training artifact sample count differs")
+        if self.artifact.sample_ids_sha256 != sha256_hex(self.sample_ids):
+            raise ValueError("Host training artifact has another sample order")
+        if self.artifact.top_k != manifest.top_k:
+            raise ValueError("Host training artifact has another top-k width")
+        if (
+            self.artifact.padded_sequence_length
+            > manifest.maximum_sequence_length
+        ):
+            raise ValueError("Host training artifact exceeds the sequence limit")
+        if self.host_adapter_version != manifest.current_host_adapter_version:
+            raise ValueError("Host training job has another parent adapter")
+        if self.host_model_profile_hash != (
+            manifest.host_model_profile.profile_hash()
+        ):
+            raise ValueError("Host training job has another model profile")
+        if self.host_public_data_epochs != manifest.host_public_data_epochs:
+            raise ValueError("Host training epochs differ from the manifest")
+        if self.distillation != manifest.distillation:
+            raise ValueError("Host training distillation config differs")
+        if self.artifact.byte_size > manifest.maximum_host_training_job_bytes:
+            raise ValueError("Host training artifact exceeds the signed size limit")
+        if len(self.accepted_client_ids) < manifest.trusted_client_quorum:
+            raise ValueError("Host training job no longer satisfies quorum")
+        if len(self.accepted_client_ids) != len(set(self.accepted_client_ids)):
+            raise ValueError("accepted Host training Client IDs must be unique")
+        accepted = set(self.accepted_client_ids)
+        if not accepted.issubset(manifest.selected_client_ids):
+            raise ValueError("Host training job contains an unselected Client")
+        expected_order = [
+            client_id
+            for client_id in manifest.selected_client_ids
+            if client_id in accepted
+        ]
+        if self.accepted_client_ids != expected_order:
+            raise ValueError("accepted Host training Clients changed signed order")
+        expected_hash = sha256_hex(
+            self.model_dump(mode="json", exclude={"job_hash"})
+        )
+        if self.job_hash != expected_hash:
+            raise ValueError("job_hash does not match the Host training job")
+        return self
+
+    @classmethod
+    def create(cls, **values: Any) -> "HostTrainingJob":
+        payload = cls.model_construct(**values).model_dump(
+            mode="json",
+            exclude={"job_hash"},
+        )
+        return cls(**payload, job_hash=sha256_hex(payload))
+
+
+class HostTrainingJobReceipt(ContractModel):
+    round_id: str = Field(min_length=1, max_length=128)
+    manifest_hash: str = Field(pattern=HASH_PATTERN)
+    job_hash: str = Field(pattern=HASH_PATTERN)
+    artifact_sha256: str = Field(pattern=HASH_PATTERN)
+    artifact_byte_size: int = Field(ge=1)
+    accepted_client_ids: list[str] = Field(min_length=1, max_length=256)
+
+
+class HostCandidateTrainingResult(ContractModel):
+    schema_version: Literal["1.0"] = HOST_CANDIDATE_RESULT_SCHEMA_VERSION
+    round_id: str = Field(min_length=1, max_length=128)
+    manifest_hash: str = Field(pattern=HASH_PATTERN)
+    job_hash: str = Field(pattern=HASH_PATTERN)
+    parent_adapter_version: int = Field(ge=0)
+    parent_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    candidate_adapter_version: int = Field(ge=1)
+    candidate_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    host_model_profile_hash: str = Field(pattern=HASH_PATTERN)
+    execution_profile_hash: str = Field(pattern=HASH_PATTERN)
+    host_public_data_epochs: Literal[1, 5]
+    supervised_loss_weight: Literal[0.9] = 0.9
+    distillation_loss_weight: Literal[0.1] = 0.1
+    loss_type: Literal["ce"] = "ce"
+    temperature: Literal[1.0] = 1.0
+    optimizer_step_count: int = Field(ge=1)
+    optimizer_loss: float = Field(ge=0, allow_inf_nan=False)
+    supervised_answer_loss: float = Field(ge=0, allow_inf_nan=False)
+    distillation_answer_loss: float = Field(ge=0, allow_inf_nan=False)
+    trainable_parameter_count: int = Field(gt=0)
+    total_parameter_count: int = Field(gt=0)
+    lora_tensors_changed: Literal[True] = True
+    frozen_base_unchanged: Literal[True] = True
+    reload_verified: Literal[True] = True
+    dependency_versions: dict[str, str]
+    created_at: str
+    result_hash: str = Field(pattern=HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_result(self) -> "HostCandidateTrainingResult":
+        parse_utc(self.created_at)
+        if self.candidate_adapter_version != self.parent_adapter_version + 1:
+            raise ValueError("Host candidate version must follow its parent")
+        expected = sha256_hex(
+            self.model_dump(mode="json", exclude={"result_hash"})
+        )
+        if self.result_hash != expected:
+            raise ValueError("result_hash does not match Host candidate training")
+        return self
+
+    @classmethod
+    def create(cls, **values: Any) -> "HostCandidateTrainingResult":
+        payload = cls.model_construct(**values).model_dump(
+            mode="json", exclude={"result_hash"}
+        )
+        return cls(**payload, result_hash=sha256_hex(payload))
 
 
 class DistillationResult(ContractModel):

@@ -11,6 +11,7 @@ from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import serialize_knowledge_artifact
 from shared.protocol import (
     AlignmentConfig,
+    HostCandidateTrainingResult,
     LoraProfile,
     ModelProfile,
     RoundCreateRequest,
@@ -36,6 +37,40 @@ def profile(role: str) -> ModelProfile:
 
 
 class ProtocolSecurityTests(unittest.TestCase):
+    def test_host_candidate_result_hash_and_version_are_bound(self) -> None:
+        result = HostCandidateTrainingResult.create(
+            round_id="round-1",
+            manifest_hash="a" * 64,
+            job_hash="b" * 64,
+            parent_adapter_version=0,
+            parent_adapter_hash="c" * 64,
+            candidate_adapter_version=1,
+            candidate_adapter_hash="d" * 64,
+            host_model_profile_hash="e" * 64,
+            execution_profile_hash="f" * 64,
+            host_public_data_epochs=5,
+            optimizer_step_count=2,
+            optimizer_loss=0.5,
+            supervised_answer_loss=0.55,
+            distillation_answer_loss=0.05,
+            trainable_parameter_count=10,
+            total_parameter_count=100,
+            dependency_versions={"torch": "test"},
+            created_at=utc_text(),
+        )
+        payload = result.model_dump(mode="json")
+        payload["optimizer_step_count"] = 3
+        with self.assertRaises(ValidationError):
+            HostCandidateTrainingResult.model_validate(payload)
+
+        payload = result.model_dump(mode="json")
+        payload["candidate_adapter_version"] = 2
+        payload["result_hash"] = sha256_hex(
+            {key: value for key, value in payload.items() if key != "result_hash"}
+        )
+        with self.assertRaises(ValidationError):
+            HostCandidateTrainingResult.model_validate(payload)
+
     def test_manifest_and_package_signatures_and_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             coordinator = Ed25519Identity.load_or_create(
@@ -65,6 +100,15 @@ class ProtocolSecurityTests(unittest.TestCase):
                 submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
             )
             self.assertTrue(manifest.verify_signature(coordinator.public_key_b64))
+            self.assertEqual(manifest.host_public_data_epochs, 5)
+            self.assertEqual(
+                manifest.maximum_host_training_job_bytes,
+                256 * 1024 * 1024,
+            )
+            tampered_manifest = manifest.model_dump(mode="json")
+            tampered_manifest["host_public_data_epochs"] = 1
+            with self.assertRaises(ValidationError):
+                RoundManifest.model_validate(tampered_manifest)
             samples = deterministic_knowledge_samples(
                 manifest=manifest,
                 participant_id="client-a",

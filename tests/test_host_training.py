@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import httpx
 from pydantic import ValidationError
 
+from coordinator.service import ConflictError, CoordinatorService, HostGateway
 from host.model_profiles import (
     GRANITE_3_3_2B_HOST_PROFILE_ID,
     pinned_host_profile,
@@ -24,6 +25,7 @@ from host.peft_backend import (
     HostBaselineResult,
     InitializedHostAdapter,
     TransformersPeftHostBackend,
+    selective_host_loss,
 )
 from host.runtime import HostRuntime, HostRuntimeError, default_host_profile
 from host.training import (
@@ -35,14 +37,20 @@ from host.training import (
     host_execution_profile_from_environment,
 )
 from shared.adapter_checkpoint import AdapterCheckpointMetadata
-from shared.crypto import Ed25519Identity
+from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import (
+    AlignmentConfig,
+    HostCandidateTrainingResult,
+    HostTrainingArtifactDescriptor,
+    HostTrainingJob,
+    HostTrainingJobReceipt,
     HostReferenceDatasetBundle,
     RoundCreateRequest,
     RoundManifest,
+    RoundState,
     utc_text,
 )
 from shared.reference_dataset import (
@@ -105,6 +113,7 @@ class FakeHostPeftBackend:
     def __init__(self) -> None:
         self.calls = 0
         self.generate_calls = 0
+        self.train_calls = 0
         self.initialized = fake_initialized_adapter()
         self.contract = self.initialized.initialization.contract
         self.execution_profile = (
@@ -161,6 +170,41 @@ class FakeHostPeftBackend:
             validation=validation,
         )
 
+    def train_candidate(self, job, artifact_path) -> HostCandidateTrainingResult:
+        self.train_calls += 1
+        self.asserted_artifact_path = Path(artifact_path)
+        return HostCandidateTrainingResult.create(
+            round_id=job.manifest.round_id,
+            manifest_hash=job.manifest.manifest_hash,
+            job_hash=job.job_hash,
+            parent_adapter_version=job.host_adapter_version,
+            parent_adapter_hash=self.initialized.metadata.checkpoint_hash,
+            candidate_adapter_version=job.host_adapter_version + 1,
+            candidate_adapter_hash="c" * 64,
+            host_model_profile_hash=job.host_model_profile_hash,
+            execution_profile_hash=self.execution_profile.profile_hash(),
+            host_public_data_epochs=job.host_public_data_epochs,
+            supervised_loss_weight=0.9,
+            distillation_loss_weight=0.1,
+            loss_type="ce",
+            temperature=1.0,
+            optimizer_step_count=1,
+            optimizer_loss=0.75,
+            supervised_answer_loss=0.8,
+            distillation_answer_loss=0.3,
+            trainable_parameter_count=1024,
+            total_parameter_count=2_000_000_000,
+            lora_tensors_changed=True,
+            frozen_base_unchanged=True,
+            reload_verified=True,
+            dependency_versions={"torch": "test"},
+            created_at=utc_text(),
+        )
+
+    def validate_candidate(self, result) -> Path:
+        self.validated_candidate = result
+        return Path("/test/candidates") / result.round_id
+
 
 def reference_sample(sample_id: str) -> ReferenceSample:
     return ReferenceSample(
@@ -182,6 +226,8 @@ def host_round_bundle(
     maximum_sequence_length: int = 128,
     top_k: int = 2,
     maximum_knowledge_package_bytes: int = 1024 * 1024,
+    host_public_data_epochs: int = 5,
+    alignment: AlignmentConfig | None = None,
 ) -> tuple[RoundManifest, HostReferenceDatasetBundle]:
     reference = reference or [
         reference_sample("dp-1"),
@@ -205,6 +251,8 @@ def host_round_bundle(
         truncation_policy="reject",
         top_k=top_k,
         maximum_knowledge_package_bytes=maximum_knowledge_package_bytes,
+        host_public_data_epochs=host_public_data_epochs,
+        alignment=alignment or AlignmentConfig(),
     )
     manifest = RoundManifest.create_signed(
         identity=Ed25519Identity(Ed25519PrivateKey.generate()),
@@ -226,7 +274,141 @@ def host_round_bundle(
     )
 
 
+def write_test_host_training_job(
+    manifest: RoundManifest,
+    path: Path,
+    *,
+    integration_audit_hash: str = "e" * 64,
+) -> HostTrainingJob:
+    import numpy as np
+    from safetensors.numpy import save as save_safetensors
+
+    sample_ids = list(manifest.sample_ids)
+    if manifest.top_k != 2:
+        raise ValueError("test artifact requires top-k 2")
+    answer_token_ids = [2 + index % 64 for index in range(len(sample_ids))]
+    alternate_token_ids = [
+        128 + index % 64 for index in range(len(sample_ids))
+    ]
+    input_rows = [
+        [1, token_id, 0] for token_id in answer_token_ids
+    ]
+    attention_rows = [[1, 1, 0] for _ in sample_ids]
+    label_rows = [
+        [-100, token_id, -100] for token_id in answer_token_ids
+    ]
+    sparse_token_rows = [
+        [
+            [1, token_id],
+            [token_id, alternate_token_id],
+            [0, 1],
+        ]
+        for token_id, alternate_token_id in zip(
+            answer_token_ids,
+            alternate_token_ids,
+        )
+    ]
+    tensors = {
+        "input_ids": np.asarray(input_rows, dtype=np.int32),
+        "attention_mask": np.asarray(attention_rows, dtype=np.uint8),
+        "labels": np.asarray(label_rows, dtype=np.int32),
+        "sparse_target_token_ids": np.asarray(
+            sparse_token_rows,
+            dtype=np.int32,
+        ),
+        "sparse_target_probabilities": np.tile(
+            np.asarray([0.75, 0.25], dtype=np.float32),
+            (len(sample_ids), 3, 1),
+        ),
+        "sparse_target_valid_mask": np.ones(
+            (len(sample_ids), 3, 2), dtype=np.uint8
+        ),
+    }
+    artifact = save_safetensors(tensors)
+    path.write_bytes(artifact)
+    trainer_inputs_hash = sha256_hex(
+        {
+            "sample_ids": sample_ids,
+            "input_ids": [row[:2] for row in input_rows],
+            "attention_lengths": [2 for _ in sample_ids],
+            "labels": [row[:2] for row in label_rows],
+            "pad_token_id": 0,
+            "target_token_ids": tensors[
+                "sparse_target_token_ids"
+            ].tolist(),
+            "target_probabilities": tensors[
+                "sparse_target_probabilities"
+            ].tolist(),
+            "target_valid_mask": tensors[
+                "sparse_target_valid_mask"
+            ].astype(bool).tolist(),
+        }
+    )
+    descriptor = HostTrainingArtifactDescriptor(
+        byte_size=len(artifact),
+        sha256=sha256_hex(artifact),
+        sample_count=len(sample_ids),
+        sample_ids_sha256=sha256_hex(sample_ids),
+        padded_sequence_length=3,
+        top_k=manifest.top_k,
+        pad_token_id=0,
+        trainer_inputs_sha256=trainer_inputs_hash,
+    )
+    return HostTrainingJob.create(
+        manifest=manifest,
+        dataset_hash="d" * 64,
+        integration_audit_hash=integration_audit_hash,
+        accepted_client_ids=["client-a"],
+        sample_ids=sample_ids,
+        host_adapter_version=manifest.current_host_adapter_version,
+        host_model_profile_hash=manifest.host_model_profile.profile_hash(),
+        host_public_data_epochs=manifest.host_public_data_epochs,
+        distillation=manifest.distillation,
+        artifact=descriptor,
+        created_at=utc_text(),
+    )
+
+
 class GraniteHostTrainingContractTests(unittest.TestCase):
+    def test_selective_loss_is_answer_only_and_uses_agreed_weights(self) -> None:
+        import torch
+
+        logits = torch.tensor(
+            [[[0.2, 1.2, -0.4], [8.0, -8.0, 3.0], [1.0, 1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        inputs = {
+            "labels": torch.tensor([[-100, 1, -100]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 3), dtype=torch.long),
+            "sparse_target_token_ids": torch.tensor(
+                [[[1, 0], [0, 2], [1, 2]]], dtype=torch.long
+            ),
+            "sparse_target_probabilities": torch.tensor(
+                [[[0.8, 0.2], [0.5, 0.5], [0.5, 0.5]]],
+                dtype=torch.float32,
+            ),
+            "sparse_target_valid_mask": torch.ones(
+                (1, 3, 2), dtype=torch.bool
+            ),
+        }
+        combined, supervised, distillation = selective_host_loss(
+            torch, logits, inputs
+        )
+        self.assertTrue(
+            torch.allclose(combined, 0.9 * supervised + 0.1 * distillation)
+        )
+
+        changed = logits.clone()
+        changed[:, 1:, :] = torch.tensor(
+            [[[100.0, -100.0, 50.0], [-50.0, 100.0, -100.0]]]
+        )
+        changed_combined, changed_supervised, changed_distillation = (
+            selective_host_loss(torch, changed, inputs)
+        )
+        self.assertTrue(torch.equal(supervised, changed_supervised))
+        self.assertTrue(torch.equal(distillation, changed_distillation))
+        self.assertTrue(torch.equal(combined, changed_combined))
+
     def test_contract_freezes_the_agreed_host_decisions(self) -> None:
         profile = pinned_host_profile()
         contract = GraniteHostTrainingContract.create(profile)
@@ -480,6 +662,173 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
 
 
 class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_trains_sealed_dtw_round_without_blocking_status(self) -> None:
+        manifest, _ = host_round_bundle(
+            round_id="async-candidate-round",
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1"),
+        )
+        backend = FakeHostPeftBackend()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "prepared.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            receipt = HostTrainingJobReceipt(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                job_hash=job.job_hash,
+                artifact_sha256=job.artifact.sha256,
+                artifact_byte_size=job.artifact.byte_size,
+                accepted_client_ids=job.accepted_client_ids,
+            )
+            result = backend.train_candidate(job, artifact)
+            training_started = asyncio.Event()
+            release_training = asyncio.Event()
+
+            async def blocking_train_candidate(value):
+                self.assertEqual(value, job)
+                training_started.set()
+                await release_training.wait()
+                return result
+
+            gateway = mock.Mock()
+            gateway.load_training_job = mock.AsyncMock(return_value=receipt)
+            gateway.train_candidate = mock.AsyncMock(
+                side_effect=blocking_train_candidate
+            )
+            service = CoordinatorService(
+                data_dir=Path(directory) / "coordinator",
+                host_gateway=gateway,
+            )
+            service.store.write_json(
+                f"rounds/{manifest.round_id}/manifest.json",
+                manifest.model_dump(mode="json"),
+            )
+            service.store.write_json(
+                f"rounds/{manifest.round_id}/state.json",
+                RoundState(
+                    round_id=manifest.round_id,
+                    state="SEALED",
+                    accepted_client_ids=["client-a"],
+                    sealed_client_ids=["client-a"],
+                    host_adapter_before=0,
+                    message="trusted quorum reached; submission set sealed",
+                    updated_at=utc_text(),
+                ).model_dump(mode="json"),
+            )
+            service.store.write_json(
+                "rounds/current.json", {"round_id": manifest.round_id}
+            )
+            target = service.store.path(
+                f"rounds/{manifest.round_id}/host_training_job/"
+                "trainer_inputs.safetensors"
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(artifact.read_bytes())
+
+            before = await service.round_status(manifest.round_id)
+            self.assertEqual(before.state, "SEALED")
+            gateway.load_training_job.assert_not_awaited()
+            gateway.train_candidate.assert_not_awaited()
+
+            with mock.patch.object(
+                service, "_load_host_training_job", return_value=job
+            ):
+                pending = asyncio.create_task(service.monitor_once())
+                await asyncio.wait_for(training_started.wait(), timeout=1)
+                during = await asyncio.wait_for(
+                    service.round_status(manifest.round_id), timeout=1
+                )
+                self.assertEqual(during.state, "DISTILLING")
+                self.assertIn("optimization is running", during.message)
+                release_training.set()
+                await pending
+
+            after = service.get_state(manifest.round_id)
+            self.assertEqual(after.state, "DISTILLING")
+            self.assertIn("awaiting Step 5.6", after.message)
+            self.assertIsNone(after.host_adapter_after)
+            self.assertIsNone(after.adapter_promoted)
+            gateway.load_training_job.assert_awaited_once()
+            gateway.train_candidate.assert_awaited_once_with(job)
+            persisted = HostCandidateTrainingResult.model_validate(
+                service.store.read_json(
+                    f"rounds/{manifest.round_id}/host_training_job/"
+                    "candidate_result.json"
+                )
+            )
+            self.assertEqual(persisted, result)
+
+    async def test_training_job_and_candidate_are_immutable_without_promotion(
+        self,
+    ) -> None:
+        backend = FakeHostPeftBackend()
+        manifest, bundle = host_round_bundle(
+            alignment=AlignmentConfig(
+                strategy="dtw",
+                profile_version="test-v1",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=pinned_host_profile(),
+                training_execution_profile=backend.execution_profile,
+                peft_backend=backend,
+            )
+            runtime.load_reference_data(bundle)
+            artifact_path = Path(directory) / "trainer-inputs.safetensors"
+            job = write_test_host_training_job(manifest, artifact_path)
+            adapter_before = runtime.active_adapter()
+            app = create_host_app(
+                runtime,
+                internal_token_override="internal-test-token",
+            )
+            transport = httpx.ASGITransport(app=app)
+            gateway = HostGateway(
+                "http://host",
+                "internal-test-token",
+                transport=transport,
+            )
+
+            receipt = await gateway.load_training_job(job, artifact_path)
+            self.assertEqual(receipt.job_hash, job.job_hash)
+
+            retry = await gateway.load_training_job(job, artifact_path)
+            self.assertEqual(retry, receipt)
+
+            candidate = await gateway.train_candidate(job)
+            self.assertEqual(candidate.parent_adapter_version, 0)
+            self.assertEqual(candidate.candidate_adapter_version, 1)
+            self.assertEqual(candidate.optimizer_step_count, 1)
+            self.assertTrue(candidate.lora_tensors_changed)
+            self.assertTrue(candidate.frozen_base_unchanged)
+            self.assertTrue(candidate.reload_verified)
+            self.assertEqual(runtime.active_adapter(), adapter_before)
+            self.assertEqual(backend.train_calls, 1)
+
+            candidate_retry = await gateway.train_candidate(job)
+            self.assertEqual(candidate_retry, candidate)
+            self.assertEqual(backend.train_calls, 1)
+
+            changed = write_test_host_training_job(
+                manifest,
+                artifact_path,
+                integration_audit_hash="f" * 64,
+            )
+            with self.assertRaisesRegex(ConflictError, "returned 409"):
+                await gateway.load_training_job(changed, artifact_path)
+
+            self.assertEqual(runtime.active_adapter(), adapter_before)
+            root = runtime.store.path(
+                f"rounds/{manifest.round_id}/training_job"
+            )
+            self.assertTrue((root / "job.json").is_file())
+            self.assertTrue((root / "trainer_inputs.safetensors").is_file())
+            self.assertTrue(
+                runtime.store.path(
+                    f"rounds/{manifest.round_id}/candidate/result.json"
+                ).is_file()
+            )
+
     async def test_inference_runs_off_loop_and_rejects_a_concurrent_job(self) -> None:
         backend = FakeHostPeftBackend()
         manifest, bundle = host_round_bundle()
@@ -545,6 +894,58 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
     "set LEGALFEDLLM_RUN_REAL_HOST_TESTS=true for the pinned Granite Host",
 )
 class RealHostAdapterAcceptanceTests(unittest.TestCase):
+    def test_train_reload_and_retain_host_candidate_without_promotion(self) -> None:
+        profile = pinned_host_profile()
+        execution = host_execution_profile_from_environment()
+        smoke_sample_count = (
+            2
+            * execution.micro_batch_size
+            * execution.gradient_accumulation_steps
+        )
+        smoke_reference = [
+            reference_sample(f"dp-smoke-{index:04d}")
+            for index in range(smoke_sample_count)
+        ]
+        manifest, bundle = host_round_bundle(
+            reference=smoke_reference,
+            round_id="real-host-candidate-smoke",
+            host_public_data_epochs=execution.public_data_epochs,
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=backend,
+            )
+            runtime.load_reference_data(bundle)
+            artifact = Path(directory) / "candidate-smoke.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            runtime.load_training_job(job, artifact)
+            active_before = runtime.active_adapter()
+
+            result = runtime.train_candidate(job)
+
+            self.assertGreaterEqual(result.optimizer_step_count, 2)
+            self.assertTrue(result.lora_tensors_changed)
+            self.assertTrue(result.frozen_base_unchanged)
+            self.assertTrue(result.reload_verified)
+            self.assertEqual(runtime.active_adapter(), active_before)
+            metadata, candidate_path = backend.checkpoints.candidate(
+                manifest.round_id,
+                result.candidate_adapter_version,
+            )
+            self.assertEqual(metadata.checkpoint_hash, result.candidate_adapter_hash)
+            self.assertTrue(
+                (candidate_path / "adapter_model.safetensors").is_file()
+            )
+
     def test_initialize_infer_validate_package_and_restart(self) -> None:
         profile = pinned_host_profile()
         execution = host_execution_profile_from_environment()

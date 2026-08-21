@@ -17,6 +17,10 @@ try:
         TokenizerEndpoint,
     )
     from shared.crypto import sha256_hex
+    from shared.distillation_artifact import (
+        load_host_training_artifact,
+        write_host_training_artifact,
+    )
     from shared.fedmkt_core.integration import (
         DistillationIntegrationError,
         TrustedClientQuorumError,
@@ -29,6 +33,7 @@ try:
     from shared.protocol import (
         KnowledgePackage,
         KnowledgeSample,
+        LoraProfile,
         ModelProfile,
         SafetyReport,
     )
@@ -98,7 +103,7 @@ def endpoint(
 
 
 def model_profile(value: TokenizerEndpoint) -> ModelProfile:
-    return ModelProfile.model_construct(
+    return ModelProfile(
         role=value.role,
         profile_id=value.profile_id,
         model_id=value.model_id,
@@ -109,8 +114,10 @@ def model_profile(value: TokenizerEndpoint) -> ModelProfile:
         tokenizer_revision=value.tokenizer_revision,
         tokenizer_class=value.tokenizer_class,
         vocabulary_size=value.vocabulary_size,
+        prompt_template_hash=HASH,
         tokenizer_chat_template_hash=value.tokenizer_chat_template_hash,
         chat_template_mode=value.chat_template_mode,
+        lora=LoraProfile(rank=8),
     )
 
 
@@ -421,6 +428,193 @@ class FedMKTIntegrationTests(unittest.TestCase):
             loss,
             torch.tensor(math.log(self.host_endpoint.vocabulary_size)),
         )
+
+    def test_sparse_trainer_inputs_round_trip_through_safetensors(self) -> None:
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.integrate(directory)
+            first_path = Path(directory) / "first.safetensors"
+            second_path = Path(directory) / "second.safetensors"
+            descriptor = write_host_training_artifact(
+                first_path,
+                result,
+                pad_token_id=self.host_endpoint.pad_token_id or 0,
+                maximum_bytes=1024 * 1024,
+            )
+            second_descriptor = write_host_training_artifact(
+                second_path,
+                result,
+                pad_token_id=self.host_endpoint.pad_token_id or 0,
+                maximum_bytes=1024 * 1024,
+            )
+            tensors = load_host_training_artifact(
+                first_path,
+                descriptor,
+                result.sample_ids,
+                maximum_bytes=1024 * 1024,
+                vocabulary_size=self.host_endpoint.vocabulary_size,
+            )
+
+            self.assertEqual(descriptor, second_descriptor)
+            self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+            self.assertEqual(
+                descriptor.trainer_inputs_sha256,
+                result.audit.trainer_inputs_sha256,
+            )
+            self.assertEqual(tensors["input_ids"].dtype, np.dtype("int32"))
+            self.assertEqual(tensors["labels"].dtype, np.dtype("int32"))
+            self.assertEqual(
+                tensors["sparse_target_token_ids"].dtype,
+                np.dtype("int32"),
+            )
+            for name, value in result.trainer_inputs().items():
+                expected = value.detach().cpu().numpy()
+                if name in {"attention_mask", "sparse_target_valid_mask"}:
+                    expected = expected.astype(np.uint8)
+                elif name != "sparse_target_probabilities":
+                    expected = expected.astype(np.int32)
+                np.testing.assert_array_equal(tensors[name], expected)
+
+            tampered = descriptor.model_copy(
+                update={"trainer_inputs_sha256": "f" * 64}
+            )
+            with self.assertRaisesRegex(ValueError, "semantic tensor hash"):
+                load_host_training_artifact(
+                    first_path,
+                    tampered,
+                    result.sample_ids,
+                    maximum_bytes=1024 * 1024,
+                    vocabulary_size=self.host_endpoint.vocabulary_size,
+                )
+            oversized_path = Path(directory) / "oversized.safetensors"
+            with self.assertRaisesRegex(ValueError, "tensors exceed"):
+                write_host_training_artifact(
+                    oversized_path,
+                    result,
+                    pad_token_id=self.host_endpoint.pad_token_id or 0,
+                    maximum_bytes=128,
+                )
+            self.assertFalse(oversized_path.exists())
+
+    def test_coordinator_freezes_one_immutable_host_training_job(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
+        from coordinator.service import CoordinatorService, HostGateway
+        from shared.crypto import Ed25519Identity
+        from shared.prompt import PROMPT_TEMPLATE
+        from shared.protocol import (
+            AlignmentConfig,
+            RoundCreateRequest,
+            RoundManifest,
+        )
+
+        request = RoundCreateRequest(
+            selected_client_ids=list(self.selected_client_ids),
+            trusted_client_quorum=2,
+            reference_dataset_id="reference-1",
+            reference_dataset_hash="1" * 64,
+            sample_ids=list(self.sample_ids),
+            prompt_template=PROMPT_TEMPLATE,
+            label_format="causal_lm",
+            maximum_sequence_length=128,
+            truncation_policy="reject",
+            top_k=2,
+            host_public_data_epochs=1,
+            alignment=AlignmentConfig(
+                strategy="dtw",
+                profile_version="test-v1",
+            ),
+            maximum_host_training_job_bytes=1024 * 1024,
+        )
+        manifest = RoundManifest.create_signed(
+            identity=Ed25519Identity(Ed25519PrivateKey.generate()),
+            round_id="round-1",
+            coordinator_id="coordinator",
+            current_host_adapter_version=3,
+            host_model_profile=model_profile(self.host_endpoint),
+            selected_client_profile_hashes={
+                client_id: "b" * 64 for client_id in self.selected_client_ids
+            },
+            request=request,
+            submission_deadline=(
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = CoordinatorService(
+                data_dir=directory,
+                host_gateway=HostGateway("http://host", "test-token"),
+            )
+            reference_bundle = SimpleNamespace(reference_samples=[object()])
+            encoded = [
+                SimpleNamespace(sample_id=sample_id, labels=self.labels[sample_id])
+                for sample_id in self.sample_ids
+            ]
+            with (
+                mock.patch(
+                    "coordinator.service.resolve_alignment_profile",
+                    return_value=self.profile,
+                ),
+                mock.patch(
+                    "coordinator.service.load_pinned_tokenizer",
+                    side_effect=[self.host_tokenizer, self.client_tokenizer],
+                ),
+                mock.patch.object(
+                    service,
+                    "_host_reference_dataset_bundle",
+                    return_value=reference_bundle,
+                ),
+                mock.patch(
+                    "coordinator.service.encode_reference_samples",
+                    return_value=encoded,
+                ),
+            ):
+                first = service._prepare_host_training_job(  # noqa: SLF001
+                    manifest=manifest,
+                    baseline=self.host_package,
+                    baseline_samples=self.host_samples,
+                    packages=self.client_packages,
+                    client_samples=self.client_samples,
+                    reports=self.safety_reports,
+                )
+                second = service._prepare_host_training_job(  # noqa: SLF001
+                    manifest=manifest,
+                    baseline=self.host_package,
+                    baseline_samples=self.host_samples,
+                    packages=self.client_packages,
+                    client_samples=self.client_samples,
+                    reports=self.safety_reports,
+                )
+
+            self.assertEqual(first, second)
+            self.assertEqual(first.accepted_client_ids, ["client-b", "client-a"])
+            self.assertEqual(first.host_public_data_epochs, 1)
+            self.assertEqual(first.sample_ids, self.sample_ids)
+            self.assertEqual(
+                first.artifact.trainer_inputs_sha256,
+                service.store.read_json(
+                    "rounds/round-1/host_training_job/integration_audit.json"
+                )["trainer_inputs_sha256"],
+            )
+            self.assertTrue(
+                service.store.path(
+                    "rounds/round-1/host_training_job/"
+                    "trainer_inputs.safetensors"
+                ).is_file()
+            )
+            self.assertFalse(
+                service.store.exists(
+                    "rounds/round-1/validated_distillation_dataset.json"
+                )
+            )
 
     def test_mixed_client_profiles_use_independent_signed_mappings(self) -> None:
         mixed_packages = [

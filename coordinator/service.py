@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import os
 import secrets
 from datetime import timedelta
 from pathlib import Path
@@ -13,9 +14,14 @@ from coordinator.reference_data import CoordinatorReferenceData
 
 from shared.alignment_profiles import (
     UnsupportedAlignmentProfile,
+    resolve_alignment_profile,
     validate_alignment_pair,
 )
-from shared.crypto import Ed25519Identity
+from shared.crypto import Ed25519Identity, canonical_json_bytes
+from shared.distillation_artifact import (
+    load_host_training_artifact,
+    write_host_training_artifact,
+)
 from shared.fedmkt_core import (
     dual_min_ce_select,
     inspect_knowledge_package,
@@ -41,12 +47,18 @@ from shared.protocol import (
     utc_text,
     HostReferenceDatasetBundle,
     HostReferenceDatasetReceipt,
+    HostCandidateTrainingResult,
+    HostTrainingJob,
+    HostTrainingJobReceipt,
 )
 from shared.storage import JsonFileStore
 from shared.reference_dataset import (
     ReferenceDatasetIdentity,
     verify_reference_dataset,
 )
+from shared.reference_knowledge import encode_reference_samples
+from shared.tokenizer_validation import load_pinned_tokenizer
+from shared.vocabulary_mapping import VocabularyMappingCache
 
 
 class CoordinatorError(RuntimeError):
@@ -180,6 +192,58 @@ class HostGateway:
             maximum_bytes=job.manifest.maximum_knowledge_package_bytes,
         )
         return DistillationResult.model_validate(payload)
+
+    async def load_training_job(
+        self,
+        job: HostTrainingJob,
+        artifact_path: str | Path,
+    ) -> HostTrainingJobReceipt:
+        with Path(artifact_path).open("rb") as artifact:
+            files = [
+                (
+                    "job",
+                    (
+                        "job.json",
+                        canonical_json_bytes(job.model_dump(mode="json")),
+                        "application/json",
+                    ),
+                ),
+                (
+                    "artifact",
+                    (
+                        "trainer_inputs.safetensors",
+                        artifact,
+                        "application/octet-stream",
+                    ),
+                ),
+            ]
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+                transport=self.transport,
+                headers={"X-Internal-Token": self.internal_token},
+            ) as client:
+                response = await client.post(
+                    "/internal/v1/training-job",
+                    files=files,
+                )
+        if response.status_code >= 400:
+            raise ConflictError(
+                f"Host runtime returned {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+        return HostTrainingJobReceipt.model_validate(response.json())
+
+    async def train_candidate(
+        self,
+        job: HostTrainingJob,
+    ) -> HostCandidateTrainingResult:
+        payload = await self._request(
+            "POST",
+            "/internal/v1/train-candidate",
+            json=job.model_dump(mode="json"),
+        )
+        return HostCandidateTrainingResult.model_validate(payload)
 
     async def generate(self, prompt: str, max_new_tokens: int) -> dict[str, Any]:
         return await self._request(
@@ -390,11 +454,26 @@ class CoordinatorService:
                         )
                 except UnsupportedAlignmentProfile as exc:
                     raise ConflictError(str(exc)) from exc
-                raise ConflictError(
-                    f"alignment profile {request.alignment.profile_id!r} is "
-                    "recognized, but real alignment execution is not yet "
-                    "available"
-                )
+                if host_identity.model_profile.training_backend != "transformers":
+                    raise ConflictError(
+                        "real DTW rounds require the Transformers Host backend"
+                    )
+                fixed_distillation = request.distillation
+                if (
+                    fixed_distillation.loss_type != "ce"
+                    or fixed_distillation.lm_loss_weight != 0.9
+                    or fixed_distillation.temperature != 1.0
+                    or fixed_distillation.minimum_validation_improvement != 0.001
+                ):
+                    raise ConflictError(
+                        "real DTW rounds require CE, temperature 1.0, "
+                        "language-model loss weight 0.9 and validation "
+                        "improvement 0.001"
+                    )
+                if request.truncation_policy != "reject":
+                    raise ConflictError(
+                        "real DTW rounds require reject-without-truncation"
+                    )
 
             counter = 0
             if self.store.exists("rounds/counter.json"):
@@ -459,7 +538,7 @@ class CoordinatorService:
         if not self.store.exists("rounds/current.json"):
             return
         round_id = self.store.read_json("rounds/current.json")["round_id"]
-        await self.advance(round_id)
+        await self.advance(round_id, process_dtw=True)
 
     async def current_manifest(self) -> RoundManifest:
         if not self.store.exists("rounds/current.json"):
@@ -472,7 +551,8 @@ class CoordinatorService:
         await self.advance(round_id)
         return self.get_state(round_id)
 
-    async def advance(self, round_id: str) -> None:
+    async def advance(self, round_id: str, *, process_dtw: bool = False) -> None:
+        deferred_dtw: tuple[RoundManifest, RoundState] | None = None
         async with self._lock:
             state = self.get_state(round_id)
             manifest = self.get_manifest(round_id)
@@ -490,7 +570,13 @@ class CoordinatorService:
                     )
                     return
             if state.state in {"SEALED", "DISTILLING"}:
-                await self._process_sealed_round(manifest, state)
+                if manifest.alignment.strategy == "dtw":
+                    if process_dtw:
+                        deferred_dtw = manifest, state
+                else:
+                    await self._process_sealed_round(manifest, state)
+        if deferred_dtw is not None:
+            await self._process_sealed_round(*deferred_dtw)
 
     async def submit_knowledge(
         self,
@@ -636,7 +722,8 @@ class CoordinatorService:
                 state.message = "trusted quorum reached; submission set sealed"
                 state.updated_at = utc_text(self.now_fn())
                 self._write_state(state)
-                await self._process_sealed_round(manifest, state)
+                if manifest.alignment.strategy != "dtw":
+                    await self._process_sealed_round(manifest, state)
                 state = self.get_state(manifest.round_id)
 
             return SubmissionReceipt(
@@ -829,11 +916,269 @@ class CoordinatorService:
                 f"Host Knowledge Package artifact is invalid: {exc}"
             ) from exc
 
+    def _load_host_training_job(
+        self,
+        manifest: RoundManifest,
+    ) -> HostTrainingJob | None:
+        from shared.fedmkt_core.integration import DistillationIntegrationAudit
+
+        root = f"rounds/{manifest.round_id}/host_training_job"
+        job_path = f"{root}/job.json"
+        audit_path = f"{root}/integration_audit.json"
+        artifact_path = f"{root}/trainer_inputs.safetensors"
+        existing = (
+            self.store.exists(job_path),
+            self.store.exists(audit_path),
+            self.store.exists(artifact_path),
+        )
+        if not any(existing):
+            return None
+        if not all(existing):
+            raise ConflictError("persisted Host training job is incomplete")
+        try:
+            job = HostTrainingJob.model_validate(self.store.read_json(job_path))
+            audit = DistillationIntegrationAudit.model_validate(
+                self.store.read_json(audit_path)
+            )
+            if job.manifest.manifest_hash != manifest.manifest_hash:
+                raise ValueError("Host training job belongs to another manifest")
+            if job.integration_audit_hash != audit.audit_hash:
+                raise ValueError("Host training job has another integration audit")
+            if job.dataset_hash != audit.dataset_hash:
+                raise ValueError("Host training job has another dataset hash")
+            if (
+                job.artifact.trainer_inputs_sha256
+                != audit.trainer_inputs_sha256
+            ):
+                raise ValueError("Host training job has another tensor hash")
+            load_host_training_artifact(
+                self.store.path(artifact_path),
+                job.artifact,
+                job.sample_ids,
+                maximum_bytes=manifest.maximum_host_training_job_bytes,
+                vocabulary_size=int(
+                    manifest.host_model_profile.vocabulary_size or 0
+                ),
+            )
+            return job
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise ConflictError(
+                f"persisted Host training job is invalid: {exc}"
+            ) from exc
+
+    def _prepare_host_training_job(
+        self,
+        *,
+        manifest: RoundManifest,
+        baseline: KnowledgePackage,
+        baseline_samples: list[KnowledgeSample],
+        packages: list[KnowledgePackage],
+        client_samples: dict[str, list[KnowledgeSample]],
+        reports: dict[str, SafetyReport],
+    ) -> HostTrainingJob:
+        from shared.fedmkt_core.integration import integrate_distillation_round
+
+        root = f"rounds/{manifest.round_id}/host_training_job"
+        job_path = f"{root}/job.json"
+        audit_path = f"{root}/integration_audit.json"
+        artifact_path = f"{root}/trainer_inputs.safetensors"
+        cached = self._load_host_training_job(manifest)
+        if cached is not None:
+            return cached
+
+        profile = resolve_alignment_profile(manifest.alignment.profile_id)
+        cache_dir = os.getenv("HF_HOME") or None
+        token = os.getenv("HF_TOKEN") or None
+        host_tokenizer = load_pinned_tokenizer(
+            profile.host,
+            cache_dir=cache_dir,
+            token=token,
+        )
+        client_tokenizer = load_pinned_tokenizer(
+            profile.client,
+            cache_dir=cache_dir,
+            token=token,
+        )
+        bundle = self._host_reference_dataset_bundle(manifest)
+        encoded = encode_reference_samples(
+            bundle.reference_samples,
+            tokenizer=host_tokenizer.tokenizer,
+            model_profile=manifest.host_model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=manifest.sample_ids,
+        )
+        batch = integrate_distillation_round(
+            profile=profile,
+            client_tokenizer=client_tokenizer,
+            host_tokenizer=host_tokenizer,
+            mapping_cache=VocabularyMappingCache(
+                self.store.path("vocabulary_mappings")
+            ),
+            host_package=baseline,
+            host_samples=baseline_samples,
+            client_packages=packages,
+            client_samples=client_samples,
+            safety_reports=reports,
+            selected_client_ids=manifest.selected_client_ids,
+            trusted_client_quorum=manifest.trusted_client_quorum,
+            labels_by_sample={item.sample_id: item.labels for item in encoded},
+            temperature=manifest.distillation.temperature,
+            loss_type=manifest.distillation.loss_type,
+        )
+        pad_token_id = profile.host.pad_token_id
+        if pad_token_id is None:
+            raise ConflictError("approved Host tokenizer has no padding token")
+        target = self.store.path(artifact_path)
+        try:
+            descriptor = write_host_training_artifact(
+                target,
+                batch,
+                pad_token_id=pad_token_id,
+                maximum_bytes=manifest.maximum_host_training_job_bytes,
+            )
+            job = HostTrainingJob.create(
+                manifest=manifest,
+                dataset_hash=batch.dataset.dataset_hash,
+                integration_audit_hash=batch.audit.audit_hash,
+                accepted_client_ids=batch.dataset.accepted_client_ids,
+                sample_ids=list(batch.sample_ids),
+                host_adapter_version=batch.dataset.host_adapter_version,
+                host_model_profile_hash=manifest.host_model_profile.profile_hash(),
+                host_public_data_epochs=manifest.host_public_data_epochs,
+                distillation=manifest.distillation,
+                artifact=descriptor,
+                created_at=utc_text(self.now_fn()),
+            )
+            self.store.write_json_if_absent(
+                audit_path,
+                batch.audit.model_dump(mode="json"),
+            )
+            self.store.write_json_if_absent(
+                job_path,
+                job.model_dump(mode="json"),
+            )
+            return job
+        except Exception:
+            if not self.store.exists(job_path):
+                self.store.delete(audit_path)
+                self.store.delete(artifact_path)
+            raise
+
+    async def _deliver_host_training_job(
+        self,
+        manifest: RoundManifest,
+        job: HostTrainingJob,
+    ) -> HostTrainingJobReceipt:
+        receipt_path = (
+            f"rounds/{manifest.round_id}/host_training_job/receipt.json"
+        )
+        if self.store.exists(receipt_path):
+            receipt = HostTrainingJobReceipt.model_validate(
+                self.store.read_json(receipt_path)
+            )
+        else:
+            receipt = await self.host.load_training_job(
+                job,
+                self.store.path(
+                    f"rounds/{manifest.round_id}/host_training_job/"
+                    "trainer_inputs.safetensors"
+                ),
+            )
+            self.store.write_json_if_absent(
+                receipt_path,
+                receipt.model_dump(mode="json"),
+            )
+        expected = HostTrainingJobReceipt(
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            job_hash=job.job_hash,
+            artifact_sha256=job.artifact.sha256,
+            artifact_byte_size=job.artifact.byte_size,
+            accepted_client_ids=job.accepted_client_ids,
+        )
+        if receipt != expected:
+            raise ConflictError("Host acknowledged another training job")
+        return receipt
+
+    async def _train_host_candidate(
+        self,
+        manifest: RoundManifest,
+        job: HostTrainingJob,
+    ) -> HostCandidateTrainingResult:
+        result_path = (
+            f"rounds/{manifest.round_id}/host_training_job/"
+            "candidate_result.json"
+        )
+        persisted = None
+        if self.store.exists(result_path):
+            persisted = HostCandidateTrainingResult.model_validate(
+                self.store.read_json(result_path)
+            )
+        result = await self.host.train_candidate(job)
+        if persisted is not None and persisted != result:
+            raise ConflictError("Host candidate result changed after persistence")
+        expected = {
+            "round_id": manifest.round_id,
+            "manifest_hash": manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "parent_adapter_version": manifest.current_host_adapter_version,
+            "candidate_adapter_version": manifest.current_host_adapter_version + 1,
+            "host_model_profile_hash": manifest.host_model_profile.profile_hash(),
+            "host_public_data_epochs": manifest.host_public_data_epochs,
+            "loss_type": "ce",
+            "temperature": 1.0,
+            "supervised_loss_weight": 0.9,
+            "distillation_loss_weight": 0.1,
+        }
+        payload = result.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ConflictError(
+                "Host candidate result differs from the signed round: "
+                + ", ".join(mismatches)
+            )
+        if not self.store.exists(result_path):
+            self.store.write_json_if_absent(
+                result_path,
+                result.model_dump(mode="json"),
+            )
+            self._audit(
+                "host_candidate_trained",
+                {
+                    "round_id": manifest.round_id,
+                    "job_hash": job.job_hash,
+                    "candidate_adapter_version": (
+                        result.candidate_adapter_version
+                    ),
+                    "candidate_adapter_hash": result.candidate_adapter_hash,
+                    "optimizer_step_count": result.optimizer_step_count,
+                    "optimizer_loss": result.optimizer_loss,
+                },
+            )
+        return result
+
     async def _process_sealed_round(
         self, manifest: RoundManifest, state: RoundState
     ) -> None:
         if state.state not in {"SEALED", "DISTILLING"}:
             return
+        if manifest.alignment.strategy == "dtw":
+            cached_job = self._load_host_training_job(manifest)
+            if cached_job is not None:
+                state.state = "DISTILLING"
+                state.message = "Host candidate optimization is running"
+                state.updated_at = utc_text(self.now_fn())
+                self._write_state(state)
+                await self._deliver_host_training_job(manifest, cached_job)
+                result = await self._train_host_candidate(manifest, cached_job)
+                state.state = "DISTILLING"
+                state.message = (
+                    "Host candidate trained and reload-verified; awaiting "
+                    "Step 5.6 private validation"
+                )
+                state.updated_at = utc_text(self.now_fn())
+                self._write_state(state)
+                return
         state.state = "DISTILLING"
         state.message = "constructing the validated Host distillation dataset"
         state.updated_at = utc_text(self.now_fn())
@@ -932,6 +1277,47 @@ class CoordinatorService:
                 )
                 for client_id in state.sealed_client_ids
             }
+            if manifest.alignment.strategy == "dtw":
+                job = await asyncio.to_thread(
+                    self._prepare_host_training_job,
+                    manifest=manifest,
+                    baseline=baseline,
+                    baseline_samples=baseline_samples,
+                    packages=packages,
+                    client_samples=client_samples,
+                    reports=reports,
+                )
+                await self._deliver_host_training_job(manifest, job)
+                result = await self._train_host_candidate(manifest, job)
+                state.state = "DISTILLING"
+                state.message = (
+                    "Host candidate trained and reload-verified; awaiting "
+                    "Step 5.6 private validation"
+                )
+                state.updated_at = utc_text(self.now_fn())
+                self._write_state(state)
+                self._audit(
+                    "host_training_job_prepared",
+                    {
+                        "round_id": manifest.round_id,
+                        "job_hash": job.job_hash,
+                        "dataset_hash": job.dataset_hash,
+                        "integration_audit_hash": (
+                            job.integration_audit_hash
+                        ),
+                        "artifact_sha256": job.artifact.sha256,
+                        "artifact_byte_size": job.artifact.byte_size,
+                        "accepted_client_ids": job.accepted_client_ids,
+                        "candidate_adapter_version": (
+                            result.candidate_adapter_version
+                        ),
+                        "candidate_adapter_hash": (
+                            result.candidate_adapter_hash
+                        ),
+                        "optimizer_step_count": result.optimizer_step_count,
+                    },
+                )
+                return
             dataset = dual_min_ce_select(
                 host_package=baseline,
                 host_samples=baseline_samples,

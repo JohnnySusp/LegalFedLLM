@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import gc
+import math
 import os
 import secrets
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -21,7 +23,15 @@ from shared.adapter_checkpoint import (
     write_atomic_json,
 )
 from shared.alignment_profiles import POC_DTW_PROFILE
-from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest, utc_text
+from shared.distillation_artifact import load_host_training_artifact
+from shared.protocol import (
+    HostCandidateTrainingResult,
+    HostTrainingJob,
+    KnowledgeSample,
+    ModelProfile,
+    RoundManifest,
+    utc_text,
+)
 from shared.reference_dataset import (
     ReferenceDatasetIdentity,
     ReferenceSample,
@@ -50,6 +60,91 @@ class InitializedHostAdapter:
 class HostBaselineResult:
     knowledge_samples: list[KnowledgeSample]
     validation: HostValidationRecord
+
+
+class _TensorRowDataset:
+    def __init__(self, tensors: dict[str, Any]):
+        self.tensors = tensors
+        self.length = int(next(iter(tensors.values())).shape[0])
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return {name: value[index] for name, value in self.tensors.items()}
+
+
+def selective_host_loss(
+    torch: Any,
+    logits: Any,
+    inputs: dict[str, Any],
+) -> tuple[Any, Any, Any]:
+    from shared.fedmkt_core.ml.sparse_targets import (
+        SparseTargetBatch,
+        answer_only_sparse_distillation_loss,
+    )
+
+    labels = inputs["labels"]
+    attention_mask = inputs["attention_mask"]
+    supervised = torch.nn.functional.cross_entropy(
+        logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
+        labels[..., 1:].contiguous().view(-1),
+        ignore_index=-100,
+    )
+    targets = SparseTargetBatch(
+        token_ids=inputs["sparse_target_token_ids"].long(),
+        probabilities=inputs["sparse_target_probabilities"].to(
+            dtype=logits.dtype
+        ),
+        valid_mask=inputs["sparse_target_valid_mask"].bool(),
+    )
+    distillation = answer_only_sparse_distillation_loss(
+        logits,
+        targets,
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_type="ce",
+    )
+    return 0.9 * supervised + 0.1 * distillation, supervised, distillation
+
+
+def _selective_host_trainer_class(transformers: Any, torch: Any) -> type:
+    class SelectiveHostTrainer(transformers.Trainer):
+        supervised_losses: list[float]
+        distillation_losses: list[float]
+
+        def __init__(self, *args: Any, **kwargs: Any):
+            super().__init__(*args, **kwargs)
+            self.supervised_losses = []
+            self.distillation_losses = []
+
+        def compute_loss(
+            self,
+            model: Any,
+            inputs: dict[str, Any],
+            return_outputs: bool = False,
+            num_items_in_batch: Any | None = None,
+        ) -> Any:
+            del num_items_in_batch
+            attention_mask = inputs["attention_mask"]
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            logits = outputs.logits
+            loss, supervised, distillation = selective_host_loss(
+                torch,
+                logits,
+                inputs,
+            )
+            self.supervised_losses.append(float(supervised.detach().float()))
+            self.distillation_losses.append(
+                float(distillation.detach().float())
+            )
+            return (loss, outputs) if return_outputs else loss
+
+    return SelectiveHostTrainer
 
 
 class TransformersPeftHostBackend:
@@ -213,6 +308,256 @@ class TransformersPeftHostBackend:
         finally:
             del reloaded, reloaded_base, model, base_model
             self._release_memory(torch)
+
+    def train_candidate(
+        self,
+        job: HostTrainingJob,
+        artifact_path: str | Path,
+    ) -> HostCandidateTrainingResult:
+        torch, transformers, peft, safetensors = self._dependencies()
+        self._validate_device(torch)
+        if job.host_model_profile_hash != self.model_profile.profile_hash():
+            raise ValueError("Host training job uses another model profile")
+        if job.host_public_data_epochs != self.execution_profile.public_data_epochs:
+            raise ValueError("Host training job epochs differ from execution profile")
+        if (
+            job.distillation.loss_type != "ce"
+            or job.distillation.temperature != 1.0
+            or job.distillation.lm_loss_weight != 0.9
+        ):
+            raise ValueError("Host training job uses an unsupported loss contract")
+
+        current = self.checkpoints.current()
+        if current is None:
+            raise RuntimeError("current Host adapter checkpoint is missing")
+        parent_metadata, parent_path = current
+        if parent_metadata.version != job.host_adapter_version:
+            raise RuntimeError("Host adapter changed before candidate training")
+
+        arrays = load_host_training_artifact(
+            artifact_path,
+            job.artifact,
+            job.sample_ids,
+            maximum_bytes=job.manifest.maximum_host_training_job_bytes,
+            vocabulary_size=int(self.model_profile.vocabulary_size or 0),
+        )
+        tensor_values = {}
+        for name, value in arrays.items():
+            tensor = torch.from_numpy(value)
+            if name in {"input_ids", "labels", "sparse_target_token_ids"}:
+                tensor = tensor.long()
+            elif name == "sparse_target_probabilities":
+                tensor = tensor.float()
+            elif name == "sparse_target_valid_mask":
+                tensor = tensor.bool()
+            tensor_values[name] = tensor
+        dataset = _TensorRowDataset(tensor_values)
+        transformers.set_seed(self.execution_profile.seed)
+        job_id = f"host-train-{secrets.token_hex(8)}"
+        output_dir = self.data_dir / "training_jobs" / job_id
+        output_dir.mkdir(parents=True, exist_ok=False)
+        candidate_path: Path | None = None
+        base_model = None
+        model = None
+        trainer = None
+        reloaded_base = None
+        reloaded = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                parent_path,
+                is_trainable=True,
+            )
+            self._verify_loaded_adapter(model)
+            trainable_count, total_count = self._assert_trainable_parameters(model)
+            frozen_checksum = self._frozen_parameter_checksum(torch, model)
+            if self.execution_profile.gradient_checkpointing:
+                model.config.use_cache = False
+                model.enable_input_require_grads()
+
+            profile = self.execution_profile
+            arguments = transformers.TrainingArguments(
+                output_dir=str(output_dir),
+                num_train_epochs=job.host_public_data_epochs,
+                per_device_train_batch_size=profile.micro_batch_size,
+                gradient_accumulation_steps=profile.gradient_accumulation_steps,
+                learning_rate=profile.learning_rate,
+                lr_scheduler_type=profile.learning_rate_scheduler,
+                warmup_ratio=profile.warmup_ratio,
+                optim=profile.optimizer,
+                adam_beta1=profile.adam_beta1,
+                adam_beta2=profile.adam_beta2,
+                weight_decay=profile.weight_decay,
+                max_grad_norm=profile.maximum_gradient_norm,
+                seed=profile.seed,
+                data_seed=profile.seed,
+                bf16=profile.precision == "bfloat16",
+                fp16=profile.precision == "float16",
+                use_cpu=profile.device == "cpu",
+                gradient_checkpointing=profile.gradient_checkpointing,
+                save_strategy="no",
+                eval_strategy="no",
+                logging_strategy="steps",
+                logging_steps=1,
+                report_to=[],
+                remove_unused_columns=False,
+                dataloader_num_workers=profile.dataloader_num_workers,
+                dataloader_pin_memory=profile.device == "cuda",
+            )
+            trainer_class = _selective_host_trainer_class(transformers, torch)
+            trainer = trainer_class(
+                model=model,
+                args=arguments,
+                train_dataset=dataset,
+            )
+            train_output = trainer.train()
+            optimizer_step_count = int(trainer.state.global_step)
+            optimizer_loss = float(train_output.training_loss)
+            if optimizer_step_count < 1:
+                raise RuntimeError("Host training completed no optimizer step")
+            if not math.isfinite(optimizer_loss) or optimizer_loss < 0:
+                raise RuntimeError("Host training produced an invalid optimizer loss")
+            if not trainer.supervised_losses or not trainer.distillation_losses:
+                raise RuntimeError("Host training did not evaluate both loss terms")
+            supervised_loss = math.fsum(trainer.supervised_losses) / len(
+                trainer.supervised_losses
+            )
+            distillation_loss = math.fsum(trainer.distillation_losses) / len(
+                trainer.distillation_losses
+            )
+            if not math.isfinite(supervised_loss) or supervised_loss < 0:
+                raise RuntimeError("Host supervised loss is invalid")
+            if not math.isfinite(distillation_loss) or distillation_loss < 0:
+                raise RuntimeError("Host distillation loss is invalid")
+
+            model = trainer.accelerator.unwrap_model(
+                trainer.model_wrapped,
+                keep_fp32_wrapper=False,
+            )
+            trainable_count, total_count = self._assert_trainable_parameters(model)
+            if self._frozen_parameter_checksum(torch, model) != frozen_checksum:
+                raise RuntimeError(
+                    "a frozen Host base-model parameter changed during training"
+                )
+            first_length = int(arrays["attention_mask"][0].sum())
+            probe_ids = arrays["input_ids"][0, :first_length].tolist()[:32]
+            expected_logits = self._probe_logits(torch, model, probe_ids)
+
+            candidate_path = self.checkpoints.staging_path(job_id)
+            model.save_pretrained(
+                candidate_path,
+                safe_serialization=True,
+                save_embedding_layers=False,
+            )
+            self._validate_adapter_tensors(safetensors, candidate_path)
+            self._assert_lora_tensors_changed(
+                torch,
+                safetensors,
+                parent_path,
+                candidate_path,
+            )
+            candidate_metadata = self.checkpoints.seal(
+                candidate_path,
+                version=parent_metadata.version + 1,
+                parent=parent_metadata,
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                execution_profile_hash=profile.profile_hash(),
+            )
+
+            del trainer, model, base_model
+            trainer = None
+            model = None
+            base_model = None
+            self._release_memory(torch)
+            reloaded_base = self._load_base_model(torch, transformers)
+            reloaded = peft.PeftModel.from_pretrained(
+                reloaded_base,
+                candidate_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(reloaded)
+            if any(parameter.requires_grad for parameter in reloaded.parameters()):
+                raise RuntimeError("reloaded Host candidate is trainable")
+            actual_logits = self._probe_logits(torch, reloaded, probe_ids)
+            self._require_same_logits(
+                torch,
+                expected_logits,
+                actual_logits,
+                label="reloaded Host candidate changed the training probe",
+                absolute_tolerance=1e-4,
+            )
+            self.checkpoints.store_candidate(candidate_path, candidate_metadata)
+            candidate_path = None
+            return HostCandidateTrainingResult.create(
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                job_hash=job.job_hash,
+                parent_adapter_version=parent_metadata.version,
+                parent_adapter_hash=parent_metadata.checkpoint_hash,
+                candidate_adapter_version=candidate_metadata.version,
+                candidate_adapter_hash=candidate_metadata.checkpoint_hash,
+                host_model_profile_hash=self.model_profile.profile_hash(),
+                execution_profile_hash=profile.profile_hash(),
+                host_public_data_epochs=job.host_public_data_epochs,
+                supervised_loss_weight=0.9,
+                distillation_loss_weight=0.1,
+                loss_type="ce",
+                temperature=1.0,
+                optimizer_step_count=optimizer_step_count,
+                optimizer_loss=optimizer_loss,
+                supervised_answer_loss=supervised_loss,
+                distillation_answer_loss=distillation_loss,
+                trainable_parameter_count=trainable_count,
+                total_parameter_count=total_count,
+                lora_tensors_changed=True,
+                frozen_base_unchanged=True,
+                reload_verified=True,
+                dependency_versions={
+                    "torch": torch.__version__,
+                    "transformers": transformers.__version__,
+                    "peft": peft.__version__,
+                    "safetensors": safetensors.__version__,
+                    "cuda": torch.version.cuda or "none",
+                },
+                created_at=utc_text(),
+            )
+        except Exception:
+            if candidate_path is not None and candidate_path.exists():
+                self.checkpoints.discard_staging(candidate_path)
+            raise
+        finally:
+            del reloaded, reloaded_base, trainer, model, base_model
+            shutil.rmtree(output_dir, ignore_errors=True)
+            self._release_memory(torch)
+
+    def validate_candidate(
+        self,
+        result: HostCandidateTrainingResult,
+    ) -> Path:
+        metadata, path = self.checkpoints.candidate(
+            result.round_id,
+            result.candidate_adapter_version,
+        )
+        expected = {
+            "round_id": result.round_id,
+            "manifest_hash": result.manifest_hash,
+            "version": result.candidate_adapter_version,
+            "checkpoint_hash": result.candidate_adapter_hash,
+            "parent_version": result.parent_adapter_version,
+            "parent_checkpoint_hash": result.parent_adapter_hash,
+            "profile_hash": result.host_model_profile_hash,
+            "execution_profile_hash": result.execution_profile_hash,
+        }
+        payload = metadata.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ValueError(
+                "stored Host candidate differs from its result: "
+                + ", ".join(mismatches)
+            )
+        return path
 
     def generate_baseline(
         self,
@@ -578,6 +923,31 @@ class TransformersPeftHostBackend:
             )
         return trainable_count, total_count
 
+    @staticmethod
+    def _frozen_parameter_checksum(torch: Any, model: Any) -> str:
+        import hashlib
+
+        digest = hashlib.sha256()
+        frozen_count = 0
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                continue
+            frozen_count += 1
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(parameter.shape)).encode("ascii"))
+            digest.update(str(parameter.dtype).encode("ascii"))
+            digest.update(
+                parameter.detach()
+                .contiguous()
+                .view(torch.uint8)
+                .cpu()
+                .numpy()
+                .tobytes()
+            )
+        if frozen_count == 0:
+            raise RuntimeError("Host PEFT model has no frozen base parameters")
+        return digest.hexdigest()
+
     def _validate_adapter_tensors(self, safetensors: Any, path: Path) -> None:
         tensor_path = path / "adapter_model.safetensors"
         with safetensors.safe_open(
@@ -600,6 +970,43 @@ class TransformersPeftHostBackend:
             raise RuntimeError(
                 "initial Host checkpoint is missing configured LoRA targets"
             )
+
+    @staticmethod
+    def _assert_lora_tensors_changed(
+        torch: Any,
+        safetensors: Any,
+        parent_path: Path,
+        candidate_path: Path,
+    ) -> None:
+        with safetensors.safe_open(
+            parent_path / "adapter_model.safetensors",
+            framework="pt",
+            device="cpu",
+        ) as parent_handle:
+            with safetensors.safe_open(
+                candidate_path / "adapter_model.safetensors",
+                framework="pt",
+                device="cpu",
+            ) as candidate_handle:
+                parent_keys = set(parent_handle.keys())
+                candidate_keys = set(candidate_handle.keys())
+                if parent_keys != candidate_keys:
+                    raise RuntimeError(
+                        "Host candidate LoRA tensor keys differ from its parent"
+                    )
+                for key in sorted(parent_keys):
+                    parent_tensor = parent_handle.get_tensor(key)
+                    candidate_tensor = candidate_handle.get_tensor(key)
+                    if (
+                        parent_tensor.shape != candidate_tensor.shape
+                        or parent_tensor.dtype != candidate_tensor.dtype
+                    ):
+                        raise RuntimeError(
+                            "Host candidate LoRA tensor structure differs"
+                        )
+                    if not torch.equal(parent_tensor, candidate_tensor):
+                        return
+        raise RuntimeError("Host training did not change any LoRA tensor")
 
     def _probe_logits(self, torch: Any, model: Any, token_ids: list[int]) -> Any:
         model.eval()

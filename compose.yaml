@@ -11,6 +11,7 @@ services:
       HOST_SERVING_BACKEND: ${HOST_SERVING_BACKEND:-mock}
       HOST_MODEL_ID: ${HOST_MODEL_ID:-legalfedllm/mock-host}
       HOST_OLLAMA_MODEL: ${HOST_OLLAMA_MODEL:-granite3.3:2b}
+      HOST_MAXIMUM_TRAINING_JOB_BYTES: ${HOST_MAXIMUM_TRAINING_JOB_BYTES:-536870912}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-development-internal-token}
     expose:
@@ -31,16 +32,22 @@ services:
       COORDINATOR_DATA_DIR: /data/coordinator
       COORDINATOR_ID: ${COORDINATOR_ID:-legalfedllm-coordinator}
       HOST_RUNTIME_URL: http://host:8002
-      HOST_TIMEOUT_SECONDS: ${HOST_TIMEOUT_SECONDS:-60}
+      HOST_TIMEOUT_SECONDS: ${HOST_TIMEOUT_SECONDS:-21600}
+      COORDINATOR_REFERENCE_DATASET_PATH: ${COORDINATOR_REFERENCE_DATASET_PATH:-}
+      COORDINATOR_VALIDATION_DATASET_PATH: ${COORDINATOR_VALIDATION_DATASET_PATH:-}
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-development-internal-token}
       REGISTRATION_TOKEN: ${REGISTRATION_TOKEN:-development-registration-token}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-development-admin-token}
       MAXIMUM_CLOCK_SKEW_SECONDS: ${MAXIMUM_CLOCK_SKEW_SECONDS:-900}
       ROUND_MONITOR_INTERVAL_SECONDS: ${ROUND_MONITOR_INTERVAL_SECONDS:-2}
+      HF_HOME: /models/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
     ports:
       - "${COORDINATOR_PORT:-8000}:8000"
     volumes:
       - coordinator_data:/data/coordinator
+      - huggingface_cache:/models/huggingface
+      - ${COORDINATOR_DATASET_DIR:-./data/derived/gld2012}:/datasets:ro
     depends_on:
       host:
         condition: service_healthy

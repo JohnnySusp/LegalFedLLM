@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from host.runtime import HostRuntime, HostRuntimeError
-from shared.knowledge_transport import knowledge_transfer_response
+from shared.knowledge_transport import (
+    KnowledgeTransportError,
+    KnowledgeTransportTooLarge,
+    knowledge_transfer_response,
+    receive_knowledge_transfer,
+)
 from shared.protocol import (
     DistillationJob,
     DistillationResult,
+    HostCandidateTrainingResult,
     KnowledgePackage,
     RoundManifest,
     ServiceIdentity,
     HostReferenceDatasetBundle,
     HostReferenceDatasetReceipt,
+    HostTrainingJob,
+    HostTrainingJobReceipt,
 )
 
 
@@ -151,6 +160,57 @@ def create_app(
                 ),
                 metadata_part_name="result",
             )
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/internal/v1/training-job",
+        response_model=HostTrainingJobReceipt,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def load_training_job(request: Request) -> HostTrainingJobReceipt:
+        incoming = host_runtime.store.path(
+            f"incoming/training-job-{secrets.token_hex(8)}.safetensors"
+        )
+        maximum = int(
+            os.getenv(
+                "HOST_MAXIMUM_TRAINING_JOB_BYTES",
+                str(512 * 1024 * 1024),
+            )
+        )
+        try:
+            received = await receive_knowledge_transfer(
+                content_type=request.headers.get("content-type", ""),
+                chunks=request.stream(),
+                artifact_path=incoming,
+                metadata_part_name="job",
+                maximum_content_bytes=maximum,
+            )
+            job = HostTrainingJob.model_validate(received.metadata)
+            return await run_exclusive_ml(
+                host_runtime.load_training_job,
+                job,
+                received.artifact_path,
+            )
+        except KnowledgeTransportTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except (KnowledgeTransportError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            incoming.unlink(missing_ok=True)
+
+    @app.post(
+        "/internal/v1/train-candidate",
+        response_model=HostCandidateTrainingResult,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def train_candidate(
+        job: HostTrainingJob,
+    ) -> HostCandidateTrainingResult:
+        try:
+            return await run_exclusive_ml(host_runtime.train_candidate, job)
         except HostRuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

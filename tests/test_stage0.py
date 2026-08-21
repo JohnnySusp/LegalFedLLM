@@ -122,7 +122,7 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(response.status_code, 409, response.text)
 
-    async def test_pinned_dtw_pair_remains_blocked_before_integration(self) -> None:
+    async def test_pinned_dtw_pair_is_admitted_with_fixed_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stack = Stack(directory)
             stack.host_runtime.model_profile = pinned_host_profile()
@@ -148,7 +148,10 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "reference_dataset_hash": sha256_hex(b"reference"),
                     "sample_ids": ["s1"],
                     "prompt_template": "{question} {answer}",
+                    "maximum_sequence_length": 128,
+                    "truncation_policy": "reject",
                     "top_k": 2,
+                    "host_public_data_epochs": 1,
                     "alignment": {
                         "strategy": "dtw",
                         "profile_version": POC_DTW_PROFILE_VERSION,
@@ -156,10 +159,16 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-            self.assertEqual(response.status_code, 409, response.text)
-            self.assertIn(
-                "real alignment execution is not yet available",
-                response.json()["detail"],
+            self.assertEqual(response.status_code, 201, response.text)
+            manifest = RoundManifest.model_validate(response.json())
+            self.assertEqual(
+                manifest.alignment.profile_id,
+                f"dtw:{POC_DTW_PROFILE_VERSION}",
+            )
+            self.assertEqual(manifest.host_public_data_epochs, 1)
+            self.assertEqual(
+                manifest.maximum_host_training_job_bytes,
+                256 * 1024 * 1024,
             )
 
     async def test_accepted_client_cache_is_immutable(self) -> None:

@@ -14,6 +14,7 @@ from host.training import (
     host_execution_profile_from_environment,
 )
 from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
+from shared.distillation_artifact import load_host_training_artifact
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.ollama import OllamaClient
@@ -21,6 +22,7 @@ from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import (
     DistillationJob,
     DistillationResult,
+    HostCandidateTrainingResult,
     KnowledgePackage,
     LoraProfile,
     ModelProfile,
@@ -28,6 +30,8 @@ from shared.protocol import (
     RoundManifest,
     HostReferenceDatasetBundle,
     HostReferenceDatasetReceipt,
+    HostTrainingJob,
+    HostTrainingJobReceipt,
 )
 from shared.storage import JsonFileStore
 from shared.reference_dataset import (
@@ -574,6 +578,158 @@ class HostRuntime:
         )
         self.store.write_json(result_path, result.model_dump(mode="json"))
         return result
+
+    def load_training_job(
+        self,
+        job: HostTrainingJob,
+        artifact_path: str | Path,
+    ) -> HostTrainingJobReceipt:
+        manifest = job.manifest
+        if manifest.host_model_profile != self.model_profile:
+            raise HostRuntimeError(
+                "Host training job is bound to another model profile"
+            )
+        if manifest.alignment.strategy != "dtw":
+            raise HostRuntimeError("real Host training requires DTW alignment")
+        if self.training_execution_profile is None:
+            raise HostRuntimeError(
+                "Host training execution profile is unavailable"
+            )
+        if job.host_public_data_epochs != (
+            self.training_execution_profile.public_data_epochs
+        ):
+            raise HostRuntimeError(
+                "Host training epochs differ from the execution profile"
+            )
+        active = self.active_adapter()
+        if job.host_adapter_version != int(active["version"]):
+            raise HostRuntimeError(
+                "Host adapter changed before training-job receipt"
+            )
+        self.verify_cached_reference_data(manifest)
+        root = f"rounds/{manifest.round_id}/training_job"
+        job_path = f"{root}/job.json"
+        stored_artifact_path = f"{root}/trainer_inputs.safetensors"
+        existing = (
+            self.store.exists(job_path),
+            self.store.exists(stored_artifact_path),
+        )
+        try:
+            load_host_training_artifact(
+                artifact_path,
+                job.artifact,
+                job.sample_ids,
+                maximum_bytes=manifest.maximum_host_training_job_bytes,
+                vocabulary_size=int(self.model_profile.vocabulary_size or 0),
+            )
+            if any(existing):
+                if not all(existing):
+                    raise ValueError("cached Host training job is incomplete")
+                stored = HostTrainingJob.model_validate(
+                    self.store.read_json(job_path)
+                )
+                if stored.job_hash != job.job_hash:
+                    raise ValueError("cached Host training job is immutable")
+                load_host_training_artifact(
+                    self.store.path(stored_artifact_path),
+                    stored.artifact,
+                    stored.sample_ids,
+                    maximum_bytes=manifest.maximum_host_training_job_bytes,
+                    vocabulary_size=int(self.model_profile.vocabulary_size or 0),
+                )
+            else:
+                try:
+                    self.store.copy_file_if_absent(
+                        stored_artifact_path,
+                        artifact_path,
+                    )
+                    self.store.write_json_if_absent(
+                        job_path,
+                        job.model_dump(mode="json"),
+                    )
+                except Exception:
+                    if not self.store.exists(job_path):
+                        self.store.delete(stored_artifact_path)
+                    raise
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise HostRuntimeError(
+                f"Host training job is invalid: {exc}"
+            ) from exc
+        return HostTrainingJobReceipt(
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            job_hash=job.job_hash,
+            artifact_sha256=job.artifact.sha256,
+            artifact_byte_size=job.artifact.byte_size,
+            accepted_client_ids=job.accepted_client_ids,
+        )
+
+    def train_candidate(
+        self,
+        job: HostTrainingJob,
+    ) -> HostCandidateTrainingResult:
+        if self.peft_backend is None or self.training_execution_profile is None:
+            raise HostRuntimeError("real Host candidate training is unavailable")
+        root = f"rounds/{job.manifest.round_id}/training_job"
+        job_path = f"{root}/job.json"
+        artifact_path = f"{root}/trainer_inputs.safetensors"
+        result_path = f"rounds/{job.manifest.round_id}/candidate/result.json"
+        try:
+            if not self.store.exists(job_path) or not self.store.exists(artifact_path):
+                raise ValueError("Host training job has not been loaded")
+            stored = HostTrainingJob.model_validate(self.store.read_json(job_path))
+            if stored.job_hash != job.job_hash:
+                raise ValueError("Host candidate request uses another training job")
+            active = self.active_adapter()
+            if int(active["version"]) != job.host_adapter_version:
+                raise ValueError("Host adapter changed before candidate training")
+            if self.store.exists(result_path):
+                result = HostCandidateTrainingResult.model_validate(
+                    self.store.read_json(result_path)
+                )
+                self._validate_candidate_result(job, result, active)
+                self.peft_backend.validate_candidate(result)
+                return result
+            result = self.peft_backend.train_candidate(
+                job,
+                self.store.path(artifact_path),
+            )
+            self._validate_candidate_result(job, result, active)
+            self.peft_backend.validate_candidate(result)
+            self.store.write_json_if_absent(
+                result_path,
+                result.model_dump(mode="json"),
+            )
+            if self.active_adapter() != active:
+                raise ValueError("Step 5.5 must not promote the Host candidate")
+            return result
+        except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise HostRuntimeError(f"Host candidate training failed: {exc}") from exc
+
+    def _validate_candidate_result(
+        self,
+        job: HostTrainingJob,
+        result: HostCandidateTrainingResult,
+        active: dict[str, Any],
+    ) -> None:
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "parent_adapter_version": job.host_adapter_version,
+            "parent_adapter_hash": active["artifact_hash"],
+            "candidate_adapter_version": job.host_adapter_version + 1,
+            "host_model_profile_hash": self.model_profile.profile_hash(),
+            "execution_profile_hash": self.training_execution_profile.profile_hash(),
+            "host_public_data_epochs": job.host_public_data_epochs,
+        }
+        payload = result.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ValueError(
+                "Host candidate result differs from its job: "
+                + ", ".join(mismatches)
+            )
 
     async def generate(self, prompt: str, max_new_tokens: int) -> str:
         if self.model_profile.serving_backend == "ollama":

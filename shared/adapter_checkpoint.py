@@ -59,6 +59,7 @@ class AdapterCheckpointStore:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "staging").mkdir(exist_ok=True)
         (self.root / "versions").mkdir(exist_ok=True)
+        (self.root / "candidates").mkdir(exist_ok=True)
 
     def staging_path(self, job_id: str) -> Path:
         if Path(job_id).name != job_id or job_id in {".", ".."}:
@@ -76,6 +77,11 @@ class AdapterCheckpointStore:
 
     def version_path(self, version: int) -> Path:
         return self.root / "versions" / f"v{version:06d}"
+
+    def candidate_path(self, round_id: str, version: int) -> Path:
+        if Path(round_id).name != round_id or round_id in {".", ".."}:
+            raise ValueError("adapter round ID is not safe")
+        return self.root / "candidates" / round_id / f"v{version:06d}"
 
     def next_version(self, minimum: int) -> int:
         version = minimum
@@ -161,6 +167,40 @@ class AdapterCheckpointStore:
             },
         )
         return target
+
+    def store_candidate(
+        self,
+        staging_path: Path,
+        metadata: AdapterCheckpointMetadata,
+    ) -> Path:
+        if metadata.round_id is None or metadata.parent_version is None:
+            raise ValueError("candidate adapter must belong to a round and parent")
+        self._validate_directory(staging_path, metadata)
+        target = self.candidate_path(metadata.round_id, metadata.version)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise FileExistsError(str(target))
+        staging_path.replace(target)
+        return target
+
+    def candidate(
+        self,
+        round_id: str,
+        version: int,
+    ) -> tuple[AdapterCheckpointMetadata, Path]:
+        path = self.candidate_path(round_id, version)
+        metadata_path = path / "checkpoint.json"
+        if not metadata_path.is_file():
+            raise ValueError(
+                f"adapter candidate {round_id!r} version {version} is missing"
+            )
+        metadata = AdapterCheckpointMetadata.model_validate_json(
+            metadata_path.read_text(encoding="utf-8")
+        )
+        if metadata.round_id != round_id or metadata.version != version:
+            raise ValueError("adapter candidate directory has another identity")
+        self._validate_directory(path, metadata)
+        return metadata, path
 
     def current(self) -> tuple[AdapterCheckpointMetadata, Path] | None:
         pointer_path = self.root / "current.json"
