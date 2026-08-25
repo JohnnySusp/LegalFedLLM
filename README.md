@@ -14,10 +14,14 @@ The repository currently combines:
 2. a real canonical shared-reference-dataset boundary;
 3. a deterministic importer for the pinned 2012 Greek Law Digest thesis copy;
 4. signed schema 2.0 Knowledge Packages with exact `safetensors` artifacts; and
-5. one real Qwen Client path using Transformers and PEFT LoRA; and
+5. one real Qwen Client path using Transformers and PEFT LoRA;
 6. an operational CPU path from heterogeneous signed Client packages through
    exact tokenizer validation, demand-driven vocabulary mapping, DTW alignment,
-   binary trust eligibility, minimum-CE selection and sparse trainer targets.
+   binary trust eligibility, minimum-CE selection and sparse trainer targets;
+   and
+7. a real Granite Host path for baseline inference, selective LoRA candidate
+   training, private D^V validation, atomic promotion or rejection, signed
+   post-decision publication and Coordinator round finalization.
 
 The accepted real-Client run trained a Qwen LoRA candidate, performed teacher-
 forced inference over all 565 accepted D^P samples, produced real top-k logits
@@ -59,10 +63,28 @@ signed schema 2.0 Client Knowledge Package
 bounded multipart Coordinator intake and immutable persistence
 ```
 
-The complete mock round continues beyond this point through deterministic
-DualMinCE selection, Host candidate promotion or rollback, signed Host package
-publication and Client reverse synchronization. Those mock stages prove the
-protocol and service behavior, not real Host or reverse-Client learning.
+For the pinned Qwen-to-Granite profile, the real Host path continues through:
+
+```text
+verified Client and Host Knowledge Packages
+        ↓
+trust-gated DTW alignment and minimum-CE teacher selection
+        ↓
+immutable bounded sparse Host training artifact
+        ↓
+selective Granite LoRA candidate training and reload verification
+        ↓
+private active-versus-candidate evaluation over D^V
+        ↓
+atomic promotion or candidate discard with an immutable decision audit
+        ↓
+post-decision Host inference over D^P
+        ↓
+signed Host Knowledge Package verification and round completion
+```
+
+The complete mock path remains available, including Client reverse
+synchronization. Real reverse-Client learning is not yet implemented.
 
 No Client LoRA tensor is sent to the Coordinator or Host. Private prompt and
 answer text is absent from the signed package metadata and numerical artifact.
@@ -108,6 +130,15 @@ answer text is absent from the signed package metadata and numerical artifact.
 - **Operational sparse distillation inputs:** persistent hashed vocabulary maps,
   per-Client DTW alignment, trust/quorum enforcement, deterministic minimum-CE
   selection, answer-only labels and bounded CPU float32 sparse targets.
+- **Real Granite Host lifecycle:** exact pinned baseline inference, immutable
+  sparse training jobs, answer-only `0.9` supervised plus `0.1` selected-teacher
+  optimization, changed-LoRA and frozen-base checks, candidate reload
+  equivalence and restart-safe candidate storage.
+- **Private Host validation and finalization:** macro mean answer-token CE over
+  D^V controls the `0.001` promotion threshold; token-weighted CE is retained as
+  a diagnostic, per-sample D^V metrics remain Host-local, rejected candidate
+  weights are discarded, and the accepted adapter produces a signed D^P Host
+  package before the Coordinator completes the round.
 - **Full-corpus validation runner:** exact D^P identity enforcement, signed
   deterministic package round-trips, mixed-client alignment, two-pass
   determinism checks and a machine-readable local resource report.
@@ -130,8 +161,10 @@ LegalFedLLM/
 │   └── reference_data.py       Coordinator-owned D^P/D^V boundary
 ├── host/
 │   ├── main.py                 Private internal Host API
-│   ├── runtime.py              Host state and mock distillation path
-│   └── model_profiles.py       Exact pinned Granite Host profile
+│   ├── runtime.py              Host state, validation and publication flow
+│   ├── model_profiles.py       Exact pinned Granite Host profile
+│   ├── training.py             Host execution and validation contracts
+│   └── peft_backend.py         Real Granite LoRA and inference execution
 ├── shared/
 │   ├── alignment_profiles.py   Approved per-Client alignment contracts
 │   ├── protocol.py             Manifests, profiles and package schemas
@@ -877,11 +910,8 @@ LegalFedLLM supplies the HTTP, security, persistence and round layers.
 
 LegalFedLLM does not yet provide:
 
-- real-alignment execution through the live Coordinator/Host HTTP round;
-- real Host baseline inference or selective LoRA distillation;
-- real D^V validation and Host adapter promotion/rollback;
 - real reverse Client distillation from a Host package;
-- a complete heterogeneous-model federation round;
+- a recorded authoritative five-epoch, full D^P/D^V heterogeneous-model round;
 - DP-SGD or formal differential-privacy accounting;
 - a learned malicious-package detector;
 - HTTPS, production identity bootstrap or encrypted artifact storage;
@@ -893,10 +923,12 @@ added.
 
 ## Next implementation milestones
 
-### Real Host distillation
+### Authoritative real Host acceptance
 
-Add real Host baseline inference, aligned selective knowledge distillation, D^V
-validation and adapter promotion or rollback.
+Run the complete pinned Qwen-to-Granite round with the five-epoch Host schedule,
+exercise both promotion and forced candidate rejection, and record wall time,
+peak VRAM/RAM, communication volume, selected teachers, validation metrics and
+adapter sizes.
 
 ### Real reverse Client distillation
 
@@ -911,16 +943,15 @@ behavior, adapter sizes and rollback behavior.
 
 ## Accurate project claim
 
-LegalFedLLM now demonstrates a real, pinned Qwen Client that can learn a local
-LoRA adapter from private examples and turn its outputs over the complete frozen
-565-sample D^P into a signed, validated and transportable Knowledge Package. Its
-shared integration core accepts independently signed Qwen and Granite Client
-packages, applies exact per-Client tokenizer mappings and DTW alignment against a
-temporary Granite validation Host, enforces binary trust eligibility and quorum,
-selects one minimum-CE teacher per sample and constructs bounded answer-only
-sparse trainer targets. Private examples and Client-native LoRA tensors remain
-local.
+LegalFedLLM demonstrates a real, pinned Qwen Client that can learn a local LoRA
+adapter from private examples and turn its outputs over the complete frozen
+565-sample D^P into a signed, validated and transportable Knowledge Package. It
+now implements the corresponding pinned Granite Host path through exact
+alignment, selective LoRA candidate training, private D^V validation, atomic
+promotion or rejection, signed post-decision D^P publication and Coordinator
+completion. Private examples, Client-native LoRA tensors and per-sample D^V
+metrics remain local.
 
-It does **not** yet demonstrate real heterogeneous Host learning, reverse real
-Client learning, a completed real-model federation round, formal differential
-privacy, a complete Safe-FedLLM defense or production-ready deployment.
+The repository does **not** yet record an authoritative five-epoch full-round
+acceptance, real reverse-Client learning, formal differential privacy, a complete
+Safe-FedLLM defense or production-ready deployment.
