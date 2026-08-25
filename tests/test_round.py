@@ -10,7 +10,8 @@ from unittest import mock
 
 import httpx
 
-from client.main import CoordinatorGateway, create_app as create_client_app
+from client.main import CoordinatorGateway
+from client.main import create_app as create_client_app
 from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService, HostGateway
@@ -19,6 +20,7 @@ from host.runtime import HostRuntime
 from shared.crypto import canonical_json_bytes, sha256_hex
 from shared.knowledge_artifact import load_package_samples
 from shared.protocol import (
+    ClientReverseTrainingJob,
     KnowledgePackage,
     RoundManifest,
     ValidatedDistillationDataset,
@@ -208,6 +210,44 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 sync = await client.post(f"/v1/rounds/{round_id}/sync")
             self.assertEqual(sync.status_code, 200, sync.text)
             self.assertEqual(sync.json()["last_completed_round"], round_id)
+            self.assertEqual(sync.json()["candidate_adapter_version"], 1)
+            self.assertEqual(sync.json()["serving_adapter_version"], 0)
+
+            reverse_job = ClientReverseTrainingJob.model_validate(
+                json.loads(
+                    (
+                        Path(directory)
+                        / "client-a"
+                        / "reverse_distillation"
+                        / "rounds"
+                        / round_id
+                        / "job.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            self.assertTrue(reverse_job.host_adapter_promoted)
+            self.assertEqual(reverse_job.client_public_data_epochs, 1)
+            self.assertEqual(
+                len(reverse_job.public_data_partition.transfer_sample_ids),
+                2,
+            )
+            self.assertEqual(
+                len(reverse_job.public_data_partition.validation_sample_ids),
+                1,
+            )
+            first_job_hash = reverse_job.job_hash
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app_a),
+                base_url="http://client-a",
+                headers=stack.client_headers,
+            ) as client:
+                retry = await client.post(f"/v1/rounds/{round_id}/sync")
+            self.assertEqual(retry.status_code, 200, retry.text)
+            self.assertEqual(
+                retry.json()["last_reverse_training_job_hash"],
+                first_job_hash,
+            )
+            self.assertEqual(retry.json()["candidate_adapter_version"], 1)
 
             coordinator_root = Path(directory) / "coordinator"
             client_root = Path(directory) / "client-a"
@@ -522,7 +562,7 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_candidate_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stack = Stack(directory, force_validation_failure=True)
-            _, app = stack.client("client-a")
+            runtime, app = stack.client("client-a")
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://client",
@@ -558,6 +598,32 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(status_response.json()["adapter_promoted"])
             self.assertEqual(status_response.json()["host_adapter_after"], 0)
             self.assertEqual(stack.host_runtime.adapter_version, 0)
+            before_sync = runtime.state()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                sync = await client.post(f"/v1/rounds/{round_id}/sync")
+            self.assertEqual(sync.status_code, 200, sync.text)
+            self.assertEqual(
+                sync.json()["candidate_adapter_version"],
+                before_sync["candidate_adapter_version"],
+            )
+            job = ClientReverseTrainingJob.model_validate(
+                json.loads(
+                    (
+                        Path(directory)
+                        / "client-a"
+                        / "reverse_distillation"
+                        / "rounds"
+                        / round_id
+                        / "job.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            self.assertFalse(job.host_adapter_promoted)
+            self.assertEqual(job.accepted_host_adapter_version, 0)
 
 
 if __name__ == "__main__":

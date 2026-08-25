@@ -8,7 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.crypto import Ed25519Identity, sha256_hex, verify_json
-
 from shared.reference_dataset import (
     ReferenceDatasetIdentity,
     ReferenceSample,
@@ -22,6 +21,9 @@ HOST_TRAINING_ARTIFACT_SCHEMA_VERSION = "1.0"
 HOST_TRAINING_JOB_SCHEMA_VERSION = "1.0"
 HOST_CANDIDATE_RESULT_SCHEMA_VERSION = "1.0"
 HOST_CANDIDATE_VALIDATION_SCHEMA_VERSION = "1.0"
+CLIENT_PUBLIC_DATA_PARTITION_SCHEMA_VERSION = "1.0"
+CLIENT_REVERSE_TRAINING_ARTIFACT_SCHEMA_VERSION = "1.0"
+CLIENT_REVERSE_TRAINING_JOB_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
 BASE64_PATTERN = r"^[A-Za-z0-9+/]+={0,2}$"
 
@@ -257,6 +259,8 @@ class RoundCreateRequest(ContractModel):
     top_k: int = Field(default=20, ge=1, le=4096)
     training_epochs: int = Field(default=1, ge=1, le=100)
     host_public_data_epochs: Literal[1, 5] = 5
+    client_public_data_epochs: Literal[1] = 1
+    client_public_validation_fraction: Literal[0.1] = 0.1
     alignment: AlignmentConfig = Field(default_factory=AlignmentConfig)
     distillation: DistillationConfig = Field(default_factory=DistillationConfig)
     dp_policy: DifferentialPrivacyPolicy = Field(default_factory=DifferentialPrivacyPolicy)
@@ -264,6 +268,11 @@ class RoundCreateRequest(ContractModel):
         default=25 * 1024 * 1024, ge=1024, le=2 * 1024 * 1024 * 1024
     )
     maximum_host_training_job_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=1024,
+        le=2 * 1024 * 1024 * 1024,
+    )
+    maximum_client_reverse_training_job_bytes: int = Field(
         default=256 * 1024 * 1024,
         ge=1024,
         le=2 * 1024 * 1024 * 1024,
@@ -315,11 +324,14 @@ class RoundManifest(ContractModel):
     top_k: int = Field(ge=1)
     training_epochs: int = Field(ge=1)
     host_public_data_epochs: Literal[1, 5]
+    client_public_data_epochs: Literal[1]
+    client_public_validation_fraction: Literal[0.1]
     alignment: AlignmentConfig
     distillation: DistillationConfig
     dp_policy: DifferentialPrivacyPolicy
     maximum_knowledge_package_bytes: int = Field(ge=1024)
     maximum_host_training_job_bytes: int = Field(ge=1024)
+    maximum_client_reverse_training_job_bytes: int = Field(ge=1024)
     submission_deadline: str
     round_nonce: str = Field(min_length=16, max_length=256)
     coordinator_id: str = Field(min_length=1, max_length=128)
@@ -424,12 +436,19 @@ class RoundManifest(ContractModel):
             "top_k": request.top_k,
             "training_epochs": request.training_epochs,
             "host_public_data_epochs": request.host_public_data_epochs,
+            "client_public_data_epochs": request.client_public_data_epochs,
+            "client_public_validation_fraction": (
+                request.client_public_validation_fraction
+            ),
             "alignment": request.alignment.model_dump(mode="json"),
             "distillation": request.distillation.model_dump(mode="json"),
             "dp_policy": request.dp_policy.model_dump(mode="json"),
             "maximum_knowledge_package_bytes": request.maximum_knowledge_package_bytes,
             "maximum_host_training_job_bytes": (
                 request.maximum_host_training_job_bytes
+            ),
+            "maximum_client_reverse_training_job_bytes": (
+                request.maximum_client_reverse_training_job_bytes
             ),
             "submission_deadline": submission_deadline,
             "round_nonce": secrets.token_urlsafe(24),
@@ -697,6 +716,152 @@ class HostTrainingArtifactDescriptor(ContractModel):
     top_k: int = Field(ge=1, le=4096)
     pad_token_id: int = Field(ge=0)
     trainer_inputs_sha256: str = Field(pattern=HASH_PATTERN)
+
+
+class ClientPublicDataPartition(ContractModel):
+    schema_version: Literal["1.0"] = CLIENT_PUBLIC_DATA_PARTITION_SCHEMA_VERSION
+    reference_dataset_id: str = Field(min_length=1, max_length=256)
+    reference_dataset_hash: str = Field(pattern=HASH_PATTERN)
+    transfer_sample_ids: list[str] = Field(min_length=1, max_length=100_000)
+    validation_sample_ids: list[str] = Field(max_length=100_000)
+    transfer_sample_ids_sha256: str = Field(pattern=HASH_PATTERN)
+    validation_sample_ids_sha256: str = Field(pattern=HASH_PATTERN)
+    validation_fraction: Literal[0.1] = 0.1
+    partition_hash: str = Field(pattern=HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_partition(self) -> ClientPublicDataPartition:
+        transfer = self.transfer_sample_ids
+        validation = self.validation_sample_ids
+        if len(transfer) != len(set(transfer)):
+            raise ValueError("Client transfer sample IDs must be unique")
+        if len(validation) != len(set(validation)):
+            raise ValueError("Client validation sample IDs must be unique")
+        if set(transfer).intersection(validation):
+            raise ValueError("Client public-data partition overlaps")
+        if self.transfer_sample_ids_sha256 != sha256_hex(transfer):
+            raise ValueError("Client transfer sample hash differs")
+        if self.validation_sample_ids_sha256 != sha256_hex(validation):
+            raise ValueError("Client validation sample hash differs")
+        expected = sha256_hex(
+            self.model_dump(mode="json", exclude={"partition_hash"})
+        )
+        if self.partition_hash != expected:
+            raise ValueError("Client public-data partition hash differs")
+        return self
+
+    @classmethod
+    def create(cls, **values: Any) -> ClientPublicDataPartition:
+        payload = cls.model_construct(**values).model_dump(
+            mode="json", exclude={"partition_hash"}
+        )
+        return cls(**payload, partition_hash=sha256_hex(payload))
+
+
+class ClientReverseTrainingArtifactDescriptor(ContractModel):
+    format: Literal["safetensors"] = KNOWLEDGE_ARTIFACT_FORMAT
+    schema_version: Literal["1.0"] = CLIENT_REVERSE_TRAINING_ARTIFACT_SCHEMA_VERSION
+    byte_size: int = Field(ge=1, le=2 * 1024 * 1024 * 1024)
+    sha256: str = Field(pattern=HASH_PATTERN)
+    sample_count: int = Field(ge=1, le=100_000)
+    sample_ids_sha256: str = Field(pattern=HASH_PATTERN)
+    padded_sequence_length: int = Field(ge=2, le=131_072)
+    top_k: int = Field(ge=1, le=4096)
+    pad_token_id: int = Field(ge=0)
+    trainer_inputs_sha256: str = Field(pattern=HASH_PATTERN)
+
+
+class ClientReverseTrainingJob(ContractModel):
+    schema_version: Literal["1.0"] = CLIENT_REVERSE_TRAINING_JOB_SCHEMA_VERSION
+    manifest: RoundManifest
+    client_id: str = Field(min_length=1, max_length=128)
+    client_model_profile_hash: str = Field(pattern=HASH_PATTERN)
+    parent_adapter_version: int = Field(ge=0)
+    parent_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    accepted_host_adapter_version: int = Field(ge=0)
+    host_package_hash: str = Field(pattern=HASH_PATTERN)
+    host_adapter_promoted: bool
+    public_data_partition: ClientPublicDataPartition
+    host_teacher_sample_ids: list[str] = Field(max_length=100_000)
+    client_public_data_epochs: Literal[1]
+    distillation: DistillationConfig
+    integration_audit_hash: str = Field(pattern=HASH_PATTERN)
+    artifact: ClientReverseTrainingArtifactDescriptor
+    created_at: str
+    job_hash: str = Field(pattern=HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_job(self) -> ClientReverseTrainingJob:
+        parse_utc(self.created_at)
+        manifest = self.manifest
+        partition = self.public_data_partition
+        if partition.reference_dataset_id != manifest.reference_dataset_id:
+            raise ValueError("Client partition uses another reference dataset")
+        if partition.reference_dataset_hash != manifest.reference_dataset_hash:
+            raise ValueError("Client partition uses another dataset hash")
+        combined = set(partition.transfer_sample_ids) | set(
+            partition.validation_sample_ids
+        )
+        if combined != set(manifest.sample_ids):
+            raise ValueError("Client partition does not cover the manifest")
+        validation_ids = set(partition.validation_sample_ids)
+        expected_transfer = [
+            value
+            for value in manifest.sample_ids
+            if value in combined - validation_ids
+        ]
+        expected_validation = [
+            value for value in manifest.sample_ids if value in validation_ids
+        ]
+        if partition.transfer_sample_ids != expected_transfer or (
+            partition.validation_sample_ids != expected_validation
+        ):
+            raise ValueError("Client partition changed signed sample order")
+        if not set(self.host_teacher_sample_ids).issubset(
+            partition.transfer_sample_ids
+        ):
+            raise ValueError("Host teacher sample IDs leave the transfer split")
+        expected_host_order = [
+            value
+            for value in partition.transfer_sample_ids
+            if value in set(self.host_teacher_sample_ids)
+        ]
+        if self.host_teacher_sample_ids != expected_host_order:
+            raise ValueError("Host teacher sample IDs changed transfer order")
+        if self.artifact.sample_count != len(partition.transfer_sample_ids):
+            raise ValueError("Client reverse artifact sample count differs")
+        if self.artifact.sample_ids_sha256 != partition.transfer_sample_ids_sha256:
+            raise ValueError("Client reverse artifact sample order differs")
+        if self.artifact.top_k != manifest.top_k:
+            raise ValueError("Client reverse artifact top-k differs")
+        if self.artifact.padded_sequence_length > manifest.maximum_sequence_length:
+            raise ValueError("Client reverse artifact exceeds sequence limit")
+        if self.client_public_data_epochs != manifest.client_public_data_epochs:
+            raise ValueError("Client public-data epochs differ from manifest")
+        if self.distillation != manifest.distillation:
+            raise ValueError("Client reverse objective differs from manifest")
+        if (
+            self.distillation.loss_type != "ce"
+            or self.distillation.temperature != 1.0
+            or self.distillation.lm_loss_weight != 0.9
+        ):
+            raise ValueError(
+                "Client reverse training requires answer-only 0.9 supervised "
+                "+ 0.1 sparse CE at temperature 1.0"
+            )
+        if self.artifact.byte_size > manifest.maximum_client_reverse_training_job_bytes:
+            raise ValueError("Client reverse artifact exceeds signed size limit")
+        expected = sha256_hex(self.model_dump(mode="json", exclude={"job_hash"}))
+        if self.job_hash != expected:
+            raise ValueError("job_hash does not match Client reverse training job")
+        return self
+
+    @classmethod
+    def create(cls, **values: Any) -> ClientReverseTrainingJob:
+        payload = cls.model_construct(**values).model_dump(
+            mode="json", exclude={"job_hash"}
+        )
+        return cls(**payload, job_hash=sha256_hex(payload))
 
 
 class HostTrainingJob(ContractModel):

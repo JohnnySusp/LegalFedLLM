@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from shared.reference_dataset import (
     ReferenceSample,
     ReferenceSource,
+    client_public_data_partition,
     load_reference_jsonl,
     reference_dataset_hash,
     reference_dataset_hash_payload,
@@ -460,6 +461,42 @@ class ReferenceSampleTests(unittest.TestCase):
             [value.sample_id for value in first_validation],
             [value.sample_id for value in second_validation],
         )
+
+    def test_client_public_partition_is_deterministic_90_10(self) -> None:
+        sample_ids = [f"sample-{index:03d}" for index in range(100)]
+        values = {
+            "reference_dataset_id": "reference-v1",
+            "reference_dataset_hash": "a" * 64,
+            "sample_ids": sample_ids,
+        }
+
+        first = client_public_data_partition(**values)
+        second = client_public_data_partition(**values)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first.transfer_sample_ids), 90)
+        self.assertEqual(len(first.validation_sample_ids), 10)
+        self.assertEqual(
+            set(first.transfer_sample_ids) | set(first.validation_sample_ids),
+            set(sample_ids),
+        )
+        self.assertFalse(
+            set(first.transfer_sample_ids) & set(first.validation_sample_ids)
+        )
+        self.assertEqual(
+            first.transfer_sample_ids,
+            [value for value in sample_ids if value in set(first.transfer_sample_ids)],
+        )
+
+    def test_client_public_partition_keeps_single_smoke_sample_trainable(self) -> None:
+        partition = client_public_data_partition(
+            reference_dataset_id="reference-v1",
+            reference_dataset_hash="b" * 64,
+            sample_ids=["only-sample"],
+        )
+
+        self.assertEqual(partition.transfer_sample_ids, ["only-sample"])
+        self.assertEqual(partition.validation_sample_ids, [])
 
 if __name__ == "__main__":
     unittest.main()

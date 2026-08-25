@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 from math import floor
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import TYPE_CHECKING, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from shared.crypto import sha256_hex
+
+if TYPE_CHECKING:
+    from shared.protocol import ClientPublicDataPartition
 
 
 REFERENCE_DATASET_SCHEMA_VERSION = 1
@@ -206,6 +209,57 @@ def split_reference_samples(
             validation.append(sample)
 
     return reference, validation
+
+
+def client_public_data_partition(
+    *,
+    reference_dataset_id: str,
+    reference_dataset_hash: str,
+    sample_ids: Iterable[str],
+) -> "ClientPublicDataPartition":
+    """Derive the signed 90/10 Client transfer/validation split.
+
+    Selection is hash-ranked so it is independent of source ordering; both
+    returned subsets retain the manifest's canonical order.
+    """
+
+    # Local import avoids the protocol/reference-model import cycle.
+    from shared.protocol import ClientPublicDataPartition
+
+    values = list(sample_ids)
+    if not values or len(values) != len(set(values)):
+        raise ValueError("Client public-data sample IDs must be non-empty and unique")
+    validation_count = (
+        0
+        if len(values) == 1
+        else max(1, len(values) - floor(0.9 * len(values)))
+    )
+    ranked = sorted(
+        values,
+        key=lambda sample_id: (
+            sha256_hex(
+                {
+                    "scheme": "legalfedllm-client-public-90-10-v1",
+                    "reference_dataset_hash": reference_dataset_hash,
+                    "sample_id": sample_id,
+                }
+            ),
+            sample_id,
+        ),
+    )
+    validation_set = set(ranked[:validation_count])
+    transfer = [value for value in values if value not in validation_set]
+    validation = [value for value in values if value in validation_set]
+    return ClientPublicDataPartition.create(
+        schema_version="1.0",
+        reference_dataset_id=reference_dataset_id,
+        reference_dataset_hash=reference_dataset_hash,
+        transfer_sample_ids=transfer,
+        validation_sample_ids=validation,
+        transfer_sample_ids_sha256=sha256_hex(transfer),
+        validation_sample_ids_sha256=sha256_hex(validation),
+        validation_fraction=0.1,
+    )
 
 
 def write_reference_jsonl(

@@ -15,11 +15,19 @@ from client.training import (
     private_dataset_semantic_hash,
 )
 from shared.adapter_checkpoint import AdapterCheckpointStore
+from shared.alignment_profiles import resolve_alignment_profile
+from shared.client_reverse_artifact import (
+    load_client_reverse_training_artifact,
+    write_client_reverse_training_artifact,
+)
 from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.ollama import OllamaClient
+from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import (
+    ClientPublicDataPartition,
+    ClientReverseTrainingJob,
     DifferentialPrivacyReport,
     KnowledgePackage,
     KnowledgeSample,
@@ -32,14 +40,17 @@ from shared.protocol import (
     utc_now,
     utc_text,
 )
-from shared.storage import JsonFileStore
-from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
-
 from shared.reference_dataset import (
     ReferenceDatasetIdentity,
+    client_public_data_partition,
     load_reference_jsonl,
     verify_reference_dataset,
 )
+from shared.reference_knowledge import encode_reference_samples
+from shared.storage import JsonFileStore
+from shared.tokenizer_validation import load_pinned_tokenizer
+from shared.vocabulary_mapping import VocabularyMappingCache
+
 
 class ClientRuntimeError(RuntimeError):
     pass
@@ -452,6 +463,22 @@ class ClientRuntime:
     @staticmethod
     def _receipt_path(round_id: str) -> str:
         return f"knowledge_cache/receipts/{round_id}.json"
+
+    @staticmethod
+    def _reverse_job_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/job.json"
+
+    @staticmethod
+    def _reverse_artifact_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/trainer_inputs.safetensors"
+
+    @staticmethod
+    def _reverse_audit_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/integration_audit.json"
+
+    @staticmethod
+    def _reverse_partition_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/public_partition.json"
 
     def _validate_package_snapshot(
         self,
@@ -1201,6 +1228,11 @@ class ClientRuntime:
         accepted_host_adapter_version: int,
         adapter_promoted: bool,
     ) -> dict[str, Any]:
+        from shared.fedmkt_core.reverse_integration import (
+            ReverseDistillationIntegrationAudit,
+            integrate_reverse_distillation,
+        )
+
         round_id = manifest.round_id
 
         cache_path = self._accepted_package_path(round_id)
@@ -1328,38 +1360,210 @@ class ClientRuntime:
             maximum_bytes=manifest.maximum_knowledge_package_bytes,
         )
 
-        host_by_id = {
-            sample.sample_id: sample
-            for sample in host_samples
-        }
+        partition = client_public_data_partition(
+            reference_dataset_id=manifest.reference_dataset_id,
+            reference_dataset_hash=manifest.reference_dataset_hash,
+            sample_ids=manifest.sample_ids,
+        )
+        if partition.validation_fraction != manifest.client_public_validation_fraction:
+            raise ValueError("Client public-data partition differs from the manifest")
 
-        client_by_id = {
-            sample.sample_id: sample
-            for sample in cached_samples
-        }
+        parent_hash = snapshot.get("training_checkpoint_hash") or snapshot.get(
+            "state_hash"
+        )
+        if not isinstance(parent_hash, str) or len(parent_hash) != 64:
+            raise ValueError("accepted Client parent snapshot hash is missing")
+        parent_version = int(snapshot["adapter_version"])
 
-        selected = [
-            sample_id
-            for sample_id in cached.sample_ids
-            if (
-                host_by_id[sample_id].ce_loss
-                < client_by_id[sample_id].ce_loss
-            )
+        transfer_set = set(partition.transfer_sample_ids)
+        transfer_client_samples = [
+            sample for sample in cached_samples if sample.sample_id in transfer_set
         ]
+        labels_by_sample: dict[str, list[int]]
+        profile = None
+        host_tokenizer = None
+        client_tokenizer = None
+        mapping_cache = None
+        if self.model_profile.training_backend == "mock":
+            labels_by_sample = {}
+            for sample in transfer_client_samples:
+                labels = [-100] * len(sample.source_input_ids)
+                labels[-1] = sample.source_input_ids[-1]
+                labels_by_sample[sample.sample_id] = labels
+        else:
+            self.verify_cached_reference_dataset(manifest)
+            reference_samples = load_reference_jsonl(
+                self.store.path(self._reference_dataset_path(round_id))
+            )
+            reference_by_id = {sample.sample_id: sample for sample in reference_samples}
+            selected_reference = [
+                reference_by_id[sample_id]
+                for sample_id in partition.transfer_sample_ids
+            ]
+            profile = resolve_alignment_profile(host_package.alignment_profile_id)
+            client_cache = os.getenv("CLIENT_TOKENIZER_CACHE_DIR") or None
+            local_only = os.getenv(
+                "LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY", "true"
+            ).strip().lower() not in {"0", "false", "no"}
+            token = os.getenv("HF_TOKEN") or None
+            client_tokenizer = load_pinned_tokenizer(
+                profile.client,
+                cache_dir=client_cache,
+                token=token,
+                local_files_only=local_only,
+            )
+            host_tokenizer = load_pinned_tokenizer(
+                profile.host,
+                cache_dir=client_cache,
+                token=token,
+                local_files_only=local_only,
+            )
+            encoded = encode_reference_samples(
+                selected_reference,
+                tokenizer=client_tokenizer.tokenizer,
+                model_profile=self.model_profile,
+                maximum_sequence_length=manifest.maximum_sequence_length,
+                expected_sample_ids=partition.transfer_sample_ids,
+                dataset_label="signed Client transfer split",
+            )
+            cached_transfer_by_id = {
+                sample.sample_id: sample for sample in transfer_client_samples
+            }
+            for sample in encoded:
+                cached_sample = cached_transfer_by_id[sample.sample_id]
+                if (
+                    sample.input_ids != cached_sample.source_input_ids
+                    or sum(sample.attention_mask)
+                    != cached_sample.attention_length
+                ):
+                    raise ClientRuntimeError(
+                        "accepted Client package differs from the freshly "
+                        "encoded transfer split"
+                    )
+            labels_by_sample = {
+                sample.sample_id: sample.labels for sample in encoded
+            }
+            mapping_cache = VocabularyMappingCache(
+                self.store.path("vocabulary_mappings")
+            )
+
+        batch = integrate_reverse_distillation(
+            client_id=self.client_id,
+            parent_adapter_version=parent_version,
+            parent_adapter_hash=parent_hash,
+            host_adapter_promoted=adapter_promoted,
+            partition_hash=partition.partition_hash,
+            transfer_sample_ids=partition.transfer_sample_ids,
+            host_package=host_package,
+            host_samples=host_samples,
+            client_package=cached,
+            client_samples=cached_samples,
+            labels_by_sample=labels_by_sample,
+            profile=profile,
+            host_tokenizer=host_tokenizer,
+            client_tokenizer=client_tokenizer,
+            mapping_cache=mapping_cache,
+        )
+
+        job_path = self._reverse_job_path(round_id)
+        artifact_path = self._reverse_artifact_path(round_id)
+        audit_path = self._reverse_audit_path(round_id)
+        partition_path = self._reverse_partition_path(round_id)
+        reverse_exists = tuple(
+            self.store.exists(path)
+            for path in (job_path, artifact_path, audit_path, partition_path)
+        )
+        if any(reverse_exists) and not all(reverse_exists):
+            raise ClientRuntimeError("Client reverse-training job cache is incomplete")
+
+        pad_token_id = 0 if profile is None else profile.client.pad_token_id
+        if pad_token_id is None:
+            raise ClientRuntimeError("Client tokenizer profile has no padding token")
+        vocabulary_size = (
+            max(
+                int(batch.input_ids.max().item()),
+                int(batch.sparse_targets.token_ids.max().item()),
+            ) + 1
+            if profile is None
+            else profile.client.vocabulary_size
+        )
+        if all(reverse_exists):
+            job = ClientReverseTrainingJob.model_validate(
+                self.store.read_json(job_path)
+            )
+            if (
+                job.manifest.manifest_hash != manifest.manifest_hash
+                or job.parent_adapter_version != parent_version
+                or job.parent_adapter_hash != parent_hash
+                or job.host_package_hash != host_package.package_hash
+                or job.host_adapter_promoted != adapter_promoted
+                or job.public_data_partition != partition
+                or job.integration_audit_hash != batch.audit.audit_hash
+            ):
+                raise ClientRuntimeError("Client reverse-training job is immutable")
+            stored_audit = ReverseDistillationIntegrationAudit.model_validate(
+                self.store.read_json(audit_path)
+            )
+            stored_partition = ClientPublicDataPartition.model_validate(
+                self.store.read_json(partition_path)
+            )
+            if stored_audit != batch.audit or stored_partition != partition:
+                raise ClientRuntimeError("Client reverse-training audit is immutable")
+            load_client_reverse_training_artifact(
+                self.store.path(artifact_path),
+                job.artifact,
+                partition.transfer_sample_ids,
+                maximum_bytes=manifest.maximum_client_reverse_training_job_bytes,
+                vocabulary_size=vocabulary_size,
+            )
+        else:
+            try:
+                artifact = write_client_reverse_training_artifact(
+                    self.store.path(artifact_path),
+                    batch,
+                    pad_token_id=pad_token_id,
+                    maximum_bytes=manifest.maximum_client_reverse_training_job_bytes,
+                )
+                job = ClientReverseTrainingJob.create(
+                    manifest=manifest,
+                    client_id=self.client_id,
+                    client_model_profile_hash=self.model_profile.profile_hash(),
+                    parent_adapter_version=parent_version,
+                    parent_adapter_hash=parent_hash,
+                    accepted_host_adapter_version=host_package.adapter_version,
+                    host_package_hash=host_package.package_hash,
+                    host_adapter_promoted=adapter_promoted,
+                    public_data_partition=partition,
+                    host_teacher_sample_ids=batch.audit.host_teacher_sample_ids,
+                    client_public_data_epochs=manifest.client_public_data_epochs,
+                    distillation=manifest.distillation,
+                    integration_audit_hash=batch.audit.audit_hash,
+                    artifact=artifact,
+                    created_at=utc_text(self.now_fn()),
+                )
+                self.store.write_json_if_absent(
+                    audit_path, batch.audit.model_dump(mode="json")
+                )
+                self.store.write_json_if_absent(
+                    partition_path, partition.model_dump(mode="json")
+                )
+                self.store.write_json_if_absent(
+                    job_path, job.model_dump(mode="json")
+                )
+            except Exception:
+                if not self.store.exists(job_path):
+                    self.store.delete(artifact_path)
+                    self.store.delete(audit_path)
+                    self.store.delete(partition_path)
+                raise
 
         state = self.state()
-
-        if adapter_promoted and selected:
-            state["candidate_adapter_version"] += 1
-            state["serving_adapter_version"] = (
-                state["candidate_adapter_version"]
-            )
-
+        # Step 6.1 prepares a job only. Step 6.2 owns training, validation,
+        # compare-and-swap promotion, and serving-pointer changes.
         state["last_completed_round"] = round_id
-        state["last_host_adapter_version"] = (
-            host_package.adapter_version
-        )
-        state["host_distillation_samples"] = selected
+        state["last_host_adapter_version"] = host_package.adapter_version
+        state["host_distillation_samples"] = batch.audit.host_teacher_sample_ids
+        state["last_reverse_training_job_hash"] = job.job_hash
 
         host_cache_package = self._host_package_path(round_id)
         host_cache_artifact = self._host_artifact_path(round_id)

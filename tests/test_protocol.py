@@ -13,11 +13,11 @@ from shared.protocol import (
     AlignmentConfig,
     HostCandidateTrainingResult,
     HostCandidateValidationResult,
+    KnowledgePackage,
     LoraProfile,
     ModelProfile,
     RoundCreateRequest,
     RoundManifest,
-    KnowledgePackage,
     utc_now,
     utc_text,
 )
@@ -140,8 +140,14 @@ class ProtocolSecurityTests(unittest.TestCase):
             )
             self.assertTrue(manifest.verify_signature(coordinator.public_key_b64))
             self.assertEqual(manifest.host_public_data_epochs, 5)
+            self.assertEqual(manifest.client_public_data_epochs, 1)
+            self.assertEqual(manifest.client_public_validation_fraction, 0.1)
             self.assertEqual(
                 manifest.maximum_host_training_job_bytes,
+                256 * 1024 * 1024,
+            )
+            self.assertEqual(
+                manifest.maximum_client_reverse_training_job_bytes,
                 256 * 1024 * 1024,
             )
             tampered_manifest = manifest.model_dump(mode="json")

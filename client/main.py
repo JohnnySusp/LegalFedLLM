@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -472,16 +473,19 @@ def create_app(
                 incoming_artifact,
                 manifest.maximum_knowledge_package_bytes,
             )
-            return client_runtime.apply_host_knowledge(
-                manifest=manifest,
-                host_package=package,
-                host_artifact_path=incoming_artifact,
-                host_public_key=identity.host_public_key,
-                expected_host_id=identity.host_service_id,
-                accepted_host_adapter_version=(
-                    status_record.host_adapter_after
-                ),
-                adapter_promoted=bool(status_record.adapter_promoted),
+            return await run_exclusive_ml(
+                partial(
+                    client_runtime.apply_host_knowledge,
+                    manifest=manifest,
+                    host_package=package,
+                    host_artifact_path=incoming_artifact,
+                    host_public_key=identity.host_public_key,
+                    expected_host_id=identity.host_service_id,
+                    accepted_host_adapter_version=(
+                        status_record.host_adapter_after
+                    ),
+                    adapter_promoted=bool(status_record.adapter_promoted),
+                )
             )
 
         except ValueError as exc:
