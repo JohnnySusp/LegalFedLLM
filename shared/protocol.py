@@ -21,6 +21,7 @@ KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "1.0"
 HOST_TRAINING_ARTIFACT_SCHEMA_VERSION = "1.0"
 HOST_TRAINING_JOB_SCHEMA_VERSION = "1.0"
 HOST_CANDIDATE_RESULT_SCHEMA_VERSION = "1.0"
+HOST_CANDIDATE_VALIDATION_SCHEMA_VERSION = "1.0"
 HASH_PATTERN = r"^[0-9a-f]{64}$"
 BASE64_PATTERN = r"^[A-Za-z0-9+/]+={0,2}$"
 
@@ -830,6 +831,114 @@ class HostCandidateTrainingResult(ContractModel):
             mode="json", exclude={"result_hash"}
         )
         return cls(**payload, result_hash=sha256_hex(payload))
+
+
+class HostCandidateValidationResult(ContractModel):
+    schema_version: Literal["1.0"] = (
+        HOST_CANDIDATE_VALIDATION_SCHEMA_VERSION
+    )
+    round_id: str = Field(min_length=1, max_length=128)
+    manifest_hash: str = Field(pattern=HASH_PATTERN)
+    job_hash: str = Field(pattern=HASH_PATTERN)
+    candidate_result_hash: str = Field(pattern=HASH_PATTERN)
+    previous_adapter_version: int = Field(ge=0)
+    previous_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    candidate_adapter_version: int = Field(ge=1)
+    candidate_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    accepted_adapter_version: int = Field(ge=0)
+    accepted_adapter_hash: str = Field(pattern=HASH_PATTERN)
+    baseline_validation_record_hash: str = Field(pattern=HASH_PATTERN)
+    candidate_validation_record_hash: str = Field(pattern=HASH_PATTERN)
+    primary_metric: Literal["macro_mean_answer_token_ce"] = (
+        "macro_mean_answer_token_ce"
+    )
+    secondary_metric: Literal["token_weighted_answer_token_ce"] = (
+        "token_weighted_answer_token_ce"
+    )
+    previous_macro_mean_answer_token_ce: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    candidate_macro_mean_answer_token_ce: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    previous_token_weighted_answer_token_ce: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    candidate_token_weighted_answer_token_ce: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    required_improvement: float = Field(ge=0, allow_inf_nan=False)
+    observed_improvement: float = Field(allow_inf_nan=False)
+    adapter_promoted: bool
+    decision_reason: Literal[
+        "candidate_improved",
+        "insufficient_improvement",
+        "forced_validation_rejection",
+    ]
+    rejected_candidate_discarded: bool
+    created_at: str
+    decision_hash: str = Field(pattern=HASH_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> "HostCandidateValidationResult":
+        parse_utc(self.created_at)
+        if self.candidate_adapter_version != self.previous_adapter_version + 1:
+            raise ValueError("Host validation candidate must follow its parent")
+        improvement = (
+            self.previous_macro_mean_answer_token_ce
+            - self.candidate_macro_mean_answer_token_ce
+        )
+        if not math.isclose(
+            self.observed_improvement,
+            improvement,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("Host validation improvement differs")
+        if self.adapter_promoted:
+            if self.decision_reason != "candidate_improved":
+                raise ValueError("promoted Host candidate has another decision reason")
+            if self.observed_improvement < self.required_improvement:
+                raise ValueError("promoted Host candidate did not meet the threshold")
+            if self.rejected_candidate_discarded:
+                raise ValueError("promoted Host candidate cannot be discarded")
+            if (
+                self.accepted_adapter_version != self.candidate_adapter_version
+                or self.accepted_adapter_hash != self.candidate_adapter_hash
+            ):
+                raise ValueError("promoted Host adapter identity differs")
+        else:
+            if self.decision_reason == "candidate_improved":
+                raise ValueError("rejected Host candidate has a promotion reason")
+            if (
+                self.decision_reason == "insufficient_improvement"
+                and self.observed_improvement >= self.required_improvement
+            ):
+                raise ValueError("rejected Host candidate met the threshold")
+            if not self.rejected_candidate_discarded:
+                raise ValueError("rejected Host candidate weights must be discarded")
+            if (
+                self.accepted_adapter_version != self.previous_adapter_version
+                or self.accepted_adapter_hash != self.previous_adapter_hash
+            ):
+                raise ValueError("rejected Host candidate changed the active adapter")
+        expected = sha256_hex(
+            self.model_dump(mode="json", exclude={"decision_hash"})
+        )
+        if self.decision_hash != expected:
+            raise ValueError("decision_hash does not match Host validation")
+        return self
+
+    @classmethod
+    def create(cls, **values: Any) -> "HostCandidateValidationResult":
+        payload = cls.model_construct(**values).model_dump(
+            mode="json", exclude={"decision_hash"}
+        )
+        return cls(**payload, decision_hash=sha256_hex(payload))
 
 
 class DistillationResult(ContractModel):

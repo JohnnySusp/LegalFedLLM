@@ -180,8 +180,11 @@ class TransformersPeftHostBackend:
         current = self.checkpoints.current()
         if current is not None:
             metadata, path = current
-            record = self._load_initialization_record(path)
-            self._validate_initialization(metadata, record)
+            initial_metadata, initial_path = self.checkpoints.version(0)
+            record = self._load_initialization_record(initial_path)
+            self._validate_initialization(initial_metadata, record)
+            if metadata.version > 0:
+                self._validate_promoted_adapter(metadata)
             return InitializedHostAdapter(metadata, path, record)
 
         torch, transformers, peft, safetensors = self._dependencies()
@@ -559,6 +562,31 @@ class TransformersPeftHostBackend:
             )
         return path
 
+    def promote_candidate(
+        self,
+        result: HostCandidateTrainingResult,
+    ) -> InitializedHostAdapter:
+        metadata, path = self.checkpoints.promote_candidate(
+            result.round_id,
+            result.candidate_adapter_version,
+            result.candidate_adapter_hash,
+        )
+        self._validate_promoted_adapter(metadata)
+        initial_metadata, initial_path = self.checkpoints.version(0)
+        initialization = self._load_initialization_record(initial_path)
+        self._validate_initialization(initial_metadata, initialization)
+        return InitializedHostAdapter(metadata, path, initialization)
+
+    def discard_candidate(
+        self,
+        result: HostCandidateTrainingResult,
+    ) -> None:
+        self.checkpoints.discard_candidate(
+            result.round_id,
+            result.candidate_adapter_version,
+            result.candidate_adapter_hash,
+        )
+
     def generate_baseline(
         self,
         reference_samples: Sequence[ReferenceSample],
@@ -746,6 +774,198 @@ class TransformersPeftHostBackend:
             del model, base_model
             self._release_memory(torch)
 
+    def validate_trained_candidate(
+        self,
+        validation_samples: Sequence[ReferenceSample],
+        validation_identity: ReferenceDatasetIdentity,
+        manifest: RoundManifest,
+        result: HostCandidateTrainingResult,
+    ) -> HostValidationRecord:
+        torch, transformers, peft, _ = self._dependencies()
+        from shared.fedmkt_core.ml.logit_generation import (
+            generate_pub_data_logits,
+        )
+        from shared.fedmkt_core.ml.vars_define import (
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
+
+        self._validate_device(torch)
+        transformers.set_seed(self.execution_profile.seed)
+        validated_tokenizer = load_pinned_tokenizer(
+            POC_DTW_PROFILE.host,
+            cache_dir=os.getenv("HF_HOME"),
+            token=os.getenv("HF_TOKEN") or None,
+        )
+        tokenizer = validated_tokenizer.tokenizer
+        if tokenizer.pad_token_id is None:
+            raise RuntimeError("pinned Host tokenizer has no padding token")
+        values = list(validation_samples)
+        if reference_dataset_identity(values) != validation_identity:
+            raise ValueError("Host validation data differs from its identity")
+        encoded = encode_reference_samples(
+            values,
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=[sample.sample_id for sample in values],
+            dataset_label="private D^V",
+        )
+        candidate_path = self.validate_candidate(result)
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                candidate_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(model)
+            if any(parameter.requires_grad for parameter in model.parameters()):
+                raise RuntimeError("Host candidate validation loaded trainable parameters")
+            model.eval()
+            collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+            arguments = FedMKTGenerationArguments(
+                top_k_logits_keep=manifest.top_k
+            )
+            metrics: list[HostValidationSampleMetric] = []
+            for start in range(0, len(encoded), self.knowledge_batch_size):
+                batch_values = encoded[start : start + self.knowledge_batch_size]
+                generated = generate_pub_data_logits(
+                    self._generation_inputs(batch_values),
+                    model,
+                    arguments,
+                    collator,
+                )
+                token_ids = generated[PER_STEP_INDICES]
+                logits = generated[PER_STEP_LOGITS]
+                losses = generated[METRIC]
+                self._validate_fedmkt_batch(
+                    len(batch_values),
+                    token_ids,
+                    logits,
+                    losses,
+                )
+                for index, item in enumerate(batch_values):
+                    metrics.append(
+                        HostValidationSampleMetric(
+                            sample_id=item.sample_id,
+                            answer_token_count=sum(
+                                label != -100 for label in item.labels[1:]
+                            ),
+                            answer_token_ce=float(losses[index].item()),
+                        )
+                    )
+            return HostValidationRecord.create(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                validation_dataset=validation_identity,
+                host_model_profile_hash=self.model_profile.profile_hash(),
+                adapter_version=result.candidate_adapter_version,
+                checkpoint_hash=result.candidate_adapter_hash,
+                contract_hash=self.contract.contract_hash,
+                execution_profile_hash=self.execution_profile.profile_hash(),
+                samples=metrics,
+            )
+        finally:
+            del model, base_model
+            self._release_memory(torch)
+
+    def generate_post_decision_knowledge(
+        self,
+        reference_samples: Sequence[ReferenceSample],
+        manifest: RoundManifest,
+        *,
+        expected_adapter_version: int,
+        expected_checkpoint_hash: str,
+    ) -> list[KnowledgeSample]:
+        torch, transformers, peft, _ = self._dependencies()
+        from shared.fedmkt_core.ml.logit_generation import (
+            generate_pub_data_logits,
+        )
+        from shared.fedmkt_core.ml.vars_define import (
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
+
+        self._validate_device(torch)
+        transformers.set_seed(self.execution_profile.seed)
+        validated_tokenizer = load_pinned_tokenizer(
+            POC_DTW_PROFILE.host,
+            cache_dir=os.getenv("HF_HOME"),
+            token=os.getenv("HF_TOKEN") or None,
+        )
+        tokenizer = validated_tokenizer.tokenizer
+        if tokenizer.pad_token_id is None:
+            raise RuntimeError("pinned Host tokenizer has no padding token")
+        encoded = encode_reference_samples(
+            list(reference_samples),
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            maximum_sequence_length=manifest.maximum_sequence_length,
+            expected_sample_ids=manifest.sample_ids,
+        )
+        current = self.checkpoints.current()
+        if current is None:
+            raise RuntimeError("current Host adapter checkpoint is missing")
+        metadata, checkpoint_path = current
+        if (
+            metadata.version != expected_adapter_version
+            or metadata.checkpoint_hash != expected_checkpoint_hash
+        ):
+            raise RuntimeError("current Host checkpoint differs from the decision")
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                checkpoint_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(model)
+            if any(parameter.requires_grad for parameter in model.parameters()):
+                raise RuntimeError("post-decision Host inference loaded trainable parameters")
+            model.eval()
+            collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
+            arguments = FedMKTGenerationArguments(
+                top_k_logits_keep=manifest.top_k
+            )
+            samples: list[KnowledgeSample] = []
+            for start in range(0, len(encoded), self.knowledge_batch_size):
+                batch_values = encoded[start : start + self.knowledge_batch_size]
+                generated = generate_pub_data_logits(
+                    self._generation_inputs(batch_values),
+                    model,
+                    arguments,
+                    collator,
+                )
+                token_ids = generated[PER_STEP_INDICES]
+                logits = generated[PER_STEP_LOGITS]
+                losses = generated[METRIC]
+                self._validate_fedmkt_batch(
+                    len(batch_values),
+                    token_ids,
+                    logits,
+                    losses,
+                )
+                for index, item in enumerate(batch_values):
+                    samples.append(
+                        knowledge_sample_from_rows(
+                            item,
+                            top_k_token_ids=token_ids[index].tolist(),
+                            top_k_logits=logits[index].tolist(),
+                            ce_loss=float(losses[index].item()),
+                        )
+                    )
+            return samples
+        finally:
+            del model, base_model
+            self._release_memory(torch)
+
     @staticmethod
     def _generation_inputs(values: Sequence[Any]) -> dict[str, list[list[int]]]:
         return {
@@ -804,6 +1024,19 @@ class TransformersPeftHostBackend:
             raise ValueError(
                 "Host initialization execution profile differs from checkpoint"
             )
+
+    def _validate_promoted_adapter(
+        self,
+        metadata: AdapterCheckpointMetadata,
+    ) -> None:
+        if metadata.version < 1 or metadata.parent_version is None:
+            raise ValueError("promoted Host adapter has no parent version")
+        if metadata.parent_checkpoint_hash is None:
+            raise ValueError("promoted Host adapter has no parent checkpoint")
+        if metadata.round_id is None or metadata.manifest_hash is None:
+            raise ValueError("promoted Host adapter has no round binding")
+        if metadata.execution_profile_hash != self.execution_profile.profile_hash():
+            raise ValueError("promoted Host adapter uses another execution profile")
 
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any, Any]:

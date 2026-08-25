@@ -18,6 +18,7 @@ from shared.protocol import (
     DistillationJob,
     DistillationResult,
     HostCandidateTrainingResult,
+    HostCandidateValidationResult,
     KnowledgePackage,
     RoundManifest,
     ServiceIdentity,
@@ -211,6 +212,43 @@ def create_app(
     ) -> HostCandidateTrainingResult:
         try:
             return await run_exclusive_ml(host_runtime.train_candidate, job)
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/internal/v1/validate-candidate",
+        response_model=HostCandidateValidationResult,
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def validate_candidate(
+        job: HostTrainingJob,
+    ) -> HostCandidateValidationResult:
+        try:
+            return await run_exclusive_ml(
+                host_runtime.validate_candidate_and_decide,
+                job,
+            )
+        except HostRuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/internal/v1/post-decision-knowledge",
+        dependencies=[Depends(require_internal_token)],
+    )
+    async def post_decision_knowledge(manifest: RoundManifest):
+        try:
+            package = await run_exclusive_ml(
+                host_runtime.generate_post_decision_reference_knowledge,
+                manifest,
+            )
+            return knowledge_transfer_response(
+                metadata=package,
+                artifact_path=host_runtime.knowledge_artifact_path(
+                    manifest,
+                    enforce_manifest_parent=False,
+                ),
+                metadata_part_name="package",
+            )
         except HostRuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

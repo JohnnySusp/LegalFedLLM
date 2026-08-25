@@ -23,6 +23,7 @@ from shared.protocol import (
     DistillationJob,
     DistillationResult,
     HostCandidateTrainingResult,
+    HostCandidateValidationResult,
     KnowledgePackage,
     LoraProfile,
     ModelProfile,
@@ -32,6 +33,7 @@ from shared.protocol import (
     HostReferenceDatasetReceipt,
     HostTrainingJob,
     HostTrainingJobReceipt,
+    utc_text,
 )
 from shared.storage import JsonFileStore
 from shared.reference_dataset import (
@@ -212,14 +214,20 @@ class HostRuntime:
             raise HostRuntimeError(
                 "manifest is bound to a different Host adapter version"
             )
+        decision = None
         if (
             self.model_profile.training_backend == "transformers"
             and not enforce_manifest_parent
         ):
-            raise HostRuntimeError(
-                "post-distillation Host inference requires the real "
-                "distillation backend"
-            )
+            decision = self.candidate_validation_decision(manifest)
+            if (
+                decision.accepted_adapter_version != int(active["version"])
+                or decision.accepted_adapter_hash
+                != str(active["checkpoint_hash"])
+            ):
+                raise HostRuntimeError(
+                    "active Host adapter differs from the validation decision"
+                )
 
         identity_path = self._dataset_identity_path(
             manifest.round_id
@@ -296,6 +304,26 @@ class HostRuntime:
             except (RuntimeError, ValueError, OSError) as exc:
                 raise HostRuntimeError(
                     f"real Host baseline inference failed: {exc}"
+                ) from exc
+        elif self.model_profile.training_backend == "transformers":
+            try:
+                receipt = self.verify_cached_reference_data(manifest)
+                del receipt
+                reference_samples = load_reference_jsonl(
+                    self.store.path(
+                        self._reference_dataset_path(manifest.round_id)
+                    )
+                )
+                assert self.peft_backend is not None
+                samples = self.peft_backend.generate_post_decision_knowledge(
+                    reference_samples,
+                    manifest,
+                    expected_adapter_version=int(active["version"]),
+                    expected_checkpoint_hash=str(active["checkpoint_hash"]),
+                )
+            except (RuntimeError, ValueError, OSError) as exc:
+                raise HostRuntimeError(
+                    f"post-decision Host inference failed: {exc}"
                 ) from exc
         else:
             samples = deterministic_knowledge_samples(
@@ -410,6 +438,15 @@ class HostRuntime:
             raise HostRuntimeError(
                 f"cached Host Knowledge Package is invalid: {exc}"
             ) from exc
+
+    def generate_post_decision_reference_knowledge(
+        self,
+        manifest: RoundManifest,
+    ) -> KnowledgePackage:
+        return self.generate_reference_knowledge(
+            manifest,
+            enforce_manifest_parent=False,
+        )
 
     def validation_baseline(
         self,
@@ -681,15 +718,37 @@ class HostRuntime:
             if stored.job_hash != job.job_hash:
                 raise ValueError("Host candidate request uses another training job")
             active = self.active_adapter()
-            if int(active["version"]) != job.host_adapter_version:
-                raise ValueError("Host adapter changed before candidate training")
             if self.store.exists(result_path):
                 result = HostCandidateTrainingResult.model_validate(
                     self.store.read_json(result_path)
                 )
+                decision_path = self._candidate_decision_path(
+                    job.manifest.round_id
+                )
+                if self.store.exists(decision_path):
+                    decision = HostCandidateValidationResult.model_validate(
+                        self.store.read_json(decision_path)
+                    )
+                    self._validate_candidate_result_contract(job, result)
+                    self._validate_candidate_decision(job, result, decision)
+                    current = self.active_adapter()
+                    if (
+                        int(current["version"])
+                        != decision.accepted_adapter_version
+                        or str(current["checkpoint_hash"])
+                        != decision.accepted_adapter_hash
+                    ):
+                        raise ValueError(
+                            "active Host adapter differs from the cached decision"
+                        )
+                    return result
+                if int(active["version"]) != job.host_adapter_version:
+                    raise ValueError("Host adapter changed before candidate training")
                 self._validate_candidate_result(job, result, active)
                 self.peft_backend.validate_candidate(result)
                 return result
+            if int(active["version"]) != job.host_adapter_version:
+                raise ValueError("Host adapter changed before candidate training")
             result = self.peft_backend.train_candidate(
                 job,
                 self.store.path(artifact_path),
@@ -701,7 +760,9 @@ class HostRuntime:
                 result.model_dump(mode="json"),
             )
             if self.active_adapter() != active:
-                raise ValueError("Step 5.5 must not promote the Host candidate")
+                raise ValueError(
+                    "candidate training must not promote the active Host adapter"
+                )
             return result
         except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
             raise HostRuntimeError(f"Host candidate training failed: {exc}") from exc
@@ -712,12 +773,22 @@ class HostRuntime:
         result: HostCandidateTrainingResult,
         active: dict[str, Any],
     ) -> None:
+        self._validate_candidate_result_contract(job, result)
+        if result.parent_adapter_hash != active["artifact_hash"]:
+            raise ValueError(
+                "Host candidate result differs from its active parent"
+            )
+
+    def _validate_candidate_result_contract(
+        self,
+        job: HostTrainingJob,
+        result: HostCandidateTrainingResult,
+    ) -> None:
         expected = {
             "round_id": job.manifest.round_id,
             "manifest_hash": job.manifest.manifest_hash,
             "job_hash": job.job_hash,
             "parent_adapter_version": job.host_adapter_version,
-            "parent_adapter_hash": active["artifact_hash"],
             "candidate_adapter_version": job.host_adapter_version + 1,
             "host_model_profile_hash": self.model_profile.profile_hash(),
             "execution_profile_hash": self.training_execution_profile.profile_hash(),
@@ -730,6 +801,232 @@ class HostRuntime:
                 "Host candidate result differs from its job: "
                 + ", ".join(mismatches)
             )
+
+    def validate_candidate_and_decide(
+        self,
+        job: HostTrainingJob,
+    ) -> HostCandidateValidationResult:
+        if self.peft_backend is None or self.training_execution_profile is None:
+            raise HostRuntimeError("real Host candidate validation is unavailable")
+        try:
+            stored_job = HostTrainingJob.model_validate(
+                self.store.read_json(
+                    f"rounds/{job.manifest.round_id}/training_job/job.json"
+                )
+            )
+            if stored_job.job_hash != job.job_hash:
+                raise ValueError("Host validation request uses another training job")
+            result = HostCandidateTrainingResult.model_validate(
+                self.store.read_json(
+                    f"rounds/{job.manifest.round_id}/candidate/result.json"
+                )
+            )
+            active = self.active_adapter()
+            decision_path = self._candidate_decision_path(job.manifest.round_id)
+            if self.store.exists(decision_path):
+                decision = HostCandidateValidationResult.model_validate(
+                    self.store.read_json(decision_path)
+                )
+                self._validate_candidate_decision(job, result, decision)
+                self._apply_candidate_decision(result, decision)
+                return decision
+
+            self._validate_candidate_result(job, result, active)
+            baseline = self.validation_baseline(job.manifest)
+            receipt = self.verify_cached_reference_data(job.manifest)
+            validation_samples = load_reference_jsonl(
+                self.store.path(
+                    self._validation_dataset_path(job.manifest.round_id)
+                )
+            )
+            candidate_path = self._candidate_validation_path(
+                job.manifest.round_id
+            )
+            candidate_active = {
+                "version": result.candidate_adapter_version,
+                "artifact_hash": result.candidate_adapter_hash,
+                "checkpoint_hash": result.candidate_adapter_hash,
+            }
+            if self.store.exists(candidate_path):
+                candidate_validation = HostValidationRecord.model_validate(
+                    self.store.read_json(candidate_path)
+                )
+            else:
+                candidate_validation = self.peft_backend.validate_trained_candidate(
+                    validation_samples,
+                    receipt.validation_identity,
+                    job.manifest,
+                    result,
+                )
+            self._validate_validation_record(
+                job.manifest,
+                candidate_validation,
+                receipt=receipt,
+                validation_samples=validation_samples,
+                active=candidate_active,
+            )
+            if not self.store.exists(candidate_path):
+                self.store.write_json_if_absent(
+                    candidate_path,
+                    candidate_validation.model_dump(mode="json"),
+                )
+            required = job.manifest.distillation.minimum_validation_improvement
+            observed = (
+                baseline.macro_mean_answer_token_ce
+                - candidate_validation.macro_mean_answer_token_ce
+            )
+            promoted = not self.force_validation_failure and observed >= required
+            reason = (
+                "candidate_improved"
+                if promoted
+                else (
+                    "forced_validation_rejection"
+                    if self.force_validation_failure
+                    else "insufficient_improvement"
+                )
+            )
+            decision = HostCandidateValidationResult.create(
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                job_hash=job.job_hash,
+                candidate_result_hash=result.result_hash,
+                previous_adapter_version=result.parent_adapter_version,
+                previous_adapter_hash=result.parent_adapter_hash,
+                candidate_adapter_version=result.candidate_adapter_version,
+                candidate_adapter_hash=result.candidate_adapter_hash,
+                accepted_adapter_version=(
+                    result.candidate_adapter_version
+                    if promoted
+                    else result.parent_adapter_version
+                ),
+                accepted_adapter_hash=(
+                    result.candidate_adapter_hash
+                    if promoted
+                    else result.parent_adapter_hash
+                ),
+                baseline_validation_record_hash=baseline.record_hash,
+                candidate_validation_record_hash=(
+                    candidate_validation.record_hash
+                ),
+                previous_macro_mean_answer_token_ce=(
+                    baseline.macro_mean_answer_token_ce
+                ),
+                candidate_macro_mean_answer_token_ce=(
+                    candidate_validation.macro_mean_answer_token_ce
+                ),
+                previous_token_weighted_answer_token_ce=(
+                    baseline.token_weighted_answer_token_ce
+                ),
+                candidate_token_weighted_answer_token_ce=(
+                    candidate_validation.token_weighted_answer_token_ce
+                ),
+                required_improvement=required,
+                observed_improvement=observed,
+                adapter_promoted=promoted,
+                decision_reason=reason,
+                rejected_candidate_discarded=not promoted,
+                created_at=utc_text(),
+            )
+            self.store.write_json_if_absent(
+                decision_path,
+                decision.model_dump(mode="json"),
+            )
+            self._apply_candidate_decision(result, decision)
+            return decision
+        except (KeyError, OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise HostRuntimeError(
+                f"Host candidate validation failed: {exc}"
+            ) from exc
+
+    def candidate_validation_decision(
+        self,
+        manifest: RoundManifest,
+    ) -> HostCandidateValidationResult:
+        try:
+            decision = HostCandidateValidationResult.model_validate(
+                self.store.read_json(
+                    self._candidate_decision_path(manifest.round_id)
+                )
+            )
+            if (
+                decision.round_id != manifest.round_id
+                or decision.manifest_hash != manifest.manifest_hash
+            ):
+                raise ValueError("Host validation decision belongs to another round")
+            job = HostTrainingJob.model_validate(
+                self.store.read_json(
+                    f"rounds/{manifest.round_id}/training_job/job.json"
+                )
+            )
+            result = HostCandidateTrainingResult.model_validate(
+                self.store.read_json(
+                    f"rounds/{manifest.round_id}/candidate/result.json"
+                )
+            )
+            self._validate_candidate_decision(job, result, decision)
+            return decision
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise HostRuntimeError(
+                f"Host candidate validation decision is invalid: {exc}"
+            ) from exc
+
+    def _validate_candidate_decision(
+        self,
+        job: HostTrainingJob,
+        result: HostCandidateTrainingResult,
+        decision: HostCandidateValidationResult,
+    ) -> None:
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "candidate_result_hash": result.result_hash,
+            "previous_adapter_version": result.parent_adapter_version,
+            "previous_adapter_hash": result.parent_adapter_hash,
+            "candidate_adapter_version": result.candidate_adapter_version,
+            "candidate_adapter_hash": result.candidate_adapter_hash,
+            "required_improvement": (
+                job.manifest.distillation.minimum_validation_improvement
+            ),
+        }
+        payload = decision.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ValueError(
+                "Host validation decision differs from its job: "
+                + ", ".join(mismatches)
+            )
+
+    def _apply_candidate_decision(
+        self,
+        result: HostCandidateTrainingResult,
+        decision: HostCandidateValidationResult,
+    ) -> None:
+        assert self.peft_backend is not None
+        if decision.adapter_promoted:
+            self.real_adapter = self.peft_backend.promote_candidate(result)
+        else:
+            active = self.active_adapter()
+            if (
+                int(active["version"]) != result.parent_adapter_version
+                or str(active["checkpoint_hash"]) != result.parent_adapter_hash
+            ):
+                raise ValueError("Host rollback did not retain the parent adapter")
+            self.peft_backend.discard_candidate(result)
+        active = self.active_adapter()
+        if (
+            int(active["version"]) != decision.accepted_adapter_version
+            or str(active["checkpoint_hash"]) != decision.accepted_adapter_hash
+        ):
+            raise ValueError("active Host adapter differs from the decision")
+
+    @staticmethod
+    def _candidate_validation_path(round_id: str) -> str:
+        return f"rounds/{round_id}/validation/candidate.json"
+
+    @staticmethod
+    def _candidate_decision_path(round_id: str) -> str:
+        return f"rounds/{round_id}/validation/decision.json"
 
     async def generate(self, prompt: str, max_new_tokens: int) -> str:
         if self.model_profile.serving_backend == "ollama":

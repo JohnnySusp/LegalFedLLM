@@ -48,6 +48,7 @@ from shared.protocol import (
     HostReferenceDatasetBundle,
     HostReferenceDatasetReceipt,
     HostCandidateTrainingResult,
+    HostCandidateValidationResult,
     HostTrainingJob,
     HostTrainingJobReceipt,
 )
@@ -244,6 +245,32 @@ class HostGateway:
             json=job.model_dump(mode="json"),
         )
         return HostCandidateTrainingResult.model_validate(payload)
+
+    async def validate_candidate(
+        self,
+        job: HostTrainingJob,
+    ) -> HostCandidateValidationResult:
+        payload = await self._request(
+            "POST",
+            "/internal/v1/validate-candidate",
+            json=job.model_dump(mode="json"),
+        )
+        return HostCandidateValidationResult.model_validate(payload)
+
+    async def post_decision_knowledge(
+        self,
+        manifest: RoundManifest,
+        artifact_path: str | Path,
+    ) -> KnowledgePackage:
+        payload = await self._knowledge_request(
+            "POST",
+            "/internal/v1/post-decision-knowledge",
+            json=manifest.model_dump(mode="json"),
+            artifact_path=artifact_path,
+            metadata_part_name="package",
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+        return KnowledgePackage.model_validate(payload)
 
     async def generate(self, prompt: str, max_new_tokens: int) -> dict[str, Any]:
         return await self._request(
@@ -1157,6 +1184,203 @@ class CoordinatorService:
             )
         return result
 
+    async def _validate_host_candidate(
+        self,
+        manifest: RoundManifest,
+        job: HostTrainingJob,
+        candidate: HostCandidateTrainingResult,
+    ) -> HostCandidateValidationResult:
+        path = (
+            f"rounds/{manifest.round_id}/host_training_job/"
+            "validation_decision.json"
+        )
+        persisted = None
+        if self.store.exists(path):
+            persisted = HostCandidateValidationResult.model_validate(
+                self.store.read_json(path)
+            )
+        decision = await self.host.validate_candidate(job)
+        if persisted is not None and persisted != decision:
+            raise ConflictError("Host validation decision changed after persistence")
+        expected = {
+            "round_id": manifest.round_id,
+            "manifest_hash": manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "candidate_result_hash": candidate.result_hash,
+            "previous_adapter_version": candidate.parent_adapter_version,
+            "previous_adapter_hash": candidate.parent_adapter_hash,
+            "candidate_adapter_version": candidate.candidate_adapter_version,
+            "candidate_adapter_hash": candidate.candidate_adapter_hash,
+            "required_improvement": (
+                manifest.distillation.minimum_validation_improvement
+            ),
+        }
+        payload = decision.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ConflictError(
+                "Host validation decision differs from the signed round: "
+                + ", ".join(mismatches)
+            )
+        if not self.store.exists(path):
+            self.store.write_json_if_absent(
+                path,
+                decision.model_dump(mode="json"),
+            )
+            self._audit(
+                "host_candidate_validated",
+                {
+                    "round_id": manifest.round_id,
+                    "decision_hash": decision.decision_hash,
+                    "baseline_validation_record_hash": (
+                        decision.baseline_validation_record_hash
+                    ),
+                    "candidate_validation_record_hash": (
+                        decision.candidate_validation_record_hash
+                    ),
+                    "previous_macro_mean_answer_token_ce": (
+                        decision.previous_macro_mean_answer_token_ce
+                    ),
+                    "candidate_macro_mean_answer_token_ce": (
+                        decision.candidate_macro_mean_answer_token_ce
+                    ),
+                    "previous_token_weighted_answer_token_ce": (
+                        decision.previous_token_weighted_answer_token_ce
+                    ),
+                    "candidate_token_weighted_answer_token_ce": (
+                        decision.candidate_token_weighted_answer_token_ce
+                    ),
+                    "required_improvement": decision.required_improvement,
+                    "observed_improvement": decision.observed_improvement,
+                    "adapter_promoted": decision.adapter_promoted,
+                    "decision_reason": decision.decision_reason,
+                    "rejected_candidate_discarded": (
+                        decision.rejected_candidate_discarded
+                    ),
+                },
+            )
+        return decision
+
+    async def _complete_real_round(
+        self,
+        manifest: RoundManifest,
+        state: RoundState,
+        job: HostTrainingJob,
+        candidate: HostCandidateTrainingResult,
+    ) -> None:
+        state.state = "DISTILLING"
+        state.message = "Host candidate private validation is running"
+        state.updated_at = utc_text(self.now_fn())
+        self._write_state(state)
+        decision = await self._validate_host_candidate(
+            manifest,
+            job,
+            candidate,
+        )
+        state.message = "post-decision Host reference inference is running"
+        state.updated_at = utc_text(self.now_fn())
+        self._write_state(state)
+        incoming = self.incoming_artifact_path(
+            manifest.round_id,
+            "host-result",
+        )
+        try:
+            previous_host_identity = await self._host_identity()
+            package = await self.host.post_decision_knowledge(
+                manifest,
+                incoming,
+            )
+            host_identity = await self._host_identity(refresh=True)
+            if (
+                host_identity.service_id != previous_host_identity.service_id
+                or host_identity.public_key != previous_host_identity.public_key
+                or host_identity.model_profile
+                != previous_host_identity.model_profile
+            ):
+                raise ConflictError(
+                    "Host identity changed during the signed round"
+                )
+            if host_identity.adapter_version != decision.accepted_adapter_version:
+                raise ConflictError(
+                    "Host identity differs from the validation decision"
+                )
+            self._verify_host_package(
+                manifest=manifest,
+                package=package,
+                artifact_path=incoming,
+                host_identity=host_identity,
+                expected_adapter_version=decision.accepted_adapter_version,
+            )
+            self._persist_knowledge_package(
+                package_path=(
+                    f"rounds/{manifest.round_id}/host_knowledge/package.json"
+                ),
+                artifact_path=(
+                    f"rounds/{manifest.round_id}/host_knowledge/"
+                    "knowledge.safetensors"
+                ),
+                package=package,
+                source_artifact=incoming,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            result = DistillationResult(
+                round_id=manifest.round_id,
+                previous_adapter_version=decision.previous_adapter_version,
+                candidate_adapter_version=decision.candidate_adapter_version,
+                accepted_adapter_version=decision.accepted_adapter_version,
+                previous_validation_loss=(
+                    decision.previous_macro_mean_answer_token_ce
+                ),
+                candidate_validation_loss=(
+                    decision.candidate_macro_mean_answer_token_ce
+                ),
+                required_improvement=decision.required_improvement,
+                adapter_promoted=decision.adapter_promoted,
+                candidate_artifact_hash=decision.candidate_adapter_hash,
+                host_knowledge_package=package,
+            )
+            result_path = f"rounds/{manifest.round_id}/distillation_result.json"
+            if self.store.exists(result_path):
+                persisted = DistillationResult.model_validate(
+                    self.store.read_json(result_path)
+                )
+                if persisted != result:
+                    raise ConflictError(
+                        "real Host distillation result changed after persistence"
+                    )
+            else:
+                self.store.write_json_if_absent(
+                    result_path,
+                    result.model_dump(mode="json"),
+                )
+            if package.package_hash not in state.host_package_hashes:
+                state.host_package_hashes.append(package.package_hash)
+            if package.nonce not in state.host_nonces:
+                state.host_nonces.append(package.nonce)
+            state.state = "COMPLETED"
+            state.host_adapter_after = decision.accepted_adapter_version
+            state.adapter_promoted = decision.adapter_promoted
+            state.message = (
+                "candidate Host adapter accepted"
+                if decision.adapter_promoted
+                else "candidate Host adapter rejected; previous adapter retained"
+            )
+            state.updated_at = utc_text(self.now_fn())
+            self._write_state(state)
+            self._audit(
+                "round_completed",
+                {
+                    "round_id": manifest.round_id,
+                    "adapter_promoted": decision.adapter_promoted,
+                    "adapter_version": decision.accepted_adapter_version,
+                    "decision_hash": decision.decision_hash,
+                    "host_package_hash": package.package_hash,
+                    "selected_samples": len(job.sample_ids),
+                },
+            )
+        finally:
+            incoming.unlink(missing_ok=True)
+
     async def _process_sealed_round(
         self, manifest: RoundManifest, state: RoundState
     ) -> None:
@@ -1171,13 +1395,12 @@ class CoordinatorService:
                 self._write_state(state)
                 await self._deliver_host_training_job(manifest, cached_job)
                 result = await self._train_host_candidate(manifest, cached_job)
-                state.state = "DISTILLING"
-                state.message = (
-                    "Host candidate trained and reload-verified; awaiting "
-                    "Step 5.6 private validation"
+                await self._complete_real_round(
+                    manifest,
+                    state,
+                    cached_job,
+                    result,
                 )
-                state.updated_at = utc_text(self.now_fn())
-                self._write_state(state)
                 return
         state.state = "DISTILLING"
         state.message = "constructing the validated Host distillation dataset"
@@ -1289,13 +1512,6 @@ class CoordinatorService:
                 )
                 await self._deliver_host_training_job(manifest, job)
                 result = await self._train_host_candidate(manifest, job)
-                state.state = "DISTILLING"
-                state.message = (
-                    "Host candidate trained and reload-verified; awaiting "
-                    "Step 5.6 private validation"
-                )
-                state.updated_at = utc_text(self.now_fn())
-                self._write_state(state)
                 self._audit(
                     "host_training_job_prepared",
                     {
@@ -1316,6 +1532,12 @@ class CoordinatorService:
                         ),
                         "optimizer_step_count": result.optimizer_step_count,
                     },
+                )
+                await self._complete_real_round(
+                    manifest,
+                    state,
+                    job,
+                    result,
                 )
                 return
             dataset = dual_min_ce_select(

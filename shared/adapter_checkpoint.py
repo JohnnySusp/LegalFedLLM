@@ -202,6 +202,101 @@ class AdapterCheckpointStore:
         self._validate_directory(path, metadata)
         return metadata, path
 
+    def promote_candidate(
+        self,
+        round_id: str,
+        version: int,
+        checkpoint_hash: str,
+    ) -> tuple[AdapterCheckpointMetadata, Path]:
+        current = self.current()
+        if current is not None:
+            current_metadata, current_path = current
+            if (
+                current_metadata.version == version
+                and current_metadata.checkpoint_hash == checkpoint_hash
+                and current_metadata.round_id == round_id
+            ):
+                return current_metadata, current_path
+
+        target = self.version_path(version)
+        if target.exists():
+            metadata = AdapterCheckpointMetadata.model_validate_json(
+                (target / "checkpoint.json").read_text(encoding="utf-8")
+            )
+            self._validate_candidate_promotion(
+                metadata,
+                round_id=round_id,
+                version=version,
+                checkpoint_hash=checkpoint_hash,
+                current=current,
+            )
+            self._validate_directory(target, metadata)
+        else:
+            metadata, candidate_path = self.candidate(round_id, version)
+            self._validate_candidate_promotion(
+                metadata,
+                round_id=round_id,
+                version=version,
+                checkpoint_hash=checkpoint_hash,
+                current=current,
+            )
+            candidate_path.replace(target)
+
+        write_atomic_json(
+            self.root / "current.json",
+            {
+                "version": metadata.version,
+                "checkpoint_hash": metadata.checkpoint_hash,
+                "profile_hash": metadata.profile_hash,
+            },
+        )
+        return metadata, target
+
+    def discard_candidate(
+        self,
+        round_id: str,
+        version: int,
+        checkpoint_hash: str,
+    ) -> None:
+        path = self.candidate_path(round_id, version)
+        if not path.exists():
+            return
+        metadata, verified_path = self.candidate(round_id, version)
+        if metadata.checkpoint_hash != checkpoint_hash:
+            raise ValueError("discarded candidate checkpoint hash differs")
+        shutil.rmtree(verified_path)
+        try:
+            verified_path.parent.rmdir()
+        except OSError:
+            pass
+
+    def _validate_candidate_promotion(
+        self,
+        metadata: AdapterCheckpointMetadata,
+        *,
+        round_id: str,
+        version: int,
+        checkpoint_hash: str,
+        current: tuple[AdapterCheckpointMetadata, Path] | None,
+    ) -> None:
+        if (
+            metadata.round_id != round_id
+            or metadata.version != version
+            or metadata.checkpoint_hash != checkpoint_hash
+        ):
+            raise ValueError("promoted candidate identity differs")
+        if metadata.parent_version is None or metadata.parent_checkpoint_hash is None:
+            raise ValueError("promoted candidate has no parent checkpoint")
+        if current is None:
+            raise ValueError("active parent checkpoint is missing")
+        current_metadata, _ = current
+        if (
+            current_metadata.version != metadata.parent_version
+            or current_metadata.checkpoint_hash
+            != metadata.parent_checkpoint_hash
+        ):
+            raise ValueError("active checkpoint differs from candidate parent")
+
     def current(self) -> tuple[AdapterCheckpointMetadata, Path] | None:
         pointer_path = self.root / "current.json"
         if not pointer_path.exists():

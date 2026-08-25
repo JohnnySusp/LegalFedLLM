@@ -12,6 +12,7 @@ from shared.knowledge_artifact import serialize_knowledge_artifact
 from shared.protocol import (
     AlignmentConfig,
     HostCandidateTrainingResult,
+    HostCandidateValidationResult,
     LoraProfile,
     ModelProfile,
     RoundCreateRequest,
@@ -37,6 +38,44 @@ def profile(role: str) -> ModelProfile:
 
 
 class ProtocolSecurityTests(unittest.TestCase):
+    def test_host_validation_decision_is_hash_bound_and_consistent(self) -> None:
+        decision = HostCandidateValidationResult.create(
+            round_id="round-1",
+            manifest_hash="a" * 64,
+            job_hash="b" * 64,
+            candidate_result_hash="c" * 64,
+            previous_adapter_version=0,
+            previous_adapter_hash="d" * 64,
+            candidate_adapter_version=1,
+            candidate_adapter_hash="e" * 64,
+            accepted_adapter_version=1,
+            accepted_adapter_hash="e" * 64,
+            baseline_validation_record_hash="f" * 64,
+            candidate_validation_record_hash="1" * 64,
+            previous_macro_mean_answer_token_ce=0.5,
+            candidate_macro_mean_answer_token_ce=0.25,
+            previous_token_weighted_answer_token_ce=0.55,
+            candidate_token_weighted_answer_token_ce=0.3,
+            required_improvement=0.001,
+            observed_improvement=0.25,
+            adapter_promoted=True,
+            decision_reason="candidate_improved",
+            rejected_candidate_discarded=False,
+            created_at=utc_text(),
+        )
+        payload = decision.model_dump(mode="json")
+        payload["candidate_macro_mean_answer_token_ce"] = 0.75
+        with self.assertRaises(ValidationError):
+            HostCandidateValidationResult.model_validate(payload)
+
+        payload = decision.model_dump(mode="json")
+        payload["adapter_promoted"] = False
+        payload["decision_hash"] = sha256_hex(
+            {key: value for key, value in payload.items() if key != "decision_hash"}
+        )
+        with self.assertRaises(ValidationError):
+            HostCandidateValidationResult.model_validate(payload)
+
     def test_host_candidate_result_hash_and_version_are_bound(self) -> None:
         result = HostCandidateTrainingResult.create(
             round_id="round-1",

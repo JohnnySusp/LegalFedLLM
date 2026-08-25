@@ -36,21 +36,27 @@ from host.training import (
     HostTrainingExecutionProfile,
     host_execution_profile_from_environment,
 )
-from shared.adapter_checkpoint import AdapterCheckpointMetadata
+from shared.adapter_checkpoint import (
+    AdapterCheckpointMetadata,
+    AdapterCheckpointStore,
+)
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
-from shared.knowledge_artifact import load_package_samples
+from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import (
     AlignmentConfig,
     HostCandidateTrainingResult,
+    HostCandidateValidationResult,
     HostTrainingArtifactDescriptor,
     HostTrainingJob,
     HostTrainingJobReceipt,
+    KnowledgePackage,
     HostReferenceDatasetBundle,
     RoundCreateRequest,
     RoundManifest,
     RoundState,
+    ServiceIdentity,
     utc_text,
 )
 from shared.reference_dataset import (
@@ -110,10 +116,20 @@ def fake_initialized_adapter() -> InitializedHostAdapter:
 
 
 class FakeHostPeftBackend:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        candidate_validation_losses: list[float] | None = None,
+    ) -> None:
         self.calls = 0
         self.generate_calls = 0
         self.train_calls = 0
+        self.validation_calls = 0
+        self.promotion_calls = 0
+        self.discard_calls = 0
+        self.discarded_candidates: set[tuple[str, int]] = set()
+        self.candidate_validation_losses = (
+            candidate_validation_losses or [0.1, 0.2]
+        )
         self.initialized = fake_initialized_adapter()
         self.contract = self.initialized.initialization.contract
         self.execution_profile = (
@@ -204,6 +220,88 @@ class FakeHostPeftBackend:
     def validate_candidate(self, result) -> Path:
         self.validated_candidate = result
         return Path("/test/candidates") / result.round_id
+
+    def validate_trained_candidate(
+        self,
+        validation_samples,
+        validation_identity,
+        manifest,
+        result,
+    ) -> HostValidationRecord:
+        self.validation_calls += 1
+        losses = self.candidate_validation_losses
+        if len(losses) != len(validation_samples):
+            raise RuntimeError("fake validation loss count differs")
+        return HostValidationRecord.create(
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            validation_dataset=validation_identity,
+            host_model_profile_hash=pinned_host_profile().profile_hash(),
+            adapter_version=result.candidate_adapter_version,
+            checkpoint_hash=result.candidate_adapter_hash,
+            contract_hash=self.contract.contract_hash,
+            execution_profile_hash=self.execution_profile.profile_hash(),
+            samples=[
+                HostValidationSampleMetric(
+                    sample_id=sample.sample_id,
+                    answer_token_count=index + 1,
+                    answer_token_ce=losses[index],
+                )
+                for index, sample in enumerate(validation_samples)
+            ],
+        )
+
+    def promote_candidate(self, result) -> InitializedHostAdapter:
+        if (
+            self.initialized.metadata.version == result.candidate_adapter_version
+            and self.initialized.metadata.checkpoint_hash
+            == result.candidate_adapter_hash
+        ):
+            return self.initialized
+        self.promotion_calls += 1
+        parent = self.initialized.metadata
+        metadata = parent.model_copy(
+            update={
+                "version": result.candidate_adapter_version,
+                "parent_version": result.parent_adapter_version,
+                "parent_checkpoint_hash": result.parent_adapter_hash,
+                "round_id": result.round_id,
+                "manifest_hash": result.manifest_hash,
+                "checkpoint_hash": result.candidate_adapter_hash,
+            }
+        )
+        self.initialized = InitializedHostAdapter(
+            metadata,
+            Path("/test/versions") / f"v{metadata.version:06d}",
+            self.initialized.initialization,
+        )
+        return self.initialized
+
+    def discard_candidate(self, result) -> None:
+        key = (result.round_id, result.candidate_adapter_version)
+        if key in self.discarded_candidates:
+            return
+        self.discard_calls += 1
+        self.discarded_candidates.add(key)
+
+    def generate_post_decision_knowledge(
+        self,
+        reference_samples,
+        manifest,
+        *,
+        expected_adapter_version,
+        expected_checkpoint_hash,
+    ):
+        if expected_adapter_version != self.initialized.metadata.version:
+            raise RuntimeError("unexpected accepted adapter version")
+        if expected_checkpoint_hash != self.initialized.metadata.checkpoint_hash:
+            raise RuntimeError("unexpected accepted checkpoint hash")
+        return deterministic_knowledge_samples(
+            manifest=manifest,
+            participant_id="legalfedllm-host",
+            role="host",
+            adapter_version=expected_adapter_version,
+        )
 
 
 def reference_sample(sample_id: str) -> ReferenceSample:
@@ -369,7 +467,123 @@ def write_test_host_training_job(
     )
 
 
+def write_signed_host_package(
+    manifest: RoundManifest,
+    artifact_path: str | Path,
+    identity: Ed25519Identity,
+    adapter_version: int,
+) -> KnowledgePackage:
+    samples = deterministic_knowledge_samples(
+        manifest=manifest,
+        participant_id="legalfedllm-host",
+        role="host",
+        adapter_version=adapter_version,
+    )
+    descriptor = write_knowledge_artifact(
+        artifact_path,
+        samples,
+        maximum_bytes=manifest.maximum_knowledge_package_bytes,
+    )
+    return KnowledgePackage.create_signed(
+        identity=identity,
+        round_id=manifest.round_id,
+        manifest_hash=manifest.manifest_hash,
+        sender_id="legalfedllm-host",
+        sender_role="host",
+        model_profile=manifest.host_model_profile,
+        adapter_version=adapter_version,
+        alignment_profile_id=(
+            f"{manifest.alignment.strategy}:"
+            f"{manifest.alignment.profile_version}"
+        ),
+        reference_dataset_id=manifest.reference_dataset_id,
+        reference_dataset_hash=manifest.reference_dataset_hash,
+        top_k=manifest.top_k,
+        sample_ids=manifest.sample_ids,
+        artifact=descriptor,
+    )
+
+
 class GraniteHostTrainingContractTests(unittest.TestCase):
+    def test_candidate_checkpoint_promotion_and_discard_are_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = AdapterCheckpointStore(directory, pinned_host_profile())
+
+            initial_path = store.staging_path("initial")
+            (initial_path / "adapter_config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (initial_path / "adapter_model.safetensors").write_bytes(b"initial")
+            initial = store.seal(
+                initial_path,
+                version=0,
+                parent=None,
+                round_id=None,
+                manifest_hash=None,
+                execution_profile_hash="a" * 64,
+            )
+            store.promote(initial_path, initial)
+
+            candidate_path = store.staging_path("candidate-one")
+            (candidate_path / "adapter_config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (candidate_path / "adapter_model.safetensors").write_bytes(
+                b"candidate-one"
+            )
+            candidate = store.seal(
+                candidate_path,
+                version=1,
+                parent=initial,
+                round_id="round-1",
+                manifest_hash="b" * 64,
+                execution_profile_hash="a" * 64,
+            )
+            store.store_candidate(candidate_path, candidate)
+
+            promoted, promoted_path = store.promote_candidate(
+                "round-1",
+                1,
+                candidate.checkpoint_hash,
+            )
+            retry, retry_path = store.promote_candidate(
+                "round-1",
+                1,
+                candidate.checkpoint_hash,
+            )
+            self.assertEqual(retry, promoted)
+            self.assertEqual(retry_path, promoted_path)
+            self.assertEqual(store.current()[0], promoted)
+
+            rejected_path = store.staging_path("candidate-two")
+            (rejected_path / "adapter_config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            (rejected_path / "adapter_model.safetensors").write_bytes(
+                b"candidate-two"
+            )
+            rejected = store.seal(
+                rejected_path,
+                version=2,
+                parent=promoted,
+                round_id="round-2",
+                manifest_hash="c" * 64,
+                execution_profile_hash="a" * 64,
+            )
+            store.store_candidate(rejected_path, rejected)
+            store.discard_candidate(
+                "round-2",
+                2,
+                rejected.checkpoint_hash,
+            )
+            store.discard_candidate(
+                "round-2",
+                2,
+                rejected.checkpoint_hash,
+            )
+            self.assertFalse(store.candidate_path("round-2", 2).exists())
+            self.assertEqual(store.current()[0], promoted)
+
     def test_selective_loss_is_answer_only_and_uses_agreed_weights(self) -> None:
         import torch
 
@@ -660,6 +874,112 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
             ):
                 runtime.generate_reference_knowledge(manifest)
 
+    def test_runtime_promotes_validated_candidate_and_publishes_knowledge(
+        self,
+    ) -> None:
+        backend = FakeHostPeftBackend(candidate_validation_losses=[0.1, 0.2])
+        manifest, bundle = host_round_bundle(
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=pinned_host_profile(),
+                training_execution_profile=backend.execution_profile,
+                peft_backend=backend,
+            )
+            runtime.load_reference_data(bundle)
+            runtime.generate_reference_knowledge(manifest)
+            artifact = Path(directory) / "trainer-inputs.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            runtime.load_training_job(job, artifact)
+            candidate = runtime.train_candidate(job)
+
+            decision = runtime.validate_candidate_and_decide(job)
+
+            self.assertTrue(decision.adapter_promoted)
+            self.assertEqual(decision.decision_reason, "candidate_improved")
+            self.assertEqual(decision.accepted_adapter_version, 1)
+            self.assertEqual(decision.accepted_adapter_hash, "c" * 64)
+            self.assertGreaterEqual(
+                decision.observed_improvement,
+                decision.required_improvement,
+            )
+            self.assertEqual(runtime.adapter_version, 1)
+            self.assertEqual(backend.validation_calls, 1)
+            self.assertEqual(backend.promotion_calls, 1)
+            self.assertEqual(backend.discard_calls, 0)
+            self.assertEqual(
+                decision.candidate_result_hash,
+                candidate.result_hash,
+            )
+
+            package = runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(package.adapter_version, 1)
+            self.assertEqual(package.sample_ids, manifest.sample_ids)
+            self.assertTrue(
+                package.verify_signature(runtime.identity.public_key_b64)
+            )
+            retry = runtime.validate_candidate_and_decide(job)
+            self.assertEqual(retry, decision)
+            self.assertEqual(backend.validation_calls, 1)
+            self.assertEqual(backend.promotion_calls, 1)
+            self.assertEqual(runtime.train_candidate(job), candidate)
+            self.assertEqual(backend.train_calls, 1)
+
+    def test_runtime_forced_rejection_discards_candidate_and_retains_parent(
+        self,
+    ) -> None:
+        backend = FakeHostPeftBackend(candidate_validation_losses=[0.1, 0.2])
+        manifest, bundle = host_round_bundle(
+            round_id="forced-validation-rejection",
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=pinned_host_profile(),
+                training_execution_profile=backend.execution_profile,
+                peft_backend=backend,
+                force_validation_failure=True,
+            )
+            runtime.load_reference_data(bundle)
+            runtime.generate_reference_knowledge(manifest)
+            artifact = Path(directory) / "trainer-inputs.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            runtime.load_training_job(job, artifact)
+            candidate = runtime.train_candidate(job)
+
+            decision = runtime.validate_candidate_and_decide(job)
+
+            self.assertFalse(decision.adapter_promoted)
+            self.assertEqual(
+                decision.decision_reason,
+                "forced_validation_rejection",
+            )
+            self.assertTrue(decision.rejected_candidate_discarded)
+            self.assertEqual(decision.accepted_adapter_version, 0)
+            self.assertEqual(decision.accepted_adapter_hash, "a" * 64)
+            self.assertEqual(runtime.adapter_version, 0)
+            self.assertEqual(backend.promotion_calls, 0)
+            self.assertEqual(backend.discard_calls, 1)
+
+            package = runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(package.adapter_version, 0)
+            retry = runtime.validate_candidate_and_decide(job)
+            self.assertEqual(retry, decision)
+            self.assertEqual(backend.validation_calls, 1)
+            self.assertEqual(backend.discard_calls, 1)
+            self.assertEqual(
+                runtime.train_candidate(job).result_hash,
+                candidate.result_hash,
+            )
+            self.assertEqual(backend.train_calls, 1)
+
 
 class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_monitor_trains_sealed_dtw_round_without_blocking_status(self) -> None:
@@ -680,6 +1000,31 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
                 accepted_client_ids=job.accepted_client_ids,
             )
             result = backend.train_candidate(job, artifact)
+            decision = HostCandidateValidationResult.create(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                job_hash=job.job_hash,
+                candidate_result_hash=result.result_hash,
+                previous_adapter_version=0,
+                previous_adapter_hash="a" * 64,
+                candidate_adapter_version=1,
+                candidate_adapter_hash="c" * 64,
+                accepted_adapter_version=1,
+                accepted_adapter_hash="c" * 64,
+                baseline_validation_record_hash="b" * 64,
+                candidate_validation_record_hash="d" * 64,
+                previous_macro_mean_answer_token_ce=0.5,
+                candidate_macro_mean_answer_token_ce=0.25,
+                previous_token_weighted_answer_token_ce=0.55,
+                candidate_token_weighted_answer_token_ce=0.3,
+                required_improvement=0.001,
+                observed_improvement=0.25,
+                adapter_promoted=True,
+                decision_reason="candidate_improved",
+                rejected_candidate_discarded=False,
+                created_at=utc_text(),
+            )
+            host_identity = Ed25519Identity(Ed25519PrivateKey.generate())
             training_started = asyncio.Event()
             release_training = asyncio.Event()
 
@@ -693,6 +1038,29 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
             gateway.load_training_job = mock.AsyncMock(return_value=receipt)
             gateway.train_candidate = mock.AsyncMock(
                 side_effect=blocking_train_candidate
+            )
+            gateway.validate_candidate = mock.AsyncMock(
+                return_value=decision
+            )
+
+            async def post_decision_knowledge(value, artifact_path):
+                return write_signed_host_package(
+                    value,
+                    artifact_path,
+                    host_identity,
+                    1,
+                )
+
+            gateway.post_decision_knowledge = mock.AsyncMock(
+                side_effect=post_decision_knowledge
+            )
+            gateway.identity = mock.AsyncMock(
+                return_value=ServiceIdentity(
+                    service_id="legalfedllm-host",
+                    public_key=host_identity.public_key_b64,
+                    model_profile=manifest.host_model_profile,
+                    adapter_version=1,
+                )
             )
             service = CoordinatorService(
                 data_dir=Path(directory) / "coordinator",
@@ -743,12 +1111,13 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
                 await pending
 
             after = service.get_state(manifest.round_id)
-            self.assertEqual(after.state, "DISTILLING")
-            self.assertIn("awaiting Step 5.6", after.message)
-            self.assertIsNone(after.host_adapter_after)
-            self.assertIsNone(after.adapter_promoted)
+            self.assertEqual(after.state, "COMPLETED")
+            self.assertEqual(after.host_adapter_after, 1)
+            self.assertTrue(after.adapter_promoted)
             gateway.load_training_job.assert_awaited_once()
             gateway.train_candidate.assert_awaited_once_with(job)
+            gateway.validate_candidate.assert_awaited_once_with(job)
+            gateway.post_decision_knowledge.assert_awaited_once()
             persisted = HostCandidateTrainingResult.model_validate(
                 service.store.read_json(
                     f"rounds/{manifest.round_id}/host_training_job/"
@@ -756,6 +1125,126 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             self.assertEqual(persisted, result)
+            persisted_decision = HostCandidateValidationResult.model_validate(
+                service.store.read_json(
+                    f"rounds/{manifest.round_id}/host_training_job/"
+                    "validation_decision.json"
+                )
+            )
+            self.assertEqual(persisted_decision, decision)
+            package, package_path = service.get_host_knowledge(
+                manifest.round_id
+            )
+            self.assertEqual(package.adapter_version, 1)
+            self.assertTrue(package_path.is_file())
+
+    async def test_coordinator_finalizes_forced_candidate_rejection(self) -> None:
+        manifest, _ = host_round_bundle(
+            round_id="coordinator-forced-rejection",
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1"),
+        )
+        backend = FakeHostPeftBackend()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "prepared.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            candidate = backend.train_candidate(job, artifact)
+            decision = HostCandidateValidationResult.create(
+                round_id=manifest.round_id,
+                manifest_hash=manifest.manifest_hash,
+                job_hash=job.job_hash,
+                candidate_result_hash=candidate.result_hash,
+                previous_adapter_version=0,
+                previous_adapter_hash="a" * 64,
+                candidate_adapter_version=1,
+                candidate_adapter_hash="c" * 64,
+                accepted_adapter_version=0,
+                accepted_adapter_hash="a" * 64,
+                baseline_validation_record_hash="b" * 64,
+                candidate_validation_record_hash="d" * 64,
+                previous_macro_mean_answer_token_ce=0.5,
+                candidate_macro_mean_answer_token_ce=0.25,
+                previous_token_weighted_answer_token_ce=0.55,
+                candidate_token_weighted_answer_token_ce=0.3,
+                required_improvement=0.001,
+                observed_improvement=0.25,
+                adapter_promoted=False,
+                decision_reason="forced_validation_rejection",
+                rejected_candidate_discarded=True,
+                created_at=utc_text(),
+            )
+            host_identity = Ed25519Identity(Ed25519PrivateKey.generate())
+            gateway = mock.Mock()
+            gateway.validate_candidate = mock.AsyncMock(
+                return_value=decision
+            )
+
+            async def post_decision_knowledge(value, artifact_path):
+                return write_signed_host_package(
+                    value,
+                    artifact_path,
+                    host_identity,
+                    0,
+                )
+
+            gateway.post_decision_knowledge = mock.AsyncMock(
+                side_effect=post_decision_knowledge
+            )
+            gateway.identity = mock.AsyncMock(
+                return_value=ServiceIdentity(
+                    service_id="legalfedllm-host",
+                    public_key=host_identity.public_key_b64,
+                    model_profile=manifest.host_model_profile,
+                    adapter_version=0,
+                )
+            )
+            service = CoordinatorService(
+                data_dir=Path(directory) / "coordinator",
+                host_gateway=gateway,
+            )
+            state = RoundState(
+                round_id=manifest.round_id,
+                state="DISTILLING",
+                accepted_client_ids=["client-a"],
+                sealed_client_ids=["client-a"],
+                host_adapter_before=0,
+                updated_at=utc_text(),
+            )
+            service.store.write_json(
+                f"rounds/{manifest.round_id}/manifest.json",
+                manifest.model_dump(mode="json"),
+            )
+
+            await service._complete_real_round(  # noqa: SLF001
+                manifest,
+                state,
+                job,
+                candidate,
+            )
+
+            self.assertEqual(state.state, "COMPLETED")
+            self.assertFalse(state.adapter_promoted)
+            self.assertEqual(state.host_adapter_after, 0)
+            package, path = service.get_host_knowledge(manifest.round_id)
+            self.assertEqual(package.adapter_version, 0)
+            self.assertTrue(path.is_file())
+            events = [
+                json.loads(line)
+                for line in service.store.path("audit/events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            validation_event = next(
+                event
+                for event in events
+                if event["event"] == "host_candidate_validated"
+            )
+            self.assertEqual(
+                validation_event["decision_reason"],
+                "forced_validation_rejection",
+            )
+            self.assertTrue(
+                validation_event["rejected_candidate_discarded"]
+            )
 
     async def test_training_job_and_candidate_are_immutable_without_promotion(
         self,
@@ -775,6 +1264,7 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
                 peft_backend=backend,
             )
             runtime.load_reference_data(bundle)
+            runtime.generate_reference_knowledge(manifest)
             artifact_path = Path(directory) / "trainer-inputs.safetensors"
             job = write_test_host_training_job(manifest, artifact_path)
             adapter_before = runtime.active_adapter()
@@ -828,6 +1318,20 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
                     f"rounds/{manifest.round_id}/candidate/result.json"
                 ).is_file()
             )
+
+            decision = await gateway.validate_candidate(job)
+            self.assertTrue(decision.adapter_promoted)
+            self.assertEqual(runtime.adapter_version, 1)
+            incoming = Path(directory) / "post-decision.safetensors"
+            package = await gateway.post_decision_knowledge(
+                manifest,
+                incoming,
+            )
+            self.assertEqual(package.adapter_version, 1)
+            self.assertTrue(
+                package.verify_signature(runtime.identity.public_key_b64)
+            )
+            self.assertTrue(incoming.is_file())
 
     async def test_inference_runs_off_loop_and_rejects_a_concurrent_job(self) -> None:
         backend = FakeHostPeftBackend()
@@ -894,7 +1398,86 @@ class HostMlEndpointTests(unittest.IsolatedAsyncioTestCase):
     "set LEGALFEDLLM_RUN_REAL_HOST_TESTS=true for the pinned Granite Host",
 )
 class RealHostAdapterAcceptanceTests(unittest.TestCase):
-    def test_train_reload_and_retain_host_candidate_without_promotion(self) -> None:
+    def test_train_validate_decide_publish_and_restart(self) -> None:
+        profile = pinned_host_profile()
+        execution = host_execution_profile_from_environment()
+        smoke_sample_count = (
+            2
+            * execution.micro_batch_size
+            * execution.gradient_accumulation_steps
+        )
+        smoke_reference = [
+            reference_sample(f"dp-decision-{index:04d}")
+            for index in range(smoke_sample_count)
+        ]
+        manifest, bundle = host_round_bundle(
+            reference=smoke_reference,
+            round_id="real-host-candidate-decision",
+            host_public_data_epochs=execution.public_data_epochs,
+            alignment=AlignmentConfig(strategy="dtw", profile_version="test-v1"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=backend,
+            )
+            runtime.load_reference_data(bundle)
+            runtime.generate_reference_knowledge(manifest)
+            artifact = Path(directory) / "candidate-decision.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            runtime.load_training_job(job, artifact)
+            runtime.train_candidate(job)
+
+            decision = runtime.validate_candidate_and_decide(job)
+
+            expected_promotion = (
+                decision.observed_improvement
+                >= decision.required_improvement
+            )
+            self.assertEqual(decision.adapter_promoted, expected_promotion)
+            self.assertEqual(
+                decision.accepted_adapter_version,
+                1 if expected_promotion else 0,
+            )
+            package = runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(
+                package.adapter_version,
+                decision.accepted_adapter_version,
+            )
+            self.assertTrue(
+                package.verify_signature(runtime.identity.public_key_b64)
+            )
+
+            restarted_backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            restarted_runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=restarted_backend,
+            )
+            self.assertEqual(
+                restarted_runtime.adapter_version,
+                decision.accepted_adapter_version,
+            )
+            cached = restarted_runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(cached.package_hash, package.package_hash)
+
+    def test_train_validate_force_rejection_publish_and_restart(self) -> None:
         profile = pinned_host_profile()
         execution = host_execution_profile_from_environment()
         smoke_sample_count = (
@@ -923,8 +1506,10 @@ class RealHostAdapterAcceptanceTests(unittest.TestCase):
                 model_profile=profile,
                 training_execution_profile=execution,
                 peft_backend=backend,
+                force_validation_failure=True,
             )
             runtime.load_reference_data(bundle)
+            runtime.generate_reference_knowledge(manifest)
             artifact = Path(directory) / "candidate-smoke.safetensors"
             job = write_test_host_training_job(manifest, artifact)
             runtime.load_training_job(job, artifact)
@@ -945,6 +1530,47 @@ class RealHostAdapterAcceptanceTests(unittest.TestCase):
             self.assertTrue(
                 (candidate_path / "adapter_model.safetensors").is_file()
             )
+
+            decision = runtime.validate_candidate_and_decide(job)
+            self.assertFalse(decision.adapter_promoted)
+            self.assertEqual(
+                decision.decision_reason,
+                "forced_validation_rejection",
+            )
+            self.assertTrue(decision.rejected_candidate_discarded)
+            self.assertEqual(runtime.active_adapter(), active_before)
+            self.assertFalse(candidate_path.exists())
+            package = runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(package.adapter_version, 0)
+            self.assertTrue(
+                package.verify_signature(runtime.identity.public_key_b64)
+            )
+
+            restarted_backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            restarted_runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=restarted_backend,
+                force_validation_failure=True,
+            )
+            self.assertEqual(restarted_runtime.adapter_version, 0)
+            self.assertEqual(
+                restarted_runtime.candidate_validation_decision(
+                    manifest
+                ),
+                decision,
+            )
+            cached = restarted_runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(cached.package_hash, package.package_hash)
 
     def test_initialize_infer_validate_package_and_restart(self) -> None:
         profile = pinned_host_profile()
