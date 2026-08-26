@@ -21,7 +21,10 @@ The repository currently combines:
    and
 7. a real Granite Host path for baseline inference, selective LoRA candidate
    training, private D^V validation, atomic promotion or rejection, signed
-   post-decision publication and Coordinator round finalization.
+   post-decision publication and Coordinator round finalization; and
+8. a real Qwen reverse-distillation path with immutable sparse jobs, archived-
+   parent LoRA training, public held-out validation, a hash-bound SafeFed-style
+   LoRA probe gate and compare-and-swap candidate adoption.
 
 The accepted real-Client run trained a Qwen LoRA candidate, performed teacher-
 forced inference over all 565 accepted D^P samples, produced real top-k logits
@@ -81,10 +84,21 @@ atomic promotion or candidate discard with an immutable decision audit
 post-decision Host inference over D^P
         ↓
 signed Host Knowledge Package verification and round completion
+        ↓
+Client-owned Host-to-Client alignment and strict lower-CE selection
+        ↓
+immutable 90% D^P reverse-training job
+        ↓
+one-epoch Qwen LoRA candidate training and reload verification
+        ↓
+independent 10% D^P quality and SafeFed-style safety gates
+        ↓
+atomic promotion, rejection or stale-parent discard
 ```
 
-The complete mock path remains available, including Client reverse
-synchronization. Real reverse-Client learning is not yet implemented.
+The complete mock path remains available, including deterministic Client reverse
+training decisions. Mock validation and safety values are protocol fixtures, not
+evidence about a real model or classifier.
 
 No Client LoRA tensor is sent to the Coordinator or Host. Private prompt and
 answer text is absent from the signed package metadata and numerical artifact.
@@ -139,6 +153,19 @@ answer text is absent from the signed package metadata and numerical artifact.
   a diagnostic, per-sample D^V metrics remain Host-local, rejected candidate
   weights are discarded, and the accepted adapter produces a signed D^P Host
   package before the Coordinator completes the round.
+- **Immutable Client reverse jobs:** deterministic 90/10 D^P partitioning,
+  Client-owned Host-to-Client alignment, strict Host-better selection, retained
+  Client self-targets, one public-data epoch and exact parent/package/artifact
+  hash binding.
+- **Real Qwen reverse candidate lifecycle:** archived-parent loading,
+  answer-only `0.9` supervised plus `0.1` sparse distillation loss, LoRA-only
+  optimization, frozen-base verification, safetensors save/reload equivalence
+  and restart-safe candidate storage.
+- **Independent Client adoption gates:** macro held-out answer-token CE may
+  regress by at most `0.001`; token-weighted CE and teacher-forced exact-match/
+  ROUGE-L remain diagnostics; a Qwen-specific SafeFed-style probe must report
+  maliciousness below `0.8`; stale parents and either failed gate discard the
+  candidate without overwriting a newer adapter.
 - **Full-corpus validation runner:** exact D^P identity enforcement, signed
   deterministic package round-trips, mixed-client alignment, two-pass
   determinism checks and a machine-readable local resource report.
@@ -154,6 +181,8 @@ LegalFedLLM/
 │   ├── model_profiles.py       Exact pinned Client model profiles
 │   ├── training.py             Data contracts and checkpoint lifecycle
 │   ├── peft_backend.py         Real Transformers/PEFT execution
+│   ├── reverse_training.py     Reverse candidate, validation and decision flow
+│   ├── safety_probe.py         Strict SafeFed-style linear-probe artifact gate
 │   └── knowledge.py            D^P encoding and KnowledgeSample conversion
 ├── coordinator/
 │   ├── main.py                 Public federation API
@@ -170,6 +199,7 @@ LegalFedLLM/
 │   ├── protocol.py             Manifests, profiles and package schemas
 │   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
 │   ├── knowledge_transport.py  Bounded streaming multipart transport
+│   ├── client_reverse_artifact.py  Bounded reverse-training artifact I/O
 │   ├── reference_dataset.py    Canonical schema, JSONL I/O and hashing
 │   ├── prompt.py               Shared reference-prompt renderer
 │   ├── crypto.py               Ed25519 and canonical SHA-256 helpers
@@ -189,6 +219,8 @@ LegalFedLLM/
 │   ├── test_client_knowledge.py
 │   ├── test_client_real_package.py
 │   ├── test_client_real_model.py
+│   ├── test_client_real_reverse.py
+│   ├── test_client_reverse_training.py
 │   └── ...                     Dataset, package, transport and round tests
 ├── scripts/
 │   ├── demo_round.py           Containerized mock-round driver
@@ -369,6 +401,68 @@ The package generator loads the archived round-specific adapter named by the
 validated training record, not whichever adapter happens to be current later.
 Pending retries reuse the exact signed package and exact artifact bytes without a
 second inference run.
+
+## Client reverse distillation and adoption
+
+Client synchronization first verifies the signed post-decision Host package and
+reuses the accepted Client package, adapter snapshot and pinned Host-to-Client
+alignment profile. D^P is deterministically divided into an approximately 90%
+transfer subset and a 10% Client-validation subset. Both subsets retain signed
+order, and their semantic hashes are bound into the reverse job.
+
+Every transfer sample remains in the training artifact. The Host supplies the
+sparse target only when its answer-token mean CE is strictly lower; ties and
+Client-winning samples retain the Client distribution. If no sample selects the
+Host, synchronization records a successful no-op and does not train an adapter.
+Otherwise the real Qwen path:
+
+1. loads the immutable checkpoint that produced the accepted Client package;
+2. trains for exactly one public-data epoch using `0.9` supervised answer CE plus
+   `0.1` selected-teacher sparse CE at temperature `1.0`;
+3. requires finite losses, an optimizer step, changed LoRA tensors, an unchanged
+   frozen base and fresh-load probe-logit equivalence;
+4. evaluates parent and candidate on the held-out public subset;
+5. runs the independent SafeFed-style LoRA-delta probe; and
+6. promotes only when both gates pass and the current pointer still names the
+   archived parent.
+
+The quality rule is non-regression rather than mandatory improvement:
+
+```text
+candidate macro answer-token CE <= parent macro answer-token CE + 0.001
+```
+
+Token-weighted answer-token CE, teacher-forced exact match and teacher-forced
+ROUGE-L are recorded as diagnostics. They are not averaged with the safety
+score. The safety rule is independently:
+
+```text
+maliciousness probability < 0.8
+```
+
+The real safety gate requires `CLIENT_SAFEFED_PROBE_MANIFEST_PATH` to name a
+local JSON manifest whose adjacent `linear_probe.safetensors` contains a
+float32 linear weight and bias. The manifest fixes the exact Qwen model-profile
+hash and revision, LoRA profile hash, ordered first-layer LoRA-B keys and sizes,
+L2 normalization, threshold, training/validation-corpus hashes and weights
+SHA-256. Pickled probe files are not accepted. The repository deliberately does
+not ship unvalidated classifier weights; a missing, mismatched or tampered probe
+fails real reverse training closed.
+
+The probe follows SafeFed-LLM's first-layer LoRA-B delta and linear-probe design,
+but this local candidate gate is a LegalFedLLM adaptation. It is not a claim of
+reproducing SafeFed-LLM's complete federated defense or paper results. See the
+[SafeFed-LLM paper](https://arxiv.org/abs/2601.07177) and
+[official implementation](https://github.com/dmqx/Safe-FedLLM).
+
+The decision record binds the job, parent and candidate hashes, both validation
+records, probe artifact/report hashes, both independent gates and the observed
+active pointer. A failed gate discards candidate weights while retaining the
+audit. If another round has already advanced the Client, the decision is
+`stale_parent`; compare-and-swap discards the stale candidate and never
+overwrites the newer checkpoint. Retrying `/sync` reuses the same decision
+bytes. A Host candidate rollback is not an eligibility block: the retained
+accepted Host may still teach samples on which its CE is strictly lower.
 
 ## Reference dataset boundary
 
@@ -572,16 +666,8 @@ python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-With the complete pinned requirements installed, the current suite contains:
-
-```text
-Ran 184 tests
-OK (skipped=3)
-```
-
-The three skips are the two opt-in real-model acceptance tests and the opt-in
-live-tokenizer acceptance. The ordinary suite does not download or load a
-language model.
+The ordinary suite does not download or load a language model. Pinned Client,
+Host, tokenizer and reverse-training acceptance cases remain explicitly opt-in.
 
 Focused model-free Client tests can be run with:
 
@@ -594,6 +680,51 @@ python -m unittest -v \
   tests.test_fedmkt_integration \
   tests.test_fedmkt_validation
 ```
+
+### Focused Step 6.2 tests
+
+The Step 6.2 suite covers the exact `0.9/0.1` answer-only objective, strict and
+hash-bound probe loading, natural promotion, independent safety rejection,
+forced rejection, zero-Host-teacher no-op, restart/byte idempotence and stale-
+parent discard, including recovery from an interrupted candidate/result commit.
+It also reruns the complete deterministic round path:
+
+```bash
+python -m unittest -v \
+  tests.test_client_reverse_training \
+  tests.test_reverse_integration \
+  tests.test_protocol \
+  tests.test_reference_dataset \
+  tests.test_round
+```
+
+Two opt-in tests execute actual Qwen LoRA reverse optimization, candidate
+safetensors save/reload, held-out validation, promotion, forced rejection and
+restart replay. They download the pinned model if needed and require a compatible
+CUDA/BF16 environment:
+
+```bash
+docker compose -p legalfedllm build client
+docker compose -p legalfedllm run --rm --no-deps -T \
+  -e LEGALFEDLLM_RUN_REAL_CLIENT_REVERSE_TESTS=true \
+  -e LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY=false \
+  client python -m unittest -v tests.test_client_real_reverse
+```
+
+These opt-in tests deliberately inject a deterministic benign probe so model
+training and adoption can be tested before independently calibrated classifier
+weights exist. They do not qualify a production probe. The model-free probe test
+separately exercises the strict `probe.json` plus `linear_probe.safetensors`
+contract, PEFT tensor extraction, the exact `< 0.8` boundary and tamper rejection.
+
+For a production-style `/sync` test, place an independently trained Qwen probe
+at `${CLIENT_SAFEFED_PROBE_DIR}/probe.json` with adjacent
+`linear_probe.safetensors`. The manifest can be created with
+`SafeFedProbeManifest.create(...)`; derive the ordered first-layer LoRA-B keys
+and flattened sizes from a pinned Qwen parent adapter, bind the model/LoRA
+profile hashes and pinned revision, record independent training and validation
+corpus SHA-256 values, and bind the exact weights byte size and SHA-256. Do not
+use a test constant or self-declared benign bias for this production-style run.
 
 ### Build and health-check the services
 
@@ -802,7 +933,7 @@ after importer changes rather than edited manually.
 | `POST` | `/v1/rounds/{id}/local-train` | Train against one signed round |
 | `POST` | `/v1/participate` | Legacy current-round participation |
 | `POST` | `/v1/rounds/{id}/participate` | Generate and submit the round package |
-| `POST` | `/v1/rounds/{id}/sync` | Consume verified Host knowledge |
+| `POST` | `/v1/rounds/{id}/sync` | Verify Host knowledge and complete the local reverse decision |
 | `POST` | `/v1/generate` | Local mock or Ollama inference |
 | `GET` | `/v1/ollama/models` | List installed Ollama models |
 | `POST` | `/v1/ollama/inspect` | Inspect one Ollama model |
@@ -833,6 +964,8 @@ accepted Knowledge Packages
 Host package caches
 submission receipts
 pending and accepted adapter snapshots
+immutable reverse-training jobs and safetensors inputs
+Client candidate, validation, safety and adoption decision records
 ```
 
 For a real package, the adapter version and checkpoint hash come from the signed-
@@ -861,6 +994,8 @@ The current implementation includes:
 - temporary-file cleanup and immutable accepted storage;
 - round-specific training/checkpoint provenance;
 - a minimal deterministic Knowledge Package safety gate; and
+- a strict, local, hash-bound Qwen LoRA-probe artifact boundary for real Client
+  candidate adoption; and
 - append-only JSONL audit events.
 
 Ed25519 proves origin and integrity; it does not encrypt traffic. Compose uses
@@ -910,8 +1045,9 @@ LegalFedLLM supplies the HTTP, security, persistence and round layers.
 
 LegalFedLLM does not yet provide:
 
-- real reverse Client distillation from a Host package;
 - a recorded authoritative five-epoch, full D^P/D^V heterogeneous-model round;
+- a trained and independently calibrated Qwen SafeFed-style probe artifact or a
+  recorded full-D^P real reverse-Client acceptance run;
 - DP-SGD or formal differential-privacy accounting;
 - a learned malicious-package detector;
 - HTTPS, production identity bootstrap or encrypted artifact storage;
@@ -930,10 +1066,12 @@ exercise both promotion and forced candidate rejection, and record wall time,
 peak VRAM/RAM, communication volume, selected teachers, validation metrics and
 adapter sizes.
 
-### Real reverse Client distillation
+### Authoritative real Client reverse acceptance
 
-Verify and align Host knowledge, select samples where the Host teacher is better
-and distil them into a Client-specific LoRA.
+Train and independently validate the Qwen-specific SafeFed-style probe, then run
+the complete 90/10 D^P path through natural promotion, forced rejection,
+no-Host-teacher and stale-parent cases. Record wall time, peak VRAM/RAM, selected
+teachers, both validation records, probe identity and adapter sizes.
 
 ### Complete heterogeneous-model round
 
@@ -949,9 +1087,14 @@ adapter from private examples and turn its outputs over the complete frozen
 now implements the corresponding pinned Granite Host path through exact
 alignment, selective LoRA candidate training, private D^V validation, atomic
 promotion or rejection, signed post-decision D^P publication and Coordinator
-completion. Private examples, Client-native LoRA tensors and per-sample D^V
-metrics remain local.
+completion. The reverse path now constructs an immutable Client-owned job,
+trains a Qwen LoRA candidate from the archived round parent, evaluates it on the
+held-out public split, applies independent quality and hash-bound SafeFed-style
+safety gates, and atomically promotes or discards it. Private examples,
+Client-native LoRA tensors, Client validation details and per-sample D^V metrics
+remain local.
 
 The repository does **not** yet record an authoritative five-epoch full-round
-acceptance, real reverse-Client learning, formal differential privacy, a complete
-Safe-FedLLM defense or production-ready deployment.
+acceptance, a calibrated Qwen probe/full-corpus reverse-Client acceptance,
+formal differential privacy, a complete SafeFed-LLM defense or production-ready
+deployment.
