@@ -12,6 +12,7 @@ import httpx
 
 from client.main import CoordinatorGateway
 from client.main import create_app as create_client_app
+from client.reverse_training import ClientReverseDecision
 from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
 from coordinator.service import CoordinatorService, HostGateway
@@ -210,8 +211,6 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 sync = await client.post(f"/v1/rounds/{round_id}/sync")
             self.assertEqual(sync.status_code, 200, sync.text)
             self.assertEqual(sync.json()["last_completed_round"], round_id)
-            self.assertEqual(sync.json()["candidate_adapter_version"], 1)
-            self.assertEqual(sync.json()["serving_adapter_version"], 0)
 
             reverse_job = ClientReverseTrainingJob.model_validate(
                 json.loads(
@@ -235,6 +234,33 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 len(reverse_job.public_data_partition.validation_sample_ids),
                 1,
             )
+            reverse_decision = ClientReverseDecision.model_validate(
+                json.loads(
+                    (
+                        Path(directory)
+                        / "client-a"
+                        / "reverse_distillation"
+                        / "rounds"
+                        / round_id
+                        / "decision.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            expected_client_version = (
+                2 if reverse_job.host_teacher_sample_ids else 1
+            )
+            self.assertEqual(
+                sync.json()["candidate_adapter_version"],
+                expected_client_version,
+            )
+            self.assertEqual(
+                sync.json()["serving_adapter_version"],
+                expected_client_version,
+            )
+            self.assertEqual(
+                reverse_decision.adapter_promoted,
+                bool(reverse_job.host_teacher_sample_ids),
+            )
             first_job_hash = reverse_job.job_hash
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app_a),
@@ -247,7 +273,14 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
                 retry.json()["last_reverse_training_job_hash"],
                 first_job_hash,
             )
-            self.assertEqual(retry.json()["candidate_adapter_version"], 1)
+            self.assertEqual(
+                retry.json()["last_reverse_decision_hash"],
+                reverse_decision.decision_hash,
+            )
+            self.assertEqual(
+                retry.json()["candidate_adapter_version"],
+                expected_client_version,
+            )
 
             coordinator_root = Path(directory) / "coordinator"
             client_root = Path(directory) / "client-a"
@@ -624,6 +657,22 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(job.host_adapter_promoted)
             self.assertEqual(job.accepted_host_adapter_version, 0)
+            decision = ClientReverseDecision.model_validate(
+                json.loads(
+                    (
+                        Path(directory)
+                        / "client-a"
+                        / "reverse_distillation"
+                        / "rounds"
+                        / round_id
+                        / "decision.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            self.assertEqual(
+                decision.decision_reason,
+                "no_host_teacher_samples",
+            )
 
 
 if __name__ == "__main__":

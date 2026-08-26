@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 from client.model_profiles import pinned_client_profile
+from client.reverse_training import (
+    CLIENT_QUALITY_NON_REGRESSION_TOLERANCE,
+    ClientReverseCandidateResult,
+    ClientReverseDecision,
+    ClientValidationRecord,
+    ClientValidationSampleMetric,
+)
+from client.safety_probe import (
+    SAFED_PROBE_THRESHOLD,
+    ClientSafetyProbeReport,
+    SafeFedLoraProbe,
+)
 from client.training import (
     BackendTrainingResult,
     LocalTrainingRecord,
@@ -118,6 +130,10 @@ class ClientRuntime:
         private_dataset_id: str | None = None,
         training_execution_profile: TrainingExecutionProfile | None = None,
         knowledge_batch_size: int | None = None,
+        reverse_backend: Any | None = None,
+        safety_probe: Any | None = None,
+        safety_probe_manifest_path: str | Path | None = None,
+        force_reverse_validation_failure: bool = False,
         maximum_clock_skew_seconds: int = 900,
         now_fn: Callable[[], Any] = utc_now,
     ):
@@ -159,6 +175,20 @@ class ClientRuntime:
         )
         if self.knowledge_batch_size < 1:
             raise ValueError("knowledge batch size must be positive")
+        self.reverse_backend = reverse_backend
+        self.safety_probe = safety_probe
+        configured_probe_path = safety_probe_manifest_path or os.getenv(
+            "CLIENT_SAFEFED_PROBE_MANIFEST_PATH",
+            "",
+        )
+        self.safety_probe_manifest_path = (
+            Path(configured_probe_path).resolve()
+            if str(configured_probe_path).strip()
+            else None
+        )
+        self.force_reverse_validation_failure = (
+            force_reverse_validation_failure
+        )
 
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
         self.now_fn = now_fn
@@ -194,6 +224,10 @@ class ClientRuntime:
             "local_training_runs": 0,
             "last_completed_round": None,
             "last_training_round": None,
+            "last_reverse_training_job_hash": None,
+            "last_reverse_candidate_result_hash": None,
+            "last_reverse_decision_hash": None,
+            "last_reverse_decision_reason": None,
         }
         if self.store.exists("state.json"):
             state = self.store.read_json("state.json")
@@ -479,6 +513,26 @@ class ClientRuntime:
     @staticmethod
     def _reverse_partition_path(round_id: str) -> str:
         return f"reverse_distillation/rounds/{round_id}/public_partition.json"
+
+    @staticmethod
+    def _reverse_candidate_result_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/candidate/result.json"
+
+    @staticmethod
+    def _reverse_parent_validation_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/validation/parent.json"
+
+    @staticmethod
+    def _reverse_candidate_validation_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/validation/candidate.json"
+
+    @staticmethod
+    def _reverse_safety_report_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/safety/report.json"
+
+    @staticmethod
+    def _reverse_decision_path(round_id: str) -> str:
+        return f"reverse_distillation/rounds/{round_id}/decision.json"
 
     def _validate_package_snapshot(
         self,
@@ -1217,6 +1271,669 @@ class ClientRuntime:
         self.store.delete(pending_artifact_path)
         self.store.delete(snapshot_path)
 
+    def _reverse_backend_instance(self) -> Any:
+        if self.model_profile.training_backend != "transformers":
+            raise ClientRuntimeError("real Client reverse training is unavailable")
+        if self.reverse_backend is None:
+            from client.reverse_training import TransformersPeftReverseBackend
+
+            self.reverse_backend = TransformersPeftReverseBackend(
+                data_dir=self.store.root,
+                model_profile=self.model_profile,
+                execution_profile=self.training_execution_profile,
+                knowledge_batch_size=self.knowledge_batch_size,
+            )
+        return self.reverse_backend
+
+    def _safety_probe_instance(self) -> Any:
+        if self.safety_probe is not None:
+            return self.safety_probe
+        if self.safety_probe_manifest_path is None:
+            raise ClientRuntimeError(
+                "real Client reverse training requires a Qwen-specific "
+                "CLIENT_SAFEFED_PROBE_MANIFEST_PATH"
+            )
+        self.safety_probe = SafeFedLoraProbe(
+            manifest_path=self.safety_probe_manifest_path,
+            model_profile=self.model_profile,
+        )
+        return self.safety_probe
+
+    def _current_reverse_adapter(self) -> tuple[int, str]:
+        if self.model_profile.training_backend == "transformers":
+            if self.adapter_store is None:
+                raise ClientRuntimeError("Client adapter store is unavailable")
+            current = self.adapter_store.current()
+            if current is None:
+                raise ClientRuntimeError("current Client PEFT checkpoint is missing")
+            metadata, _ = current
+            return metadata.version, metadata.checkpoint_hash
+        state = self.state()
+        checkpoint_hash = state.get("training_checkpoint_hash")
+        if checkpoint_hash is None:
+            checkpoint_hash = sha256_hex(state)
+        return int(state["candidate_adapter_version"]), str(checkpoint_hash)
+
+    def _validate_reverse_candidate_result(
+        self,
+        job: ClientReverseTrainingJob,
+        result: ClientReverseCandidateResult,
+    ) -> None:
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "parent_adapter_version": job.parent_adapter_version,
+            "parent_adapter_hash": job.parent_adapter_hash,
+            "candidate_adapter_version": job.parent_adapter_version + 1,
+            "client_model_profile_hash": self.model_profile.profile_hash(),
+            "execution_profile_hash": self.training_execution_profile.profile_hash(),
+            "client_public_data_epochs": job.client_public_data_epochs,
+        }
+        payload = result.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ClientRuntimeError(
+                "Client reverse candidate differs from its job: "
+                + ", ".join(mismatches)
+            )
+
+    def _validate_client_validation_record(
+        self,
+        job: ClientReverseTrainingJob,
+        record: ClientValidationRecord,
+        *,
+        adapter_role: str,
+        adapter_version: int,
+        checkpoint_hash: str,
+    ) -> None:
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "partition_hash": job.public_data_partition.partition_hash,
+            "validation_sample_ids_hash": (
+                job.public_data_partition.validation_sample_ids_sha256
+            ),
+            "client_model_profile_hash": self.model_profile.profile_hash(),
+            "adapter_role": adapter_role,
+            "adapter_version": adapter_version,
+            "checkpoint_hash": checkpoint_hash,
+        }
+        payload = record.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ClientRuntimeError(
+                "Client validation record differs from its job: "
+                + ", ".join(mismatches)
+            )
+        if [sample.sample_id for sample in record.samples] != (
+            job.public_data_partition.validation_sample_ids
+        ):
+            raise ClientRuntimeError("Client validation record changed sample order")
+
+    @staticmethod
+    def _reverse_decision_reason(
+        *,
+        stale_parent: bool,
+        forced_rejection: bool,
+        quality_passed: bool,
+        safety_passed: bool,
+    ) -> str:
+        if stale_parent:
+            return "stale_parent"
+        if forced_rejection:
+            return "forced_validation_rejection"
+        if quality_passed and safety_passed:
+            return "candidate_accepted"
+        if not quality_passed and not safety_passed:
+            return "quality_and_safety_gates_failed"
+        if not quality_passed:
+            return "quality_gate_failed"
+        return "safety_gate_failed"
+
+    def _mock_reverse_candidate(
+        self,
+        job: ClientReverseTrainingJob,
+    ) -> ClientReverseCandidateResult:
+        candidate_hash = sha256_hex(
+            {
+                "backend": "mock",
+                "job_hash": job.job_hash,
+                "parent_adapter_hash": job.parent_adapter_hash,
+                "candidate_adapter_version": job.parent_adapter_version + 1,
+            }
+        )
+        return ClientReverseCandidateResult.create(
+            round_id=job.manifest.round_id,
+            manifest_hash=job.manifest.manifest_hash,
+            job_hash=job.job_hash,
+            parent_adapter_version=job.parent_adapter_version,
+            parent_adapter_hash=job.parent_adapter_hash,
+            candidate_adapter_version=job.parent_adapter_version + 1,
+            candidate_adapter_hash=candidate_hash,
+            client_model_profile_hash=self.model_profile.profile_hash(),
+            execution_profile_hash=self.training_execution_profile.profile_hash(),
+            client_public_data_epochs=1,
+            supervised_loss_weight=0.9,
+            distillation_loss_weight=0.1,
+            loss_type="ce",
+            temperature=1.0,
+            optimizer_step_count=1,
+            optimizer_loss=0.9,
+            supervised_answer_loss=1.0,
+            distillation_answer_loss=0.0,
+            trainable_parameter_count=1,
+            total_parameter_count=2,
+            lora_tensors_changed=True,
+            frozen_base_unchanged=True,
+            reload_verified=True,
+            dependency_versions={"backend": "deterministic-mock"},
+            created_at=utc_text(self.now_fn()),
+        )
+
+    def _mock_validation_record(
+        self,
+        job: ClientReverseTrainingJob,
+        result: ClientReverseCandidateResult,
+        *,
+        adapter_role: str,
+    ) -> ClientValidationRecord:
+        if not job.public_data_partition.validation_sample_ids:
+            raise ClientRuntimeError(
+                "Client public validation split contains no samples"
+            )
+        if adapter_role == "parent":
+            version = result.parent_adapter_version
+            checkpoint_hash = result.parent_adapter_hash
+            ce_loss = 1.0
+        else:
+            version = result.candidate_adapter_version
+            checkpoint_hash = result.candidate_adapter_hash
+            ce_loss = 0.999
+        metrics = [
+            ClientValidationSampleMetric(
+                sample_id=sample_id,
+                answer_token_count=1,
+                answer_token_ce=ce_loss,
+                teacher_forced_exact_match=1.0,
+                teacher_forced_rouge_l=1.0,
+            )
+            for sample_id in job.public_data_partition.validation_sample_ids
+        ]
+        return ClientValidationRecord.create(
+            backend="mock",
+            round_id=job.manifest.round_id,
+            manifest_hash=job.manifest.manifest_hash,
+            job_hash=job.job_hash,
+            partition_hash=job.public_data_partition.partition_hash,
+            client_model_profile_hash=self.model_profile.profile_hash(),
+            adapter_role=adapter_role,
+            adapter_version=version,
+            checkpoint_hash=checkpoint_hash,
+            samples=metrics,
+            created_at=utc_text(self.now_fn()),
+        )
+
+    def _load_or_create_reverse_candidate(
+        self,
+        job: ClientReverseTrainingJob,
+    ) -> ClientReverseCandidateResult:
+        path = self._reverse_candidate_result_path(job.manifest.round_id)
+        if self.store.exists(path):
+            result = ClientReverseCandidateResult.model_validate(
+                self.store.read_json(path)
+            )
+            self._validate_reverse_candidate_result(job, result)
+            if self.model_profile.training_backend == "transformers":
+                self._reverse_backend_instance().validate_candidate(result)
+            return result
+        if self.model_profile.training_backend == "transformers":
+            if self.adapter_store is None:
+                raise ClientRuntimeError("Client adapter store is unavailable")
+            candidate_version = job.parent_adapter_version + 1
+            incomplete_path = self.adapter_store.candidate_path(
+                job.manifest.round_id,
+                candidate_version,
+            )
+            if incomplete_path.exists():
+                metadata, _ = self.adapter_store.candidate(
+                    job.manifest.round_id,
+                    candidate_version,
+                )
+                expected = {
+                    "round_id": job.manifest.round_id,
+                    "manifest_hash": job.manifest.manifest_hash,
+                    "version": candidate_version,
+                    "parent_version": job.parent_adapter_version,
+                    "parent_checkpoint_hash": job.parent_adapter_hash,
+                    "profile_hash": self.model_profile.profile_hash(),
+                    "execution_profile_hash": (
+                        self.training_execution_profile.profile_hash()
+                    ),
+                }
+                metadata_payload = metadata.model_dump(mode="json")
+                mismatches = [
+                    key
+                    for key, value in expected.items()
+                    if metadata_payload[key] != value
+                ]
+                if mismatches:
+                    raise ClientRuntimeError(
+                        "incomplete Client reverse candidate differs from its "
+                        "job: "
+                        + ", ".join(mismatches)
+                    )
+                self.adapter_store.discard_candidate(
+                    job.manifest.round_id,
+                    candidate_version,
+                    metadata.checkpoint_hash,
+                )
+            result = self._reverse_backend_instance().train_candidate(
+                job,
+                self.store.path(self._reverse_artifact_path(job.manifest.round_id)),
+            )
+            self._reverse_backend_instance().validate_candidate(result)
+        else:
+            result = self._mock_reverse_candidate(job)
+        self._validate_reverse_candidate_result(job, result)
+        self.store.write_json_if_absent(path, result.model_dump(mode="json"))
+        return result
+
+    def _load_or_create_reverse_validation(
+        self,
+        job: ClientReverseTrainingJob,
+        result: ClientReverseCandidateResult,
+        *,
+        adapter_role: str,
+        validation_samples: list[Any],
+    ) -> ClientValidationRecord:
+        path = (
+            self._reverse_parent_validation_path(job.manifest.round_id)
+            if adapter_role == "parent"
+            else self._reverse_candidate_validation_path(job.manifest.round_id)
+        )
+        version = (
+            result.parent_adapter_version
+            if adapter_role == "parent"
+            else result.candidate_adapter_version
+        )
+        checkpoint_hash = (
+            result.parent_adapter_hash
+            if adapter_role == "parent"
+            else result.candidate_adapter_hash
+        )
+        if self.store.exists(path):
+            record = ClientValidationRecord.model_validate(
+                self.store.read_json(path)
+            )
+        elif self.model_profile.training_backend == "transformers":
+            record = self._reverse_backend_instance().validation_record(
+                job=job,
+                result=result,
+                validation_samples=validation_samples,
+                adapter_role=adapter_role,
+            )
+            self.store.write_json_if_absent(path, record.model_dump(mode="json"))
+        else:
+            record = self._mock_validation_record(
+                job,
+                result,
+                adapter_role=adapter_role,
+            )
+            self.store.write_json_if_absent(path, record.model_dump(mode="json"))
+        self._validate_client_validation_record(
+            job,
+            record,
+            adapter_role=adapter_role,
+            adapter_version=version,
+            checkpoint_hash=checkpoint_hash,
+        )
+        return record
+
+    def _load_or_create_safety_report(
+        self,
+        job: ClientReverseTrainingJob,
+        result: ClientReverseCandidateResult,
+    ) -> ClientSafetyProbeReport | None:
+        if self.model_profile.training_backend != "transformers":
+            return None
+        path = self._reverse_safety_report_path(job.manifest.round_id)
+        probe = self._safety_probe_instance()
+        if self.store.exists(path):
+            report = ClientSafetyProbeReport.model_validate(
+                self.store.read_json(path)
+            )
+        else:
+            if self.adapter_store is None:
+                raise ClientRuntimeError("Client adapter store is unavailable")
+            parent_metadata, parent_path = self.adapter_store.version(
+                result.parent_adapter_version
+            )
+            if parent_metadata.checkpoint_hash != result.parent_adapter_hash:
+                raise ClientRuntimeError("Client safety parent hash differs")
+            candidate_path = self._reverse_backend_instance().validate_candidate(
+                result
+            )
+            report = probe.evaluate(
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                job_hash=job.job_hash,
+                parent_checkpoint_hash=result.parent_adapter_hash,
+                candidate_checkpoint_hash=result.candidate_adapter_hash,
+                parent_path=parent_path,
+                candidate_path=candidate_path,
+                created_at=utc_text(self.now_fn()),
+            )
+            self.store.write_json_if_absent(path, report.model_dump(mode="json"))
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "model_profile_hash": self.model_profile.profile_hash(),
+            "parent_checkpoint_hash": result.parent_adapter_hash,
+            "candidate_checkpoint_hash": result.candidate_adapter_hash,
+            "probe_artifact_hash": probe.manifest.artifact_hash,
+        }
+        payload = report.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ClientRuntimeError(
+                "Client safety report differs from its job: "
+                + ", ".join(mismatches)
+            )
+        return report
+
+    def _validate_reverse_decision(
+        self,
+        job: ClientReverseTrainingJob,
+        decision: ClientReverseDecision,
+    ) -> None:
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "job_hash": job.job_hash,
+            "host_teacher_sample_count": len(job.host_teacher_sample_ids),
+            "parent_adapter_version": job.parent_adapter_version,
+            "parent_adapter_hash": job.parent_adapter_hash,
+        }
+        payload = decision.model_dump(mode="json")
+        mismatches = [key for key, value in expected.items() if payload[key] != value]
+        if mismatches:
+            raise ClientRuntimeError(
+                "Client reverse decision differs from its job: "
+                + ", ".join(mismatches)
+            )
+        if decision.candidate_result_hash is not None:
+            result = ClientReverseCandidateResult.model_validate(
+                self.store.read_json(
+                    self._reverse_candidate_result_path(job.manifest.round_id)
+                )
+            )
+            self._validate_reverse_candidate_result(job, result)
+            if result.result_hash != decision.candidate_result_hash:
+                raise ClientRuntimeError(
+                    "Client reverse decision uses another candidate result"
+                )
+            for path, expected_hash in (
+                (
+                    self._reverse_parent_validation_path(job.manifest.round_id),
+                    decision.parent_validation_record_hash,
+                ),
+                (
+                    self._reverse_candidate_validation_path(job.manifest.round_id),
+                    decision.candidate_validation_record_hash,
+                ),
+            ):
+                record = ClientValidationRecord.model_validate(
+                    self.store.read_json(path)
+                )
+                if record.record_hash != expected_hash:
+                    raise ClientRuntimeError(
+                        "Client reverse decision uses another validation record"
+                    )
+            if decision.safety_report_hash is not None:
+                report = ClientSafetyProbeReport.model_validate(
+                    self.store.read_json(
+                        self._reverse_safety_report_path(job.manifest.round_id)
+                    )
+                )
+                if report.report_hash != decision.safety_report_hash:
+                    raise ClientRuntimeError(
+                        "Client reverse decision uses another safety report"
+                    )
+
+    def _apply_reverse_decision(
+        self,
+        job: ClientReverseTrainingJob,
+        decision: ClientReverseDecision,
+    ) -> None:
+        if decision.candidate_result_hash is None:
+            return
+        result = ClientReverseCandidateResult.model_validate(
+            self.store.read_json(
+                self._reverse_candidate_result_path(job.manifest.round_id)
+            )
+        )
+        if self.model_profile.training_backend != "transformers":
+            return
+        backend = self._reverse_backend_instance()
+        current_version, current_hash = self._current_reverse_adapter()
+        if decision.adapter_promoted:
+            if (
+                current_version == result.candidate_adapter_version
+                and current_hash == result.candidate_adapter_hash
+            ):
+                return
+            if (
+                current_version == result.parent_adapter_version
+                and current_hash == result.parent_adapter_hash
+            ):
+                backend.promote_candidate(result)
+                return
+            if current_version > result.candidate_adapter_version:
+                if self.adapter_store is None:
+                    raise ClientRuntimeError("Client adapter store is unavailable")
+                archived, _ = self.adapter_store.version(
+                    result.candidate_adapter_version
+                )
+                if archived.checkpoint_hash != result.candidate_adapter_hash:
+                    raise ClientRuntimeError(
+                        "archived promoted Client candidate hash differs"
+                    )
+                return
+            raise ClientRuntimeError(
+                "active Client adapter differs from the promotion decision"
+            )
+        backend.discard_candidate(result)
+
+    def _complete_reverse_distillation(
+        self,
+        job: ClientReverseTrainingJob,
+    ) -> ClientReverseDecision:
+        decision_path = self._reverse_decision_path(job.manifest.round_id)
+        if self.store.exists(decision_path):
+            decision = ClientReverseDecision.model_validate(
+                self.store.read_json(decision_path)
+            )
+            self._validate_reverse_decision(job, decision)
+            self._apply_reverse_decision(job, decision)
+            return decision
+
+        active_version, active_hash = self._current_reverse_adapter()
+        stale_parent = (
+            active_version != job.parent_adapter_version
+            or active_hash != job.parent_adapter_hash
+        )
+        if not job.host_teacher_sample_ids:
+            decision = ClientReverseDecision.create(
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                job_hash=job.job_hash,
+                host_teacher_sample_count=0,
+                parent_adapter_version=job.parent_adapter_version,
+                parent_adapter_hash=job.parent_adapter_hash,
+                candidate_result_hash=None,
+                candidate_adapter_version=None,
+                candidate_adapter_hash=None,
+                active_adapter_version_before_decision=active_version,
+                active_adapter_hash_before_decision=active_hash,
+                accepted_adapter_version=active_version,
+                accepted_adapter_hash=active_hash,
+                parent_validation_record_hash=None,
+                candidate_validation_record_hash=None,
+                safety_report_hash=None,
+                probe_artifact_hash=None,
+                parent_macro_mean_answer_token_ce=None,
+                candidate_macro_mean_answer_token_ce=None,
+                observed_ce_regression=None,
+                quality_non_regression_tolerance=(
+                    CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
+                ),
+                quality_gate_passed=None,
+                maliciousness_probability=None,
+                safety_threshold=None,
+                safety_gate_passed=None,
+                stale_parent=stale_parent,
+                forced_rejection=False,
+                adapter_promoted=False,
+                decision_reason="no_host_teacher_samples",
+                rejected_candidate_discarded=False,
+                created_at=utc_text(self.now_fn()),
+            )
+            self.store.write_json_if_absent(
+                decision_path,
+                decision.model_dump(mode="json"),
+            )
+            return decision
+
+        if not job.public_data_partition.validation_sample_ids:
+            raise ClientRuntimeError(
+                "Client reverse adoption requires a non-empty held-out "
+                "public validation split"
+            )
+
+        if self.model_profile.training_backend == "transformers":
+            self._safety_probe_instance()
+            self.verify_cached_reference_dataset(job.manifest)
+            reference_samples = load_reference_jsonl(
+                self.store.path(
+                    self._reference_dataset_path(job.manifest.round_id)
+                )
+            )
+            by_id = {sample.sample_id: sample for sample in reference_samples}
+            validation_samples = [
+                by_id[sample_id]
+                for sample_id in job.public_data_partition.validation_sample_ids
+            ]
+        else:
+            validation_samples = []
+
+        result = self._load_or_create_reverse_candidate(job)
+        parent_validation = self._load_or_create_reverse_validation(
+            job,
+            result,
+            adapter_role="parent",
+            validation_samples=validation_samples,
+        )
+        candidate_validation = self._load_or_create_reverse_validation(
+            job,
+            result,
+            adapter_role="candidate",
+            validation_samples=validation_samples,
+        )
+        safety_report = self._load_or_create_safety_report(job, result)
+        active_version, active_hash = self._current_reverse_adapter()
+        stale_parent = (
+            active_version != job.parent_adapter_version
+            or active_hash != job.parent_adapter_hash
+        )
+        observed_regression = (
+            candidate_validation.macro_mean_answer_token_ce
+            - parent_validation.macro_mean_answer_token_ce
+        )
+        quality_passed = (
+            observed_regression <= CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
+        )
+        maliciousness_probability = (
+            safety_report.maliciousness_probability
+            if safety_report is not None
+            else 0.0
+        )
+        safety_passed = (
+            safety_report.safety_gate_passed
+            if safety_report is not None
+            else True
+        )
+        forced_rejection = self.force_reverse_validation_failure
+        promoted = (
+            quality_passed
+            and safety_passed
+            and not stale_parent
+            and not forced_rejection
+        )
+        reason = self._reverse_decision_reason(
+            stale_parent=stale_parent,
+            forced_rejection=forced_rejection,
+            quality_passed=quality_passed,
+            safety_passed=safety_passed,
+        )
+        decision = ClientReverseDecision.create(
+            round_id=job.manifest.round_id,
+            manifest_hash=job.manifest.manifest_hash,
+            job_hash=job.job_hash,
+            host_teacher_sample_count=len(job.host_teacher_sample_ids),
+            parent_adapter_version=result.parent_adapter_version,
+            parent_adapter_hash=result.parent_adapter_hash,
+            candidate_result_hash=result.result_hash,
+            candidate_adapter_version=result.candidate_adapter_version,
+            candidate_adapter_hash=result.candidate_adapter_hash,
+            active_adapter_version_before_decision=active_version,
+            active_adapter_hash_before_decision=active_hash,
+            accepted_adapter_version=(
+                result.candidate_adapter_version if promoted else active_version
+            ),
+            accepted_adapter_hash=(
+                result.candidate_adapter_hash if promoted else active_hash
+            ),
+            parent_validation_record_hash=parent_validation.record_hash,
+            candidate_validation_record_hash=candidate_validation.record_hash,
+            safety_report_hash=(
+                safety_report.report_hash if safety_report is not None else None
+            ),
+            probe_artifact_hash=(
+                safety_report.probe_artifact_hash
+                if safety_report is not None
+                else None
+            ),
+            parent_macro_mean_answer_token_ce=(
+                parent_validation.macro_mean_answer_token_ce
+            ),
+            candidate_macro_mean_answer_token_ce=(
+                candidate_validation.macro_mean_answer_token_ce
+            ),
+            observed_ce_regression=observed_regression,
+            quality_non_regression_tolerance=(
+                CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
+            ),
+            quality_gate_passed=quality_passed,
+            maliciousness_probability=maliciousness_probability,
+            safety_threshold=SAFED_PROBE_THRESHOLD,
+            safety_gate_passed=safety_passed,
+            stale_parent=stale_parent,
+            forced_rejection=forced_rejection,
+            adapter_promoted=promoted,
+            decision_reason=reason,
+            rejected_candidate_discarded=not promoted,
+            created_at=utc_text(self.now_fn()),
+        )
+        self.store.write_json_if_absent(
+            decision_path,
+            decision.model_dump(mode="json"),
+        )
+        self._apply_reverse_decision(job, decision)
+        return decision
+
     def apply_host_knowledge(
         self,
         *,
@@ -1557,14 +2274,6 @@ class ClientRuntime:
                     self.store.delete(partition_path)
                 raise
 
-        state = self.state()
-        # Step 6.1 prepares a job only. Step 6.2 owns training, validation,
-        # compare-and-swap promotion, and serving-pointer changes.
-        state["last_completed_round"] = round_id
-        state["last_host_adapter_version"] = host_package.adapter_version
-        state["host_distillation_samples"] = batch.audit.host_teacher_sample_ids
-        state["last_reverse_training_job_hash"] = job.job_hash
-
         host_cache_package = self._host_package_path(round_id)
         host_cache_artifact = self._host_artifact_path(round_id)
         host_cache_exists = (
@@ -1598,6 +2307,42 @@ class ClientRuntime:
                 if not self.store.exists(host_cache_package):
                     self.store.delete(host_cache_artifact)
                 raise
+
+        decision = self._complete_reverse_distillation(job)
+        state = self.state()
+        if self.model_profile.training_backend == "transformers":
+            current_version, current_hash = self._current_reverse_adapter()
+            state["candidate_adapter_version"] = current_version
+            state["training_adapter_version"] = current_version
+            state["training_checkpoint_hash"] = current_hash
+            if self.model_profile.serving_backend == "mock":
+                state["serving_adapter_version"] = current_version
+        elif decision.adapter_promoted:
+            if (
+                int(state["candidate_adapter_version"])
+                == decision.parent_adapter_version
+            ):
+                state["candidate_adapter_version"] = (
+                    decision.accepted_adapter_version
+                )
+                state["training_adapter_version"] = (
+                    decision.accepted_adapter_version
+                )
+                state["training_checkpoint_hash"] = (
+                    decision.accepted_adapter_hash
+                )
+                state["serving_adapter_version"] = (
+                    decision.accepted_adapter_version
+                )
+        state["last_completed_round"] = round_id
+        state["last_host_adapter_version"] = host_package.adapter_version
+        state["host_distillation_samples"] = batch.audit.host_teacher_sample_ids
+        state["last_reverse_training_job_hash"] = job.job_hash
+        state["last_reverse_candidate_result_hash"] = (
+            decision.candidate_result_hash
+        )
+        state["last_reverse_decision_hash"] = decision.decision_hash
+        state["last_reverse_decision_reason"] = decision.decision_reason
 
         self.store.write_json("state.json", state)
 

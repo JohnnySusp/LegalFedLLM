@@ -233,6 +233,11 @@ def runtime_from_environment() -> ClientRuntime:
         maximum_clock_skew_seconds=int(
             os.getenv("MAXIMUM_CLOCK_SKEW_SECONDS", "900")
         ),
+        force_reverse_validation_failure=os.getenv(
+            "CLIENT_FORCE_REVERSE_VALIDATION_FAILURE",
+            "false",
+        ).strip().lower()
+        in {"1", "true", "yes"},
     )
 
 
@@ -488,7 +493,7 @@ def create_app(
                 )
             )
 
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             raise HTTPException(
                 status_code=409,
                 detail=str(exc),

@@ -88,6 +88,8 @@ services:
       CLIENT_GRADIENT_CHECKPOINTING: ${CLIENT_GRADIENT_CHECKPOINTING:-false}
       CLIENT_VERIFY_FROZEN_BASE_CHECKSUM: ${CLIENT_VERIFY_FROZEN_BASE_CHECKSUM:-false}
       CLIENT_KNOWLEDGE_BATCH_SIZE: ${CLIENT_KNOWLEDGE_BATCH_SIZE:-1}
+      CLIENT_SAFEFED_PROBE_MANIFEST_PATH: ${CLIENT_SAFEFED_PROBE_MANIFEST_PATH:-/safety-probe/probe.json}
+      CLIENT_FORCE_REVERSE_VALIDATION_FAILURE: ${CLIENT_FORCE_REVERSE_VALIDATION_FAILURE:-false}
       HF_HOME: /models/huggingface
       HF_TOKEN: ${HF_TOKEN:-}
     ports:
@@ -96,6 +98,7 @@ services:
       - client_data:/data/client
       - huggingface_cache:/models/huggingface
       - ${CLIENT_PRIVATE_DATA_DIR:-./data/client-private}:/private:ro
+      - ${CLIENT_SAFEFED_PROBE_DIR:-./data/client-safety-probe}:/safety-probe:ro
     depends_on:
       coordinator:
         condition: service_healthy
