@@ -51,6 +51,12 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
                     attention_length=len(source),
                     top_k_token_ids=[[10 + index, 20 + index] for _ in source],
                     top_k_logits=[[2.5 + index, 1.5 + index] for _ in source],
+                    full_logsumexp=[
+                        3.75 + (2 * index), 5.5 + index, 5.5 + index
+                    ],
+                    gold_token_ids=[10 + index, -100, -100],
+                    gold_token_logits=[2.5 + index, 0.0, 0.0],
+                    gold_token_nll=[1.25 + index, 0.0, 0.0],
                     ce_loss=1.25 + index,
                 )
             )

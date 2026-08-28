@@ -16,6 +16,10 @@
 PER_STEP_LOGITS = "per_step_logits"
 PER_STEP_INDICES = "per_step_indices"
 METRIC = "metric"
+FULL_LOGSUMEXP = "full_logsumexp"
+GOLD_TOKEN_IDS = "gold_token_ids"
+GOLD_TOKEN_LOGITS = "gold_token_logits"
+GOLD_TOKEN_NLL = "gold_token_nll"
 
 ALIGNED_OTHER_LOGITS = "aligned_other_logits"
 ALIGNED_OTHER_INDICES = "aligned_other_indices"

@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -151,8 +152,20 @@ def _knowledge_rows(
 ) -> KnowledgeSample:
     token_rows: list[list[int]] = []
     logit_rows: list[list[float]] = []
+    full_logsumexp: list[float] = []
+    gold_token_ids = [-100] * len(encoded.input_ids)
+    gold_token_logits = [0.0] * len(encoded.input_ids)
+    gold_token_nll = [0.0] * len(encoded.input_ids)
+    for position in range(len(encoded.input_ids) - 1):
+        gold_token_ids[position] = encoded.labels[position + 1]
+
     for position, source_token_id in enumerate(encoded.input_ids):
-        candidates = [source_token_id, *token_pool]
+        gold_token_id = gold_token_ids[position]
+        candidates = [
+            *([gold_token_id] if gold_token_id != -100 else []),
+            source_token_id,
+            *token_pool,
+        ]
         selected: list[int] = []
         for token_id in candidates:
             if token_id not in selected:
@@ -163,15 +176,36 @@ def _knowledge_rows(
             raise ValueError("could not construct a unique top-k row")
         token_rows.append(selected)
         offset = (position % 11) / 1000
-        logit_rows.append(
-            [float(top_k - rank) + offset for rank in range(top_k)]
-        )
+        logits = [
+            4.0 + offset,
+            *[
+                float(-rank) + offset
+                for rank in range(top_k - 1)
+            ],
+        ]
+        logit_rows.append(logits)
+        if gold_token_id != -100:
+            gold_logit = logits[0]
+            gold_token_logits[position] = gold_logit
+            gold_token_nll[position] = ce_loss
+            full_logsumexp.append(gold_logit + ce_loss)
+        else:
+            maximum = max(logits)
+            top_k_logsumexp = maximum + math.log(
+                sum(math.exp(value - maximum) for value in logits)
+            )
+            full_logsumexp.append(top_k_logsumexp + 0.25)
+
     return KnowledgeSample(
         sample_id=encoded.sample_id,
         source_input_ids=encoded.input_ids,
         attention_length=len(encoded.input_ids),
         top_k_token_ids=token_rows,
         top_k_logits=logit_rows,
+        full_logsumexp=full_logsumexp,
+        gold_token_ids=gold_token_ids,
+        gold_token_logits=gold_token_logits,
+        gold_token_nll=gold_token_nll,
         ce_loss=ce_loss,
     )
 

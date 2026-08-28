@@ -203,6 +203,35 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(status_payload["adapter_promoted"])
             self.assertEqual(stack.host_runtime.adapter_version, 1)
 
+            safety_response = await stack.coordinator_request(
+                "GET",
+                f"/v1/rounds/{round_id}/safety",
+                headers={"X-Admin-Token": stack.admin_token},
+            )
+            self.assertEqual(safety_response.status_code, 200, safety_response.text)
+            safety_payload = safety_response.json()
+            self.assertEqual(set(safety_payload), {"client-a", "client-b"})
+            for client_id in ("client-a", "client-b"):
+                self.assertEqual(
+                    safety_payload[client_id]["probe_stage"],
+                    "post_alignment",
+                )
+                self.assertEqual(
+                    safety_payload[client_id]["score_components"]["peer_consistency"],
+                    0.5,
+                )
+                self.assertGreaterEqual(safety_payload[client_id]["trust_score"], 0.5)
+                history = json.loads(
+                    (
+                        Path(directory)
+                        / "coordinator"
+                        / "trust_history"
+                        / f"{client_id}.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(history["completed_rounds"], 1)
+                self.assertEqual(history["last_round_id"], round_id)
+
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app_a),
                 base_url="http://client-a",

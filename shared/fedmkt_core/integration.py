@@ -18,6 +18,7 @@ from shared.fedmkt_core.ml.sparse_targets import (
 from shared.fedmkt_core.ml.token_alignment import transform_step_logits
 from shared.fedmkt_core.safety import (
     MINIMUM_TRUST_SCORE,
+    finalize_aligned_safety_reports,
     is_eligible_for_distillation,
 )
 from shared.protocol import (
@@ -39,7 +40,7 @@ from shared.vocabulary_mapping import (
 )
 
 
-INTEGRATION_AUDIT_SCHEMA_VERSION = "2.0"
+INTEGRATION_AUDIT_SCHEMA_VERSION = "3.0"
 CLIENT_TO_HOST_DIRECTION = "client_to_host"
 
 
@@ -80,12 +81,13 @@ class SampleTeacherAudit(ContractModel):
 
 
 class DistillationIntegrationAudit(ContractModel):
-    schema_version: Literal["2.0"] = INTEGRATION_AUDIT_SCHEMA_VERSION
+    schema_version: Literal["3.0"] = INTEGRATION_AUDIT_SCHEMA_VERSION
     round_id: str = Field(min_length=1, max_length=128)
     dataset_hash: str = Field(pattern=HASH_PATTERN)
     alignments: list[AlignmentMappingAudit] = Field(min_length=1)
     accepted_client_ids: list[str]
     rejected_clients: list[RejectedClientAudit]
+    safety_reports: dict[str, SafetyReport]
     source_packages: list[SourcePackageAudit] = Field(min_length=1)
     samples: list[SampleTeacherAudit] = Field(min_length=1)
     empty_aligned_row_fallback_count: int = Field(ge=0)
@@ -471,6 +473,7 @@ def integrate_distillation_round(
     client_packages: Sequence[KnowledgePackage],
     client_samples: Mapping[str, Sequence[KnowledgeSample]],
     safety_reports: Mapping[str, SafetyReport],
+    historical_reliability: Mapping[str, float] | None = None,
     selected_client_ids: Sequence[str],
     trusted_client_quorum: int,
     labels_by_sample: Mapping[str, Sequence[int]],
@@ -558,7 +561,10 @@ def integrate_distillation_round(
             reasons.append("safety report is missing")
         elif not report.accepted:
             reasons.extend(report.reasons or ["hard protocol checks failed"])
-        elif report.trust_score < MINIMUM_TRUST_SCORE:
+        elif (
+            report.probe_stage == "post_alignment"
+            and report.trust_score < MINIMUM_TRUST_SCORE
+        ):
             reasons.append(
                 f"trust_score {report.trust_score} is below "
                 f"{MINIMUM_TRUST_SCORE}"
@@ -566,7 +572,10 @@ def integrate_distillation_round(
         if reasons:
             _rejection(rejected, client_id, reasons)
             continue
-        if not is_eligible_for_distillation(report):
+        if (
+            report.probe_stage == "post_alignment"
+            and not is_eligible_for_distillation(report)
+        ):
             raise AssertionError("eligible report gate and reasons diverged")
         try:
             validate_addressable_token_ids(
@@ -691,6 +700,43 @@ def integrate_distillation_round(
         eligible = [client_id for client_id in eligible if client_id not in failed]
         _check_quorum(eligible, trusted_client_quorum, rejected)
 
+    final_safety_reports = dict(safety_reports)
+    if any(
+        final_safety_reports[client_id].probe_stage == "pre_alignment"
+        for client_id in eligible
+    ):
+        finalized = finalize_aligned_safety_reports(
+            host_samples=host_samples,
+            client_samples=client_samples,
+            aligned_by_client=aligned_by_client,
+            pre_alignment_reports={
+                client_id: final_safety_reports[client_id]
+                for client_id in eligible
+            },
+            selected_client_ids=eligible,
+            historical_reliability=historical_reliability,
+        )
+        final_safety_reports.update(finalized)
+
+    trust_rejected: list[str] = []
+    for client_id in eligible:
+        report = final_safety_reports[client_id]
+        if not is_eligible_for_distillation(report):
+            _rejection(
+                rejected,
+                client_id,
+                report.reasons
+                or [
+                    f"trust_score {report.trust_score} is below "
+                    f"{MINIMUM_TRUST_SCORE}"
+                ],
+            )
+            trust_rejected.append(client_id)
+    eligible = [
+        client_id for client_id in eligible if client_id not in trust_rejected
+    ]
+    _check_quorum(eligible, trusted_client_quorum, rejected)
+
     selected_samples: list[ValidatedDistillationSample] = []
     sample_audits: list[SampleTeacherAudit] = []
     selected_ids: list[list[list[int]]] = []
@@ -739,7 +785,7 @@ def integrate_distillation_round(
                 (
                     sample.ce_loss,
                     client_id,
-                    safety_reports[client_id].trust_score,
+                    final_safety_reports[client_id].trust_score,
                     ids,
                     logits,
                     fallback_count,
@@ -855,9 +901,18 @@ def integrate_distillation_round(
                 ),
             )
             for profile_id in mapping_resolutions
+            if any(
+                client_profile_ids[client_id] == profile_id
+                for client_id in eligible
+            )
         ],
         accepted_client_ids=list(eligible),
         rejected_clients=rejected_audits,
+        safety_reports={
+            client_id: final_safety_reports[client_id]
+            for client_id in selected_client_ids
+            if client_id in final_safety_reports
+        },
         source_packages=source_packages,
         samples=sample_audits,
         empty_aligned_row_fallback_count=sum(

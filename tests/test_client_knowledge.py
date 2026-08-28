@@ -116,6 +116,10 @@ class ReferenceKnowledgeEncodingTests(unittest.TestCase):
             encoded,
             top_k_token_ids=rows,
             top_k_logits=logits,
+            full_logsumexp=[float(index) + 1.0 for index in range(9)],
+            gold_token_ids=[0, *([-100] * 8)],
+            gold_token_logits=[0.75, *([0.0] * 8)],
+            gold_token_nll=[0.25, *([0.0] * 8)],
             ce_loss=0.25,
         )
 
@@ -213,7 +217,15 @@ class FedMKTAnswerOnlyMetricTests(unittest.TestCase):
         import torch
 
         from shared.fedmkt_core.ml.logit_generation import generate_pub_data_logits
-        from shared.fedmkt_core.ml.vars_define import PER_STEP_INDICES, PER_STEP_LOGITS
+        from shared.fedmkt_core.ml.vars_define import (
+            FULL_LOGSUMEXP,
+            GOLD_TOKEN_IDS,
+            GOLD_TOKEN_LOGITS,
+            GOLD_TOKEN_NLL,
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
 
         observations: dict[str, object] = {}
 
@@ -262,6 +274,26 @@ class FedMKTAnswerOnlyMetricTests(unittest.TestCase):
         self.assertEqual(result[PER_STEP_INDICES][0, 0].tolist(), [5, 4])
         self.assertEqual(result[PER_STEP_LOGITS][0, 0].tolist(), [5.0, 4.0])
         self.assertEqual(result[PER_STEP_LOGITS].dtype, torch.float32)
+        expected_lse = torch.logsumexp(torch.arange(6, dtype=torch.float32), dim=0)
+        torch.testing.assert_close(
+            result[FULL_LOGSUMEXP][0],
+            expected_lse.repeat(3),
+        )
+        self.assertEqual(result[GOLD_TOKEN_IDS][0].tolist(), [2, 3, -100])
+        torch.testing.assert_close(
+            result[GOLD_TOKEN_LOGITS][0],
+            torch.tensor([2.0, 3.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            result[GOLD_TOKEN_NLL][0],
+            torch.tensor(
+                [float(expected_lse - 2.0), float(expected_lse - 3.0), 0.0]
+            ),
+        )
+        torch.testing.assert_close(
+            result[METRIC],
+            torch.tensor([float(expected_lse - 2.5)]),
+        )
 
 
 if __name__ == "__main__":

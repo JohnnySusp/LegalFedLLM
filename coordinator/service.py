@@ -24,13 +24,16 @@ from shared.distillation_artifact import (
 )
 from shared.fedmkt_core import (
     dual_min_ce_select,
+    finalize_aligned_safety_reports,
     inspect_knowledge_package,
-    is_eligible_for_distillation,
+    new_client_trust_history,
+    update_client_trust_history,
 )
 from shared.knowledge_artifact import load_package_samples
 from shared.knowledge_transport import receive_knowledge_transfer
 from shared.protocol import (
     ClientRegistrationRequest,
+    ClientTrustHistory,
     DistillationJob,
     DistillationResult,
     KnowledgePackage,
@@ -72,6 +75,10 @@ class NotFoundError(CoordinatorError):
 
 class ConflictError(CoordinatorError):
     status_code = 409
+
+
+class TrustedQuorumError(ConflictError):
+    pass
 
 
 class AuthenticationError(CoordinatorError):
@@ -561,6 +568,69 @@ class CoordinatorService:
             raise NotFoundError(f"round {round_id!r} does not exist")
         return RoundState.model_validate(self.store.read_json(path))
 
+    def get_safety_reports(self, round_id: str) -> dict[str, SafetyReport]:
+        manifest = self.get_manifest(round_id)
+        reports: dict[str, SafetyReport] = {}
+        for client_id in manifest.selected_client_ids:
+            path = f"rounds/{round_id}/safety/{client_id}.json"
+            if self.store.exists(path):
+                reports[client_id] = SafetyReport.model_validate(
+                    self.store.read_json(path)
+                )
+        return reports
+
+    def _load_client_trust_history(self, client_id: str) -> ClientTrustHistory:
+        path = f"trust_history/{client_id}.json"
+        if not self.store.exists(path):
+            return new_client_trust_history(client_id)
+        history = ClientTrustHistory.model_validate(self.store.read_json(path))
+        if history.client_id != client_id:
+            raise ConflictError("persisted Client trust history has another identity")
+        return history
+
+    def _historical_reliability(
+        self, client_ids: list[str]
+    ) -> dict[str, float]:
+        return {
+            client_id: self._load_client_trust_history(client_id).reliability
+            for client_id in client_ids
+        }
+
+    def _persist_final_safety_reports(
+        self, round_id: str, reports: dict[str, SafetyReport]
+    ) -> None:
+        for client_id, report in reports.items():
+            if report.probe_stage != "post_alignment":
+                continue
+            report_path = f"rounds/{round_id}/safety/{client_id}.json"
+            prior_stage = None
+            if self.store.exists(report_path):
+                prior_stage = SafetyReport.model_validate(
+                    self.store.read_json(report_path)
+                ).probe_stage
+            self.store.write_json(report_path, report.model_dump(mode="json"))
+            history = self._load_client_trust_history(client_id)
+            updated = update_client_trust_history(
+                history,
+                round_id=round_id,
+                sample_risks=report.sample_risks,
+            )
+            self.store.write_json(
+                f"trust_history/{client_id}.json",
+                updated.model_dump(mode="json"),
+            )
+            if prior_stage != "post_alignment":
+                self._audit(
+                    "package_trust_finalized",
+                    {
+                        "round_id": round_id,
+                        "client_id": client_id,
+                        "trust_score": report.trust_score,
+                        "accepted": report.accepted,
+                        "score_components": report.score_components,
+                    },
+                )
+
     async def monitor_once(self) -> None:
         if not self.store.exists("rounds/current.json"):
             return
@@ -698,16 +768,13 @@ class CoordinatorService:
                 f"rounds/{manifest.round_id}/safety/{package.sender_id}.json",
                 safety.model_dump(mode="json"),
             )
-            if not is_eligible_for_distillation(safety):
+            if not safety.accepted:
                 self._record_package_rejection(
                     state,
                     package,
-                    safety.reasons
-                    or ["trust score is below the distillation threshold"],
+                    safety.reasons or ["Knowledge Package failed hard safety checks"],
                 )
-                raise ConflictError(
-                    "Knowledge Package failed the safety probe"
-                )
+                raise ConflictError("Knowledge Package failed the safety probe")
 
             self._persist_knowledge_package(
                 package_path=(
@@ -987,6 +1054,10 @@ class CoordinatorService:
                     manifest.host_model_profile.vocabulary_size or 0
                 ),
             )
+            self._persist_final_safety_reports(
+                manifest.round_id,
+                audit.safety_reports,
+            )
             return job
         except (KeyError, OSError, TypeError, ValueError) as exc:
             raise ConflictError(
@@ -1003,7 +1074,10 @@ class CoordinatorService:
         client_samples: dict[str, list[KnowledgeSample]],
         reports: dict[str, SafetyReport],
     ) -> HostTrainingJob:
-        from shared.fedmkt_core.integration import integrate_distillation_round
+        from shared.fedmkt_core.integration import (
+            TrustedClientQuorumError,
+            integrate_distillation_round,
+        )
 
         root = f"rounds/{manifest.round_id}/host_training_job"
         job_path = f"{root}/job.json"
@@ -1034,24 +1108,30 @@ class CoordinatorService:
             maximum_sequence_length=manifest.maximum_sequence_length,
             expected_sample_ids=manifest.sample_ids,
         )
-        batch = integrate_distillation_round(
-            profile=profile,
-            client_tokenizer=client_tokenizer,
-            host_tokenizer=host_tokenizer,
-            mapping_cache=VocabularyMappingCache(
-                self.store.path("vocabulary_mappings")
-            ),
-            host_package=baseline,
-            host_samples=baseline_samples,
-            client_packages=packages,
-            client_samples=client_samples,
-            safety_reports=reports,
-            selected_client_ids=manifest.selected_client_ids,
-            trusted_client_quorum=manifest.trusted_client_quorum,
-            labels_by_sample={item.sample_id: item.labels for item in encoded},
-            temperature=manifest.distillation.temperature,
-            loss_type=manifest.distillation.loss_type,
-        )
+        try:
+            batch = integrate_distillation_round(
+                profile=profile,
+                client_tokenizer=client_tokenizer,
+                host_tokenizer=host_tokenizer,
+                mapping_cache=VocabularyMappingCache(
+                    self.store.path("vocabulary_mappings")
+                ),
+                host_package=baseline,
+                host_samples=baseline_samples,
+                client_packages=packages,
+                client_samples=client_samples,
+                safety_reports=reports,
+                selected_client_ids=manifest.selected_client_ids,
+                trusted_client_quorum=manifest.trusted_client_quorum,
+                labels_by_sample={item.sample_id: item.labels for item in encoded},
+                temperature=manifest.distillation.temperature,
+                loss_type=manifest.distillation.loss_type,
+                historical_reliability=self._historical_reliability(
+                    list(manifest.selected_client_ids)
+                ),
+            )
+        except TrustedClientQuorumError as exc:
+            raise TrustedQuorumError(str(exc)) from exc
         pad_token_id = profile.host.pad_token_id
         if pad_token_id is None:
             raise ConflictError("approved Host tokenizer has no padding token")
@@ -1083,6 +1163,10 @@ class CoordinatorService:
             self.store.write_json_if_absent(
                 job_path,
                 job.model_dump(mode="json"),
+            )
+            self._persist_final_safety_reports(
+                manifest.round_id,
+                batch.audit.safety_reports,
             )
             return job
         except Exception:
@@ -1540,6 +1624,50 @@ class CoordinatorService:
                     result,
                 )
                 return
+            aligned_by_client = {
+                client_id: {
+                    sample.sample_id: (
+                        sample.top_k_token_ids,
+                        sample.top_k_logits,
+                        0,
+                    )
+                    for sample in client_samples[client_id]
+                }
+                for client_id in state.sealed_client_ids
+            }
+            reports = finalize_aligned_safety_reports(
+                host_samples=baseline_samples,
+                client_samples=client_samples,
+                aligned_by_client=aligned_by_client,
+                pre_alignment_reports=reports,
+                selected_client_ids=state.sealed_client_ids,
+                historical_reliability=self._historical_reliability(
+                    state.sealed_client_ids
+                ),
+            )
+            self._persist_final_safety_reports(manifest.round_id, reports)
+            trusted_ids = [
+                client_id
+                for client_id in state.sealed_client_ids
+                if reports[client_id].accepted
+                and reports[client_id].trust_score >= 0.50
+            ]
+            if len(trusted_ids) < manifest.trusted_client_quorum:
+                state.state = "SKIPPED"
+                state.message = (
+                    "trusted Client quorum was lost after post-alignment trust scoring"
+                )
+                state.updated_at = utc_text(self.now_fn())
+                self._write_state(state)
+                self._audit(
+                    "round_skipped",
+                    {
+                        "round_id": manifest.round_id,
+                        "reason": state.message,
+                        "trusted_client_ids": trusted_ids,
+                    },
+                )
+                return
             dataset = dual_min_ce_select(
                 host_package=baseline,
                 host_samples=baseline_samples,
@@ -1655,6 +1783,15 @@ class CoordinatorService:
                     "selected_samples": len(dataset.samples),
                 },
             )
+        except TrustedQuorumError as exc:
+            state.state = "SKIPPED"
+            state.message = str(exc)
+            state.updated_at = utc_text(self.now_fn())
+            self._write_state(state)
+            self._audit(
+                "round_skipped", {"round_id": manifest.round_id, "reason": str(exc)}
+            )
+            return
         except Exception as exc:
             state.state = "ABORTED"
             state.message = str(exc)

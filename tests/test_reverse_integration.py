@@ -43,6 +43,10 @@ def samples(losses: tuple[float, float], offset: int) -> list[KnowledgeSample]:
                 [8 + offset, 9 + offset],
             ],
             top_k_logits=[[2.0, 1.0], [2.0, 1.0], [2.0, 1.0]],
+            full_logsumexp=[2.0 + loss, 4.0, 4.0],
+            gold_token_ids=[4 + offset, -100, -100],
+            gold_token_logits=[2.0, 0.0, 0.0],
+            gold_token_nll=[loss, 0.0, 0.0],
             ce_loss=loss,
         )
         for sample_id, loss in zip(("s1", "s2"), losses)
@@ -177,6 +181,10 @@ class ReverseIntegrationTests(unittest.TestCase):
             attention_length=3,
             top_k_token_ids=[[1, 4], [2, 4], [3, 4]],
             top_k_logits=[[3.0, 0.0]] * 3,
+            full_logsumexp=[3.1, 5.0, 5.0],
+            gold_token_ids=[1, -100, -100],
+            gold_token_logits=[3.0, 0.0, 0.0],
+            gold_token_nll=[0.1, 0.0, 0.0],
             ce_loss=0.1,
         )
         client_sample = KnowledgeSample(
@@ -185,6 +193,10 @@ class ReverseIntegrationTests(unittest.TestCase):
             attention_length=3,
             top_k_token_ids=[[10, 13], [11, 13], [12, 13]],
             top_k_logits=[[2.0, 0.0]] * 3,
+            full_logsumexp=[2.2, 4.0, 4.0],
+            gold_token_ids=[10, -100, -100],
+            gold_token_logits=[2.0, 0.0, 0.0],
+            gold_token_nll=[0.2, 0.0, 0.0],
             ce_loss=0.2,
         )
         common = {

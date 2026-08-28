@@ -15,6 +15,7 @@ from client.training import (
     execution_profile_from_environment,
 )
 from shared.crypto import Ed25519Identity, sha256_hex
+from shared.fedmkt_core.safety import inspect_knowledge_package
 from shared.knowledge_artifact import load_package_samples
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import (
@@ -220,6 +221,9 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 [sample.sample_id for sample in knowledge],
                 [sample.sample_id for sample in reference_samples],
             )
+            safety = inspect_knowledge_package(package, knowledge)
+            self.assertTrue(safety.accepted, safety.reasons)
+            self.assertEqual(safety.probe_stage, "pre_alignment")
             for sample in knowledge:
                 self.assertEqual(
                     sample.attention_length,

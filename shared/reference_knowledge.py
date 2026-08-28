@@ -85,6 +85,10 @@ def knowledge_sample_from_rows(
     *,
     top_k_token_ids: Sequence[Sequence[int]],
     top_k_logits: Sequence[Sequence[float]],
+    full_logsumexp: Sequence[float],
+    gold_token_ids: Sequence[int],
+    gold_token_logits: Sequence[float],
+    gold_token_nll: Sequence[float],
     ce_loss: float,
 ) -> KnowledgeSample:
     length = len(encoded.input_ids)
@@ -94,5 +98,9 @@ def knowledge_sample_from_rows(
         attention_length=length,
         top_k_token_ids=[list(row) for row in top_k_token_ids[:length]],
         top_k_logits=[list(row) for row in top_k_logits[:length]],
+        full_logsumexp=list(full_logsumexp[:length]),
+        gold_token_ids=list(gold_token_ids[:length]),
+        gold_token_logits=list(gold_token_logits[:length]),
+        gold_token_nll=list(gold_token_nll[:length]),
         ce_loss=ce_loss,
     )

@@ -27,6 +27,10 @@ TENSOR_NAMES = frozenset(
         "attention_lengths",
         "top_k_token_ids",
         "top_k_logits",
+        "full_logsumexp",
+        "gold_token_ids",
+        "gold_token_logits",
+        "gold_token_nll",
         "ce_losses",
     }
 )
@@ -37,6 +41,10 @@ TENSOR_DTYPES = {
     "attention_lengths": np.dtype("int32"),
     "top_k_token_ids": np.dtype("int32"),
     "top_k_logits": np.dtype("float32"),
+    "full_logsumexp": np.dtype("float32"),
+    "gold_token_ids": np.dtype("int32"),
+    "gold_token_logits": np.dtype("float32"),
+    "gold_token_nll": np.dtype("float32"),
     "ce_losses": np.dtype("float32"),
 }
 
@@ -127,6 +135,22 @@ def _artifact_tensors(
             [row for sample in values for row in sample.top_k_logits],
             "top_k_logits",
         ).reshape(offsets[-1], top_k),
+        "full_logsumexp": _as_float32(
+            [value for sample in values for value in sample.full_logsumexp],
+            "full_logsumexp",
+        ),
+        "gold_token_ids": _as_int32(
+            [value for sample in values for value in sample.gold_token_ids],
+            "gold_token_ids",
+        ),
+        "gold_token_logits": _as_float32(
+            [value for sample in values for value in sample.gold_token_logits],
+            "gold_token_logits",
+        ),
+        "gold_token_nll": _as_float32(
+            [value for sample in values for value in sample.gold_token_nll],
+            "gold_token_nll",
+        ),
         "ce_losses": _as_float32(
             [sample.ce_loss for sample in values],
             "ce_losses",
@@ -241,6 +265,10 @@ def _validate_tensor_schema(
         "attention_lengths": (sample_count,),
         "top_k_token_ids": (total_tokens, top_k),
         "top_k_logits": (total_tokens, top_k),
+        "full_logsumexp": (total_tokens,),
+        "gold_token_ids": (total_tokens,),
+        "gold_token_logits": (total_tokens,),
+        "gold_token_nll": (total_tokens,),
         "ce_losses": (sample_count,),
     }
     for name, expected_shape in expected_shapes.items():
@@ -267,6 +295,21 @@ def _validate_tensor_schema(
         raise ValueError("top-k token IDs must be non-negative")
     if not np.isfinite(tensors["top_k_logits"]).all():
         raise ValueError("top-k logits must be finite")
+    if not np.isfinite(tensors["full_logsumexp"]).all():
+        raise ValueError("full_logsumexp values must be finite")
+    gold_ids = tensors["gold_token_ids"]
+    if np.any((gold_ids < 0) & (gold_ids != -100)):
+        raise ValueError("gold token IDs must be -100 or non-negative")
+    if not np.isfinite(tensors["gold_token_logits"]).all():
+        raise ValueError("gold_token_logits values must be finite")
+    if np.any(tensors["gold_token_logits"][gold_ids == -100] != 0):
+        raise ValueError("unsupervised gold-token logits must be zero")
+    if not np.isfinite(tensors["gold_token_nll"]).all():
+        raise ValueError("gold token NLL values must be finite")
+    if np.any(tensors["gold_token_nll"] < 0):
+        raise ValueError("gold token NLL values must be non-negative")
+    if np.any(tensors["gold_token_nll"][gold_ids == -100] != 0):
+        raise ValueError("unsupervised gold-token NLL values must be zero")
     if not np.isfinite(tensors["ce_losses"]).all():
         raise ValueError("CE losses must be finite")
     if np.any(tensors["ce_losses"] < 0):
@@ -292,7 +335,7 @@ def load_knowledge_artifact(
         with safe_open(artifact_path, framework="np") as artifact:
             if artifact.metadata():
                 raise ValueError("knowledge artifact metadata is not allowed")
-            tensors = artifact.get_tensors()
+            tensors = {key: artifact.get_tensor(key) for key in artifact.keys()}
     except (OSError, SafetensorError) as exc:
         raise ValueError("invalid safetensors knowledge artifact") from exc
     _validate_tensor_schema(tensors, descriptor)
@@ -309,6 +352,10 @@ def load_knowledge_artifact(
                 attention_length=int(tensors["attention_lengths"][index]),
                 top_k_token_ids=tensors["top_k_token_ids"][start:end].tolist(),
                 top_k_logits=tensors["top_k_logits"][start:end].tolist(),
+                full_logsumexp=tensors["full_logsumexp"][start:end].tolist(),
+                gold_token_ids=tensors["gold_token_ids"][start:end].tolist(),
+                gold_token_logits=tensors["gold_token_logits"][start:end].tolist(),
+                gold_token_nll=tensors["gold_token_nll"][start:end].tolist(),
                 ce_loss=float(tensors["ce_losses"][index]),
             )
         )

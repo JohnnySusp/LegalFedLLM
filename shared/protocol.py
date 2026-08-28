@@ -16,7 +16,7 @@ from shared.reference_dataset import (
 PROTOCOL_VERSION = "1.0"
 PACKAGE_SCHEMA_VERSION = "2.0"
 KNOWLEDGE_ARTIFACT_FORMAT = "safetensors"
-KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "1.0"
+KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "2.0"
 HOST_TRAINING_ARTIFACT_SCHEMA_VERSION = "1.0"
 HOST_TRAINING_JOB_SCHEMA_VERSION = "1.0"
 HOST_CANDIDATE_RESULT_SCHEMA_VERSION = "1.0"
@@ -488,16 +488,29 @@ class KnowledgeSample(ContractModel):
     attention_length: int = Field(ge=1)
     top_k_token_ids: list[list[int]] = Field(min_length=1)
     top_k_logits: list[list[float]] = Field(min_length=1)
+    full_logsumexp: list[float] = Field(min_length=1)
+    gold_token_ids: list[int] = Field(min_length=1)
+    gold_token_logits: list[float] = Field(min_length=1)
+    gold_token_nll: list[float] = Field(min_length=1)
     ce_loss: float = Field(ge=0)
 
     @model_validator(mode="after")
     def validate_shapes(self) -> "KnowledgeSample":
-        if self.attention_length > len(self.source_input_ids):
+        length = len(self.source_input_ids)
+        if self.attention_length > length:
             raise ValueError("attention_length exceeds source_input_ids length")
         if len(self.top_k_token_ids) != len(self.top_k_logits):
             raise ValueError("top-k token and logit sequence lengths differ")
-        if len(self.top_k_token_ids) != len(self.source_input_ids):
+        if len(self.top_k_token_ids) != length:
             raise ValueError("top-k sequence length must match source_input_ids")
+        if len(self.full_logsumexp) != length:
+            raise ValueError("full_logsumexp length must match source_input_ids")
+        if len(self.gold_token_ids) != length:
+            raise ValueError("gold_token_ids length must match source_input_ids")
+        if len(self.gold_token_logits) != length:
+            raise ValueError("gold_token_logits length must match source_input_ids")
+        if len(self.gold_token_nll) != length:
+            raise ValueError("gold_token_nll length must match source_input_ids")
         widths = {len(row) for row in self.top_k_token_ids}
         logit_widths = {len(row) for row in self.top_k_logits}
         if not widths or 0 in widths or widths != logit_widths or len(widths) != 1:
@@ -506,8 +519,38 @@ class KnowledgeSample(ContractModel):
             raise ValueError("ce_loss must be finite")
         if any(token < 0 for row in self.top_k_token_ids for token in row):
             raise ValueError("token IDs must be non-negative")
+        if any(
+            token != -100 and token < 0
+            for token in self.gold_token_ids
+        ):
+            raise ValueError("gold token IDs must be -100 or non-negative")
         if any(not math.isfinite(value) for row in self.top_k_logits for value in row):
             raise ValueError("logits must be finite")
+        if any(not math.isfinite(value) for value in self.full_logsumexp):
+            raise ValueError("full_logsumexp values must be finite")
+        if any(not math.isfinite(value) for value in self.gold_token_logits):
+            raise ValueError("gold_token_logits values must be finite")
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in self.gold_token_nll
+        ):
+            raise ValueError("gold_token_nll values must be finite and non-negative")
+        supervised = 0
+        for token_id, gold_logit, nll in zip(
+            self.gold_token_ids,
+            self.gold_token_logits,
+            self.gold_token_nll,
+            strict=True,
+        ):
+            if token_id == -100:
+                if gold_logit != 0.0 or nll != 0.0:
+                    raise ValueError(
+                        "unsupervised gold-token positions must use logit/NLL 0.0"
+                    )
+            else:
+                supervised += 1
+        if supervised == 0:
+            raise ValueError("knowledge sample requires a supervised gold token")
         return self
 
     @property
@@ -517,7 +560,7 @@ class KnowledgeSample(ContractModel):
 
 class KnowledgeArtifactDescriptor(ContractModel):
     format: Literal["safetensors"] = KNOWLEDGE_ARTIFACT_FORMAT
-    schema_version: Literal["1.0"] = KNOWLEDGE_ARTIFACT_SCHEMA_VERSION
+    schema_version: Literal["2.0"] = KNOWLEDGE_ARTIFACT_SCHEMA_VERSION
     byte_size: int = Field(ge=1, le=2 * 1024 * 1024 * 1024)
     sha256: str = Field(pattern=HASH_PATTERN)
     sample_count: int = Field(ge=1, le=100_000)
@@ -649,6 +692,39 @@ class SafetyReport(ContractModel):
     accepted: bool
     trust_score: float = Field(ge=0, le=1)
     reasons: list[str] = Field(default_factory=list)
+    probe_stage: Literal["pre_alignment", "post_alignment"] = "post_alignment"
+    score_components: dict[str, float] = Field(default_factory=dict)
+    sample_risks: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_safety_score(self) -> "SafetyReport":
+        if self.trust_score != round(self.trust_score, 2):
+            raise ValueError("trust_score must use at most two decimal places")
+        for values, label in (
+            (self.score_components, "safety score components"),
+            (self.sample_risks, "sample risks"),
+        ):
+            if any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+                for value in values.values()
+            ):
+                raise ValueError(f"{label} must be finite values in [0, 1]")
+        return self
+
+
+class ClientTrustHistory(ContractModel):
+    schema_version: Literal["1.0"] = "1.0"
+    client_id: str = Field(min_length=1, max_length=128)
+    alpha: float = Field(gt=0)
+    beta: float = Field(gt=0)
+    completed_rounds: int = Field(ge=0)
+    last_round_id: str | None = Field(default=None, max_length=128)
+
+    @property
+    def reliability(self) -> float:
+        return self.alpha / (self.alpha + self.beta)
 
 
 class ValidatedDistillationSample(ContractModel):

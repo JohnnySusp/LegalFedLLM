@@ -157,6 +157,13 @@ def _knowledge_samples(
                 attention_length=len(sample.input_ids),
                 top_k_token_ids=token_rows,
                 top_k_logits=[[4.0, 1.0] for _ in token_rows],
+                full_logsumexp=[
+                    4.0 + ce_loss,
+                    *([6.0] * (len(token_rows) - 1)),
+                ],
+                gold_token_ids=[token_rows[0][0], *([-100] * (len(token_rows) - 1))],
+                gold_token_logits=[4.0, *([0.0] * (len(token_rows) - 1))],
+                gold_token_nll=[ce_loss, *([0.0] * (len(token_rows) - 1))],
                 ce_loss=ce_loss,
             )
         )

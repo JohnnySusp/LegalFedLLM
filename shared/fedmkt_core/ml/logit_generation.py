@@ -23,7 +23,15 @@ import gc
 import torch
 import torch.nn.functional as F
 
-from shared.fedmkt_core.ml.vars_define import METRIC, PER_STEP_INDICES, PER_STEP_LOGITS
+from shared.fedmkt_core.ml.vars_define import (
+    FULL_LOGSUMEXP,
+    GOLD_TOKEN_IDS,
+    GOLD_TOKEN_LOGITS,
+    GOLD_TOKEN_NLL,
+    METRIC,
+    PER_STEP_INDICES,
+    PER_STEP_LOGITS,
+)
 
 
 class Metric:
@@ -102,8 +110,28 @@ def generate_pub_data_logits(inputs, model, training_args, data_collator):
         selected_logits, selected_indices = LogitsSelection.select_logits(
             logits, training_args
         )
+        float_logits = logits.float()
+        full_logsumexp = torch.logsumexp(float_logits, dim=-1)
+        gold_token_ids = torch.full_like(input_ids, -100)
+        gold_token_ids[..., :-1] = labels[..., 1:]
+        gold_token_logits = torch.zeros_like(full_logsumexp)
+        gold_token_nll = torch.zeros_like(full_logsumexp)
+        supervised = gold_token_ids.ne(-100)
+        safe_gold_ids = gold_token_ids.clamp_min(0)
+        gold_logits = float_logits.gather(
+            dim=-1,
+            index=safe_gold_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        gold_token_logits[supervised] = gold_logits[supervised]
+        gold_token_nll[supervised] = (
+            full_logsumexp[supervised] - gold_logits[supervised]
+        )
         inputs[PER_STEP_LOGITS] = selected_logits.detach().float().cpu()
         inputs[PER_STEP_INDICES] = selected_indices.detach().cpu()
+        inputs[FULL_LOGSUMEXP] = full_logsumexp.detach().cpu()
+        inputs[GOLD_TOKEN_IDS] = gold_token_ids.detach().cpu()
+        inputs[GOLD_TOKEN_LOGITS] = gold_token_logits.detach().cpu()
+        inputs[GOLD_TOKEN_NLL] = gold_token_nll.detach().cpu()
         inputs[METRIC] = metric.detach().cpu()
 
     if was_training:

@@ -27,6 +27,10 @@ def samples() -> list[KnowledgeSample]:
             attention_length=2,
             top_k_token_ids=[[101, 102], [103, 104]],
             top_k_logits=[[2.5, 1.25], [3.0, -0.5]],
+            full_logsumexp=[2.75, 5.0],
+            gold_token_ids=[101, -100],
+            gold_token_logits=[2.5, 0.0],
+            gold_token_nll=[0.25, 0.0],
             ce_loss=0.25,
         ),
         KnowledgeSample(
@@ -35,6 +39,10 @@ def samples() -> list[KnowledgeSample]:
             attention_length=2,
             top_k_token_ids=[[201, 202], [203, 204], [205, 206]],
             top_k_logits=[[4.0, 2.0], [1.5, 1.0], [0.5, -1.0]],
+            full_logsumexp=[4.75, 3.5, 2.5],
+            gold_token_ids=[201, -100, -100],
+            gold_token_logits=[4.0, 0.0, 0.0],
+            gold_token_nll=[0.75, 0.0, 0.0],
             ce_loss=0.75,
         ),
     ]
@@ -65,7 +73,7 @@ class KnowledgeArtifactTests(unittest.TestCase):
             )
         with self.assertRaises(ValidationError):
             KnowledgeArtifactDescriptor.model_validate(
-                {**payload, "schema_version": "2.0"}
+                {**payload, "schema_version": "1.0"}
             )
 
     def test_ordered_sample_id_hash_binds_order(self) -> None:

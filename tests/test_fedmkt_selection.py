@@ -26,6 +26,10 @@ def sample(sample_id: str, ce_loss: float, token_id: int) -> KnowledgeSample:
         attention_length=1,
         top_k_token_ids=[[token_id]],
         top_k_logits=[[float(token_id)]],
+        full_logsumexp=[float(token_id) + ce_loss],
+        gold_token_ids=[token_id],
+        gold_token_logits=[float(token_id)],
+        gold_token_nll=[ce_loss],
         ce_loss=ce_loss,
     )
 

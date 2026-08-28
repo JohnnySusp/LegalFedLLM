@@ -292,6 +292,10 @@ class TransformersPeftTrainingBackend:
             generate_pub_data_logits,
         )
         from shared.fedmkt_core.ml.vars_define import (
+            FULL_LOGSUMEXP,
+            GOLD_TOKEN_IDS,
+            GOLD_TOKEN_LOGITS,
+            GOLD_TOKEN_NLL,
             METRIC,
             PER_STEP_INDICES,
             PER_STEP_LOGITS,
@@ -361,6 +365,10 @@ class TransformersPeftTrainingBackend:
                 )
                 token_ids = result[PER_STEP_INDICES]
                 logits = result[PER_STEP_LOGITS]
+                full_logsumexp = result[FULL_LOGSUMEXP]
+                gold_token_ids = result[GOLD_TOKEN_IDS]
+                gold_token_logits = result[GOLD_TOKEN_LOGITS]
+                gold_token_nll = result[GOLD_TOKEN_NLL]
                 losses = result[METRIC]
                 if (
                     token_ids.size(0) != len(batch_values)
@@ -374,6 +382,10 @@ class TransformersPeftTrainingBackend:
                             item,
                             top_k_token_ids=token_ids[index].tolist(),
                             top_k_logits=logits[index].tolist(),
+                            full_logsumexp=full_logsumexp[index].tolist(),
+                            gold_token_ids=gold_token_ids[index].tolist(),
+                            gold_token_logits=gold_token_logits[index].tolist(),
+                            gold_token_nll=gold_token_nll[index].tolist(),
                             ce_loss=float(losses[index].item()),
                         )
                     )

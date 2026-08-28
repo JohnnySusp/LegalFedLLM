@@ -22,6 +22,7 @@ from shared.protocol import (
     RoundCreateRequest,
     RoundManifest,
     RoundState,
+    SafetyReport,
     ServiceIdentity,
     SubmissionReceipt,
 )
@@ -166,6 +167,17 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
     @app.get("/v1/rounds/{round_id}/status", response_model=RoundState)
     async def round_status(round_id: str) -> RoundState:
         return await coordinator.round_status(round_id)
+
+    @app.get(
+        "/v1/rounds/{round_id}/safety",
+        response_model=dict[str, SafetyReport],
+    )
+    async def round_safety(
+        round_id: str,
+        x_admin_token: str | None = Header(default=None),
+    ) -> dict[str, SafetyReport]:
+        coordinator.require_admin_token(x_admin_token)
+        return coordinator.get_safety_reports(round_id)
 
     @app.post(
         "/v1/rounds/{round_id}/knowledge",

@@ -264,6 +264,10 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         attention_length=sample.attention_length,
                         top_k_token_ids=sample.top_k_token_ids,
                         top_k_logits=logits,
+                        full_logsumexp=sample.full_logsumexp,
+                        gold_token_ids=sample.gold_token_ids,
+                        gold_token_logits=sample.gold_token_logits,
+                        gold_token_nll=sample.gold_token_nll,
                         ce_loss=sample.ce_loss,
                     )
                 )

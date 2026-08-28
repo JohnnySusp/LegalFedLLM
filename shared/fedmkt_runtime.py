@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from dataclasses import dataclass
 
@@ -30,22 +31,36 @@ def deterministic_knowledge_samples(
         rng = random.Random(
             _seed(manifest.round_id, sample_id, participant_id, role, str(adapter_version))
         )
-        token_rows: list[list[int]] = []
-        logit_rows: list[list[float]] = []
-        for _ in range(sequence_length):
-            tokens = rng.sample(range(vocabulary_size), manifest.top_k)
-            logits = sorted(
-                [round(rng.uniform(-2.0, 8.0), 6) for _ in range(manifest.top_k)],
-                reverse=True,
-            )
-            token_rows.append(tokens)
-            logit_rows.append(logits)
-
         if role == "host":
             base = 0.80 + rng.random() * 0.10
             ce_loss = max(0.01, base - adapter_version * 0.50)
         else:
             ce_loss = 0.30 + rng.random() * 0.40
+        ce_loss = round(ce_loss, 8)
+
+        token_rows: list[list[int]] = []
+        logit_rows: list[list[float]] = []
+        full_logsumexp: list[float] = []
+        gold_token_ids = [-100] * sequence_length
+        gold_token_logits = [0.0] * sequence_length
+        gold_token_nll = [0.0] * sequence_length
+        for row_index in range(sequence_length):
+            tokens = rng.sample(range(vocabulary_size), manifest.top_k)
+            logits = [0.0] + [
+                -2.0 - 0.75 * index
+                for index in range(max(0, manifest.top_k - 1))
+            ]
+            lse = ce_loss if row_index == 0 else max(1.0, ce_loss + 0.5)
+            top_mass = math.fsum(math.exp(value - lse) for value in logits)
+            if top_mass >= 0.98:
+                lse += math.log(top_mass / 0.80)
+            token_rows.append(tokens)
+            logit_rows.append(logits)
+            full_logsumexp.append(lse)
+        gold_token_ids[0] = token_rows[0][0]
+        gold_token_logits[0] = logit_rows[0][0]
+        gold_token_nll[0] = full_logsumexp[0] - logit_rows[0][0]
+        ce_loss = gold_token_nll[0]
 
         samples.append(
             KnowledgeSample(
@@ -54,7 +69,11 @@ def deterministic_knowledge_samples(
                 attention_length=sequence_length,
                 top_k_token_ids=token_rows,
                 top_k_logits=logit_rows,
-                ce_loss=round(ce_loss, 8),
+                full_logsumexp=full_logsumexp,
+                gold_token_ids=gold_token_ids,
+                gold_token_logits=gold_token_logits,
+                gold_token_nll=gold_token_nll,
+                ce_loss=ce_loss,
             )
         )
     return samples

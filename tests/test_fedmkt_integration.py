@@ -26,6 +26,7 @@ try:
         TrustedClientQuorumError,
         integrate_distillation_round,
     )
+    from shared.fedmkt_core.safety import inspect_knowledge_package
     from shared.fedmkt_core.ml.sparse_targets import (
         answer_only_sparse_distillation_loss,
     )
@@ -161,6 +162,16 @@ def sample(
             [3.0 + logit_offset, 0.0 + logit_offset]
             for _ in source_ids
         ],
+        full_logsumexp=[
+            3.0 + logit_offset + ce_loss,
+            *([5.0 + logit_offset] * (len(source_ids) - 1)),
+        ],
+        gold_token_ids=[top_k_ids[0][0], *([-100] * (len(source_ids) - 1))],
+        gold_token_logits=[
+            3.0 + logit_offset,
+            *([0.0] * (len(source_ids) - 1)),
+        ],
+        gold_token_nll=[ce_loss, *([0.0] * (len(source_ids) - 1))],
         ce_loss=ce_loss,
     )
 
@@ -376,6 +387,35 @@ class FedMKTIntegrationTests(unittest.TestCase):
         }
         values.update(changes)
         return integrate_distillation_round(**values)
+
+    def test_pre_alignment_reports_are_finalized_before_teacher_selection(self) -> None:
+        selected = ["client-a"]
+        package_by_id = {item.sender_id: item for item in self.client_packages}
+        reports = {
+            client_id: inspect_knowledge_package(
+                package_by_id[client_id],
+                self.client_samples[client_id],
+            )
+            for client_id in selected
+        }
+        self.assertEqual(reports["client-a"].probe_stage, "pre_alignment")
+
+        with tempfile.TemporaryDirectory() as directory:
+            batch = self.integrate(
+                directory,
+                client_packages=[package_by_id["client-a"]],
+                client_samples={"client-a": self.client_samples["client-a"]},
+                safety_reports=reports,
+                selected_client_ids=selected,
+                trusted_client_quorum=1,
+                historical_reliability={"client-a": 0.5},
+            )
+
+        final = batch.audit.safety_reports["client-a"]
+        self.assertEqual(final.probe_stage, "post_alignment")
+        self.assertEqual(final.score_components["peer_consistency"], 0.5)
+        self.assertGreaterEqual(final.trust_score, 0.5)
+        self.assertEqual(batch.dataset.accepted_client_ids, ["client-a"])
 
     def test_validated_packages_reach_deterministic_sparse_trainer_inputs(self) -> None:
         import torch
