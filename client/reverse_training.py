@@ -16,6 +16,7 @@ from shared.alignment_profiles import resolve_alignment_profile
 from shared.answer_only import AnswerOnlyCollator
 from shared.client_reverse_artifact import load_client_reverse_training_artifact
 from shared.crypto import sha256_hex
+from shared.distillation_artifact import TENSOR_NAMES
 from shared.protocol import (
     HASH_PATTERN,
     ClientReverseTrainingJob,
@@ -31,6 +32,7 @@ from shared.tokenizer_validation import load_pinned_tokenizer
 
 
 CLIENT_QUALITY_NON_REGRESSION_TOLERANCE = 0.001
+CLIENT_REVERSE_LOSS_SEQUENCE_CHUNK_SIZE = 64
 
 
 class ReverseTrainingContract(BaseModel):
@@ -441,23 +443,75 @@ class _TensorRowDataset:
         return {name: value[index] for name, value in self.tensors.items()}
 
 
+def collate_client_reverse_training_rows(
+    torch: Any,
+    features: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    if not features:
+        raise ValueError("Client reverse training batch is empty")
+    if any(set(feature) != TENSOR_NAMES for feature in features):
+        raise ValueError("Client reverse training rows contain unexpected tensors")
+
+    batch = {
+        name: torch.stack([feature[name] for feature in features])
+        for name in sorted(TENSOR_NAMES)
+    }
+    attention_mask = batch["attention_mask"]
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "Client reverse attention mask must have [batch, sequence] shape"
+        )
+    active = attention_mask.bool().any(dim=0)
+    active_positions = torch.nonzero(active, as_tuple=False)
+    if active_positions.numel() == 0:
+        raise ValueError("Client reverse training batch has no attended token")
+    sequence_length = int(active_positions[-1].item()) + 1
+
+    for name in ("input_ids", "attention_mask", "labels"):
+        batch[name] = batch[name][:, :sequence_length]
+    for name in (
+        "sparse_target_token_ids",
+        "sparse_target_probabilities",
+        "sparse_target_valid_mask",
+    ):
+        batch[name] = batch[name][:, :sequence_length, :]
+    return batch
+
+
+class _TrimmedClientReverseTrainingCollator:
+    def __call__(self, features: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        import torch
+
+        return collate_client_reverse_training_rows(torch, features)
+
+
 def selective_client_loss(
     torch: Any,
     logits: Any,
     inputs: dict[str, Any],
+    *,
+    sequence_chunk_size: int = CLIENT_REVERSE_LOSS_SEQUENCE_CHUNK_SIZE,
 ) -> tuple[Any, Any, Any]:
     from shared.fedmkt_core.ml.sparse_targets import (
         SparseTargetBatch,
-        answer_only_sparse_distillation_loss,
+        SparseTargetError,
+        validate_sparse_target_batch,
     )
 
+    if type(sequence_chunk_size) is not int or sequence_chunk_size < 1:
+        raise ValueError(
+            "Client reverse loss sequence chunk size must be positive"
+        )
     labels = inputs["labels"]
     attention_mask = inputs["attention_mask"]
-    supervised = torch.nn.functional.cross_entropy(
-        logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
-        labels[..., 1:].contiguous().view(-1),
-        ignore_index=-100,
-    )
+    if labels.shape != logits.shape[:2] or attention_mask.shape != labels.shape:
+        raise SparseTargetError(
+            "labels and attention mask must match model batch and sequence shape"
+        )
+    if labels.device != logits.device or attention_mask.device != logits.device:
+        raise SparseTargetError(
+            "model logits, labels and attention mask must share one device"
+        )
     targets = SparseTargetBatch(
         token_ids=inputs["sparse_target_token_ids"].long(),
         probabilities=inputs["sparse_target_probabilities"].to(
@@ -465,12 +519,94 @@ def selective_client_loss(
         ),
         valid_mask=inputs["sparse_target_valid_mask"].bool(),
     )
-    distillation = answer_only_sparse_distillation_loss(
-        logits,
-        targets,
-        labels=labels,
-        attention_mask=attention_mask,
-        loss_type="ce",
+    validate_sparse_target_batch(targets, vocab_size=logits.shape[-1])
+    if logits.shape[:2] != targets.token_ids.shape[:2]:
+        raise SparseTargetError(
+            "model logits and sparse targets differ in batch or sequence shape"
+        )
+    if logits.device != targets.token_ids.device:
+        raise SparseTargetError(
+            "model logits and sparse targets must share one device"
+        )
+
+    shifted_labels = labels[..., 1:]
+    shifted_attention = attention_mask[..., 1:].bool()
+    supervised_mask = shifted_labels.ne(-100)
+    distillation_mask = supervised_mask & shifted_attention
+    supervised_positions = supervised_mask.sum()
+    distillation_positions = distillation_mask.sum()
+    if supervised_positions == 0:
+        raise SparseTargetError(
+            "answer-only supervision requires at least one supervised target token"
+        )
+    if distillation_positions == 0:
+        raise SparseTargetError(
+            "answer-only distillation requires at least one supervised target token"
+        )
+
+    supervised_sum = None
+    distillation_sum = None
+    shifted_sequence_length = logits.shape[1] - 1
+    for start in range(0, shifted_sequence_length, sequence_chunk_size):
+        end = min(start + sequence_chunk_size, shifted_sequence_length)
+        chunk_logits = logits[:, start:end, :]
+        normalizer = torch.logsumexp(chunk_logits, dim=-1)
+
+        chunk_supervised_mask = supervised_mask[:, start:end]
+        chunk_labels = shifted_labels[:, start:end]
+        safe_labels = torch.where(
+            chunk_supervised_mask,
+            chunk_labels,
+            torch.zeros_like(chunk_labels),
+        )
+        selected_labels = torch.gather(
+            chunk_logits,
+            -1,
+            safe_labels.unsqueeze(-1),
+        ).squeeze(-1)
+        chunk_supervised = (
+            (normalizer - selected_labels)
+            * chunk_supervised_mask.to(normalizer.dtype)
+        ).sum()
+        supervised_sum = (
+            chunk_supervised
+            if supervised_sum is None
+            else supervised_sum + chunk_supervised
+        )
+
+        chunk_token_ids = targets.token_ids[:, start:end, :]
+        chunk_probabilities = targets.probabilities[:, start:end, :]
+        chunk_valid_mask = targets.valid_mask[:, start:end, :]
+        selected_sparse_logits = torch.gather(
+            chunk_logits,
+            -1,
+            chunk_token_ids,
+        )
+        selected_sparse_log_probabilities = (
+            selected_sparse_logits - normalizer.unsqueeze(-1)
+        )
+        per_position_distillation = (
+            -chunk_probabilities * selected_sparse_log_probabilities
+            * chunk_valid_mask.to(chunk_probabilities.dtype)
+        ).sum(dim=-1)
+        chunk_distillation_mask = distillation_mask[:, start:end]
+        chunk_distillation = (
+            per_position_distillation
+            * chunk_distillation_mask.to(per_position_distillation.dtype)
+        ).sum()
+        distillation_sum = (
+            chunk_distillation
+            if distillation_sum is None
+            else distillation_sum + chunk_distillation
+        )
+
+    if supervised_sum is None or distillation_sum is None:
+        raise SparseTargetError(
+            "Client reverse loss requires at least two sequence tokens"
+        )
+    supervised = supervised_sum / supervised_positions.to(supervised_sum.dtype)
+    distillation = distillation_sum / distillation_positions.to(
+        distillation_sum.dtype
     )
     return 0.9 * supervised + 0.1 * distillation, supervised, distillation
 
@@ -603,6 +739,7 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 model=model,
                 args=arguments,
                 train_dataset=dataset,
+                data_collator=_TrimmedClientReverseTrainingCollator(),
             )
             train_output = trainer.train()
             optimizer_step_count = int(trainer.state.global_step)

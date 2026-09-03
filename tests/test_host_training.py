@@ -25,6 +25,7 @@ from host.peft_backend import (
     HostBaselineResult,
     InitializedHostAdapter,
     TransformersPeftHostBackend,
+    collate_host_training_rows,
     selective_host_loss,
 )
 from host.runtime import HostRuntime, HostRuntimeError, default_host_profile
@@ -622,6 +623,169 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
         self.assertTrue(torch.equal(supervised, changed_supervised))
         self.assertTrue(torch.equal(distillation, changed_distillation))
         self.assertTrue(torch.equal(combined, changed_combined))
+
+    def test_host_training_collator_trims_global_sequence_padding(self) -> None:
+        import torch
+
+        def feature(length: int) -> dict[str, torch.Tensor]:
+            sequence_length = 7
+            top_k = 2
+            attention_mask = torch.zeros(sequence_length, dtype=torch.long)
+            attention_mask[:length] = 1
+            return {
+                "input_ids": torch.arange(sequence_length, dtype=torch.long),
+                "attention_mask": attention_mask,
+                "labels": torch.arange(sequence_length, dtype=torch.long),
+                "sparse_target_token_ids": torch.zeros(
+                    (sequence_length, top_k), dtype=torch.long
+                ),
+                "sparse_target_probabilities": torch.full(
+                    (sequence_length, top_k), 0.5, dtype=torch.float32
+                ),
+                "sparse_target_valid_mask": torch.ones(
+                    (sequence_length, top_k), dtype=torch.bool
+                ),
+            }
+
+        batch = collate_host_training_rows(
+            torch,
+            [feature(3), feature(5)],
+        )
+
+        for name in ("input_ids", "attention_mask", "labels"):
+            self.assertEqual(batch[name].shape, (2, 5))
+        for name in (
+            "sparse_target_token_ids",
+            "sparse_target_probabilities",
+            "sparse_target_valid_mask",
+        ):
+            self.assertEqual(batch[name].shape, (2, 5, 2))
+        self.assertEqual(batch["attention_mask"][0].tolist(), [1, 1, 1, 0, 0])
+        self.assertEqual(batch["attention_mask"][1].tolist(), [1, 1, 1, 1, 1])
+
+    def test_chunked_host_loss_matches_existing_loss_and_gradient(self) -> None:
+        import torch
+
+        from shared.fedmkt_core.ml.sparse_targets import (
+            SparseTargetBatch,
+            answer_only_sparse_distillation_loss,
+        )
+
+        torch.manual_seed(7)
+        logits = torch.randn((2, 7, 11), dtype=torch.float32)
+        labels = torch.tensor(
+            [
+                [-100, 1, 2, 3, -100, 5, -100],
+                [-100, 2, 4, 6, 8, -100, -100],
+            ],
+            dtype=torch.long,
+        )
+        attention_mask = torch.tensor(
+            [
+                [1, 1, 1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 0, 0],
+            ],
+            dtype=torch.long,
+        )
+        token_ids = torch.empty((2, 7, 2), dtype=torch.long)
+        for batch_index in range(2):
+            for position in range(7):
+                first = (batch_index + position) % 11
+                token_ids[batch_index, position] = torch.tensor(
+                    [first, (first + 3) % 11],
+                    dtype=torch.long,
+                )
+        probabilities = torch.tensor([0.75, 0.25], dtype=torch.float32).repeat(
+            2, 7, 1
+        )
+        valid_mask = torch.ones((2, 7, 2), dtype=torch.bool)
+        inputs = {
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "sparse_target_token_ids": token_ids,
+            "sparse_target_probabilities": probabilities,
+            "sparse_target_valid_mask": valid_mask,
+        }
+
+        oracle_logits = logits.clone().requires_grad_(True)
+        oracle_supervised = torch.nn.functional.cross_entropy(
+            oracle_logits[..., :-1, :].contiguous().view(-1, 11),
+            labels[..., 1:].contiguous().view(-1),
+            ignore_index=-100,
+        )
+        oracle_distillation = answer_only_sparse_distillation_loss(
+            oracle_logits,
+            SparseTargetBatch(
+                token_ids=token_ids,
+                probabilities=probabilities,
+                valid_mask=valid_mask,
+            ),
+            labels=labels,
+            attention_mask=attention_mask,
+            loss_type="ce",
+        )
+        oracle_combined = 0.9 * oracle_supervised + 0.1 * oracle_distillation
+        oracle_combined.backward()
+
+        chunked_logits = logits.clone().requires_grad_(True)
+        combined, supervised, distillation = selective_host_loss(
+            torch,
+            chunked_logits,
+            inputs,
+            sequence_chunk_size=2,
+        )
+        combined.backward()
+
+        self.assertTrue(torch.allclose(supervised, oracle_supervised, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(distillation, oracle_distillation, atol=1e-6)
+        )
+        self.assertTrue(torch.allclose(combined, oracle_combined, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(
+                chunked_logits.grad,
+                oracle_logits.grad,
+                atol=1e-6,
+            )
+        )
+
+    def test_chunked_host_loss_bounds_each_vocabulary_reduction(self) -> None:
+        import torch
+
+        logits = torch.tensor(
+            [[[0.2, 1.2, -0.4]] * 8],
+            dtype=torch.float32,
+        )
+        inputs = {
+            "labels": torch.tensor(
+                [[-100, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long
+            ),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "sparse_target_token_ids": torch.tensor(
+                [[[[1, 0]] * 8][0]], dtype=torch.long
+            ),
+            "sparse_target_probabilities": torch.tensor(
+                [[[[0.8, 0.2]] * 8][0]], dtype=torch.float32
+            ),
+            "sparse_target_valid_mask": torch.ones((1, 8, 2), dtype=torch.bool),
+        }
+        original_logsumexp = torch.logsumexp
+        sequence_widths: list[int] = []
+
+        def bounded_logsumexp(value, *args, **kwargs):
+            sequence_widths.append(int(value.shape[1]))
+            return original_logsumexp(value, *args, **kwargs)
+
+        with mock.patch.object(torch, "logsumexp", side_effect=bounded_logsumexp):
+            selective_host_loss(
+                torch,
+                logits,
+                inputs,
+                sequence_chunk_size=3,
+            )
+
+        self.assertEqual(sequence_widths, [3, 3, 1])
+        self.assertLessEqual(max(sequence_widths), 3)
 
     def test_contract_freezes_the_agreed_host_decisions(self) -> None:
         profile = pinned_host_profile()
