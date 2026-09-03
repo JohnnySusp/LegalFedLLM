@@ -53,6 +53,23 @@ def sample(
 
 
 class PackageSafetyTests(unittest.TestCase):
+    def test_committed_poc_trust_threshold_is_fifteen_percent(self) -> None:
+        self.assertEqual(MINIMUM_TRUST_SCORE, 0.15)
+
+        below = SafetyReport(
+            accepted=True,
+            trust_score=0.14,
+            probe_stage="post_alignment",
+        )
+        boundary = SafetyReport(
+            accepted=True,
+            trust_score=0.15,
+            probe_stage="post_alignment",
+        )
+
+        self.assertFalse(is_eligible_for_distillation(below))
+        self.assertTrue(is_eligible_for_distillation(boundary))
+
     def test_pre_alignment_recomputes_ce_from_gold_evidence(self) -> None:
         value = sample("s1", logits=[[2.0, 0.0], [1.0, 0.0]])
         payload = value.model_dump(mode="python")
@@ -185,8 +202,18 @@ class PackageSafetyTests(unittest.TestCase):
         self.assertEqual(better_report.score_components["host_relative"], 0.5)
 
     def test_final_threshold_controls_eligibility(self) -> None:
-        host = sample("s1", logits=[[2.0, 0.0]], logsumexp=[2.5], ce_loss=0.5)
-        client = sample("s1", logits=[[0.0, 2.0]], logsumexp=[4.0], ce_loss=2.0)
+        host = sample(
+            "s1",
+            logits=[[10.0, -10.0]],
+            logsumexp=[10.0001],
+            ce_loss=0.0001,
+        )
+        client = sample(
+            "s1",
+            logits=[[-10.0, 10.0]],
+            logsumexp=[10.0001],
+            ce_loss=20.0001,
+        )
         pre = SafetyReport(
             accepted=True,
             trust_score=0.2,

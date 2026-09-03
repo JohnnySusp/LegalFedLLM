@@ -53,7 +53,7 @@ padding targets preserve the pinned upstream semantics.
 
 The operational integration layer aligns all eligible Client candidates before
 the inherited minimum-CE selection rule is applied. LegalFedLLM treats
-`accepted and trust_score >= 0.5` as a binary eligibility gate: the score is
+`accepted and trust_score >= 0.15` as a binary eligibility gate: the score is
 audited but never multiplies the selected distribution or loss. It builds one
 demand-driven mapping for each signed Client alignment profile, requires all
 profiles in a batch to terminate at one exact Host endpoint, rejects a Client

@@ -12,7 +12,7 @@ from shared.protocol import (
 )
 
 
-MINIMUM_TRUST_SCORE = 0.5
+MINIMUM_TRUST_SCORE = 0.15
 NEUTRAL_SCORE = 0.5
 HISTORY_DECAY = 0.95
 TRUST_WEIGHTS = {

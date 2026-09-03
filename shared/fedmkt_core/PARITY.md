@@ -129,7 +129,7 @@ single-profile call remains supported as a compatibility form.
 Eligibility is a gate, not a weight:
 
 ```text
-eligible = all hard protocol checks passed and trust_score >= 0.5
+eligible = all hard protocol checks passed and trust_score >= 0.15
 ```
 
 Changing an eligible score does not change candidate CE or target probabilities.

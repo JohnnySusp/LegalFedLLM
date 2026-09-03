@@ -26,7 +26,10 @@ try:
         TrustedClientQuorumError,
         integrate_distillation_round,
     )
-    from shared.fedmkt_core.safety import inspect_knowledge_package
+    from shared.fedmkt_core.safety import (
+        MINIMUM_TRUST_SCORE,
+        inspect_knowledge_package,
+    )
     from shared.fedmkt_core.ml.sparse_targets import (
         answer_only_sparse_distillation_loss,
     )
@@ -351,7 +354,10 @@ class FedMKTIntegrationTests(unittest.TestCase):
         self.safety_reports = {
             "client-b": SafetyReport(accepted=True, trust_score=0.5),
             "client-a": SafetyReport(accepted=True, trust_score=1.0),
-            "below": SafetyReport(accepted=True, trust_score=0.49),
+            "below": SafetyReport(
+                accepted=True,
+                trust_score=round(MINIMUM_TRUST_SCORE - 0.01, 2),
+            ),
             "hard-rejected": SafetyReport(
                 accepted=False,
                 trust_score=0.99,

@@ -52,6 +52,8 @@ class TokenizerEndpoint:
     additional_special_token_ids: tuple[int, ...]
     model_max_length: int
     padding_side: str
+    fix_mistral_regex: bool = False
+    bind_existing_pad_token: bool = False
 
     def mismatches(self, profile: ModelProfile) -> tuple[str, ...]:
         actual = {

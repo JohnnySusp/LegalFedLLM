@@ -26,6 +26,7 @@ from shared.fedmkt_core import (
     dual_min_ce_select,
     finalize_aligned_safety_reports,
     inspect_knowledge_package,
+    is_eligible_for_distillation,
     new_client_trust_history,
     update_client_trust_history,
 )
@@ -1649,8 +1650,7 @@ class CoordinatorService:
             trusted_ids = [
                 client_id
                 for client_id in state.sealed_client_ids
-                if reports[client_id].accepted
-                and reports[client_id].trust_score >= 0.50
+                if is_eligible_for_distillation(reports[client_id])
             ]
             if len(trusted_ids) < manifest.trusted_client_quorum:
                 state.state = "SKIPPED"

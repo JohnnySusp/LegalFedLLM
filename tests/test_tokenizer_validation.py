@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
+from unittest.mock import patch
 
 from shared.alignment_profiles import POC_DTW_PROFILE
 from shared.crypto import sha256_hex
@@ -26,7 +29,7 @@ class SyntheticFastTokenizer:
         self.bos_token_id = None
         self.eos_token = "<eos>"
         self.eos_token_id = 2
-        self.pad_token = None
+        self._pad_token = None
         self.pad_token_id = None
         self.unk_token = None
         self.unk_token_id = None
@@ -40,6 +43,24 @@ class SyntheticFastTokenizer:
 
     def get_vocab(self) -> dict[str, int]:
         return dict(self.vocabulary)
+
+    @property
+    def pad_token(self):
+        return self._pad_token
+
+    @pad_token.setter
+    def pad_token(self, value) -> None:
+        self._pad_token = value
+        self.pad_token_id = (
+            None if value is None else self.vocabulary.get(value)
+        )
+
+
+class SyntheticPadTokenizer(SyntheticFastTokenizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vocabulary["<pad>"] = 3
+        self.vocab_size = 4
 
 
 def synthetic_endpoint():
@@ -69,7 +90,150 @@ def synthetic_endpoint():
     )
 
 
+def synthetic_pad_endpoint():
+    return replace(
+        synthetic_endpoint(),
+        tokenizer_class="SyntheticPadTokenizer",
+        tokenizer_base_vocabulary_size=4,
+        tokenizer_vocabulary_size=4,
+        tokenizer_max_token_id=3,
+        pad_token="<pad>",
+        pad_token_id=3,
+        bind_existing_pad_token=True,
+    )
+
+
+def mistral_nemo_endpoint():
+    return replace(
+        POC_DTW_PROFILE.host,
+        profile_id="mistral-nemo-instruct-2407-host-tokenizer-v1",
+        model_id="mistralai/Mistral-Nemo-Instruct-2407",
+        model_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
+        model_class="MistralForCausalLM",
+        model_type="mistral",
+        tokenizer_id="mistralai/Mistral-Nemo-Instruct-2407",
+        tokenizer_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
+        tokenizer_class="PreTrainedTokenizerFast",
+        vocabulary_size=131072,
+        tokenizer_chat_template_hash=(
+            "e4676cb56dffea7782fd3e2b577cfaf1e123537e6ef49b3ec7caa6c095c62272"
+        ),
+        tokenizer_artifact_sha256=(
+            "e11c71726323d33da7b8d6f6f269f1988931c0a52b7122bcdd8c05042974e0db"
+        ),
+        tokenizer_base_vocabulary_size=131072,
+        tokenizer_vocabulary_size=131072,
+        tokenizer_max_token_id=131071,
+        word_boundary_marker="Ġ",
+        bos_token="<s>",
+        bos_token_id=1,
+        eos_token="</s>",
+        eos_token_id=2,
+        pad_token="<pad>",
+        pad_token_id=10,
+        unk_token="<unk>",
+        unk_token_id=0,
+        additional_special_token_ids=(),
+        model_max_length=1000000000000000019884624838656,
+        padding_side="right",
+        fix_mistral_regex=True,
+        bind_existing_pad_token=True,
+    )
+
+
 class TokenizerValidationTests(unittest.TestCase):
+    def _load_with_fake_dependencies(self, endpoint, tokenizer):
+        arguments = {}
+        huggingface_hub = ModuleType("huggingface_hub")
+        huggingface_hub.hf_hub_download = lambda **kwargs: "/tmp/tokenizer.json"
+        transformers = ModuleType("transformers")
+
+        class FakeAutoTokenizer:
+            @staticmethod
+            def from_pretrained(model_id, **kwargs):
+                arguments["model_id"] = model_id
+                arguments.update(kwargs)
+                return tokenizer
+
+        transformers.AutoTokenizer = FakeAutoTokenizer
+        with patch.dict(
+            sys.modules,
+            {
+                "huggingface_hub": huggingface_hub,
+                "transformers": transformers,
+            },
+        ), patch(
+            "shared.tokenizer_validation.tokenizer_artifact_sha256",
+            return_value=endpoint.tokenizer_artifact_sha256,
+        ):
+            validated = load_pinned_tokenizer(endpoint)
+        return validated, arguments
+
+    def test_existing_profiles_keep_default_loading_policies(self) -> None:
+        for endpoint in (POC_DTW_PROFILE.client, POC_DTW_PROFILE.host):
+            with self.subTest(profile_id=endpoint.profile_id):
+                self.assertFalse(endpoint.fix_mistral_regex)
+                self.assertFalse(endpoint.bind_existing_pad_token)
+
+    def test_loader_passes_corrected_mistral_regex_only_when_requested(
+        self,
+    ) -> None:
+        _, default_arguments = self._load_with_fake_dependencies(
+            synthetic_endpoint(),
+            SyntheticFastTokenizer(),
+        )
+        corrected_endpoint = replace(
+            synthetic_endpoint(),
+            fix_mistral_regex=True,
+        )
+        _, corrected_arguments = self._load_with_fake_dependencies(
+            corrected_endpoint,
+            SyntheticFastTokenizer(),
+        )
+
+        self.assertNotIn("fix_mistral_regex", default_arguments)
+        self.assertIs(corrected_arguments["fix_mistral_regex"], True)
+
+    def test_loader_binds_existing_pad_without_changing_vocabulary(
+        self,
+    ) -> None:
+        endpoint = synthetic_pad_endpoint()
+        tokenizer = SyntheticPadTokenizer()
+        vocabulary_before = tokenizer.get_vocab()
+        length_before = len(tokenizer)
+        vocabulary_size_before = tokenizer.vocab_size
+
+        validated, _ = self._load_with_fake_dependencies(endpoint, tokenizer)
+
+        self.assertIs(validated.tokenizer, tokenizer)
+        self.assertEqual(tokenizer.pad_token, "<pad>")
+        self.assertEqual(tokenizer.pad_token_id, 3)
+        self.assertEqual(tokenizer.get_vocab(), vocabulary_before)
+        self.assertEqual(len(tokenizer), length_before)
+        self.assertEqual(tokenizer.vocab_size, vocabulary_size_before)
+
+    def test_existing_pad_binding_rejects_missing_token_or_wrong_id(self) -> None:
+        cases = (
+            (
+                replace(
+                    synthetic_pad_endpoint(),
+                    pad_token="<missing>",
+                ),
+                "absent from the vocabulary",
+            ),
+            (
+                replace(synthetic_pad_endpoint(), pad_token_id=2),
+                "has ID 3, expected 2",
+            ),
+        )
+        for endpoint, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(TokenizerValidationError, message):
+                    self._load_with_fake_dependencies(
+                        endpoint,
+                        SyntheticPadTokenizer(),
+                    )
+
     def test_poc_tokenizer_fingerprints_are_exact(self) -> None:
         client = POC_DTW_PROFILE.client
         host = POC_DTW_PROFILE.host
@@ -203,6 +367,11 @@ class TokenizerValidationTests(unittest.TestCase):
 
 RUN_REAL_TOKENIZER_TESTS = os.getenv(
     "LEGALFEDLLM_RUN_REAL_TOKENIZER_TESTS",
+    "",
+).lower() in {"1", "true", "yes"}
+
+RUN_REAL_NEMO_TOKENIZER_TESTS = os.getenv(
+    "LEGALFEDLLM_RUN_REAL_NEMO_TOKENIZER_TESTS",
     "",
 ).lower() in {"1", "true", "yes"}
 
@@ -341,6 +510,41 @@ class RealPinnedTokenizerAcceptanceTests(unittest.TestCase):
                 for token_id in row
             )
         )
+
+
+@unittest.skipUnless(
+    RUN_REAL_NEMO_TOKENIZER_TESTS,
+    "set LEGALFEDLLM_RUN_REAL_NEMO_TOKENIZER_TESTS=true for pinned artifacts",
+)
+class RealMistralNemoTokenizerAcceptanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cache_dir = os.getenv("LEGALFEDLLM_TOKENIZER_CACHE") or None
+        token = os.getenv("HF_TOKEN") or None
+        local_only = os.getenv(
+            "LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY",
+            "",
+        ).lower() in {"1", "true", "yes"}
+        cls.validated = load_pinned_tokenizer(
+            mistral_nemo_endpoint(),
+            cache_dir=cache_dir,
+            token=token,
+            local_files_only=local_only,
+        )
+
+    def test_actual_nemo_uses_pinned_corrected_tokenizer_and_existing_pad(
+        self,
+    ) -> None:
+        endpoint = self.validated.endpoint
+        tokenizer = self.validated.tokenizer
+
+        self.assertTrue(endpoint.fix_mistral_regex)
+        self.assertTrue(endpoint.bind_existing_pad_token)
+        self.assertEqual(tokenizer.pad_token, "<pad>")
+        self.assertEqual(tokenizer.pad_token_id, 10)
+        self.assertEqual(tokenizer.vocab_size, 131072)
+        self.assertEqual(len(tokenizer), 131072)
+        self.assertEqual(len(tokenizer.get_vocab()), 131072)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from shared.fedmkt_core.selection import dual_min_ce_select
+from shared.fedmkt_core.safety import MINIMUM_TRUST_SCORE
 from shared.protocol import KnowledgePackage, KnowledgeSample, SafetyReport
 
 
@@ -125,8 +126,8 @@ class FedMKTSelectionTests(unittest.TestCase):
                 "hard-rejected": [sample("sample-1", 0.05, 40)],
             },
             safety_reports={
-                "below": SafetyReport(accepted=True, trust_score=0.49),
-                "boundary": SafetyReport(accepted=True, trust_score=0.50),
+                "below": SafetyReport(accepted=True, trust_score=0.14),
+                "boundary": SafetyReport(accepted=True, trust_score=0.15),
                 "hard-rejected": SafetyReport(
                     accepted=False,
                     trust_score=0.99,
@@ -138,7 +139,7 @@ class FedMKTSelectionTests(unittest.TestCase):
 
         self.assertEqual(dataset.accepted_client_ids, ["boundary"])
         self.assertEqual(dataset.samples[0].teacher_id, "boundary")
-        self.assertEqual(dataset.samples[0].trust_score, 0.5)
+        self.assertEqual(dataset.samples[0].trust_score, MINIMUM_TRUST_SCORE)
 
 
 if __name__ == "__main__":

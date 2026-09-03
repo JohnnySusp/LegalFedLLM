@@ -129,6 +129,63 @@ def validate_loaded_tokenizer(
     )
 
 
+def _bind_existing_pad_token(
+    endpoint: TokenizerEndpoint,
+    tokenizer: Any,
+) -> None:
+    if endpoint.pad_token is None or endpoint.pad_token_id is None:
+        raise TokenizerValidationError(
+            "existing pad-token binding requires a pinned token and ID"
+        )
+
+    try:
+        vocabulary_before = tokenizer.get_vocab()
+        length_before = len(tokenizer)
+    except Exception as exc:
+        raise TokenizerValidationError(
+            "tokenizer state could not be recorded before pad-token binding"
+        ) from exc
+    if not isinstance(vocabulary_before, dict):
+        raise TokenizerValidationError(
+            "tokenizer vocabulary is not a dictionary"
+        )
+    vocabulary_size_before = getattr(tokenizer, "vocab_size", None)
+
+    actual_id = vocabulary_before.get(endpoint.pad_token)
+    if actual_id is None:
+        raise TokenizerValidationError(
+            f"pinned pad token {endpoint.pad_token!r} is absent from the vocabulary"
+        )
+    if actual_id != endpoint.pad_token_id:
+        raise TokenizerValidationError(
+            f"pinned pad token {endpoint.pad_token!r} has ID {actual_id}, "
+            f"expected {endpoint.pad_token_id}"
+        )
+
+    tokenizer.pad_token = endpoint.pad_token
+
+    try:
+        vocabulary_after = tokenizer.get_vocab()
+        length_after = len(tokenizer)
+    except Exception as exc:
+        raise TokenizerValidationError(
+            "tokenizer state could not be verified after pad-token binding"
+        ) from exc
+    vocabulary_size_after = getattr(tokenizer, "vocab_size", None)
+    if (
+        vocabulary_after != vocabulary_before
+        or length_after != length_before
+        or vocabulary_size_after != vocabulary_size_before
+    ):
+        raise TokenizerValidationError(
+            "binding the existing pad token changed the tokenizer vocabulary"
+        )
+    if getattr(tokenizer, "pad_token_id", None) != endpoint.pad_token_id:
+        raise TokenizerValidationError(
+            "bound pad-token ID differs from the pinned tokenizer endpoint"
+        )
+
+
 def load_pinned_tokenizer(
     endpoint: TokenizerEndpoint,
     *,
@@ -155,15 +212,22 @@ def load_pinned_tokenizer(
             local_files_only=local_files_only,
         )
     )
+    tokenizer_arguments = {
+        "revision": endpoint.tokenizer_revision,
+        "trust_remote_code": False,
+        "use_fast": True,
+        "cache_dir": cache_value,
+        "token": token,
+        "local_files_only": local_files_only,
+    }
+    if endpoint.fix_mistral_regex:
+        tokenizer_arguments["fix_mistral_regex"] = True
     tokenizer = AutoTokenizer.from_pretrained(
         endpoint.tokenizer_id,
-        revision=endpoint.tokenizer_revision,
-        trust_remote_code=False,
-        use_fast=True,
-        cache_dir=cache_value,
-        token=token,
-        local_files_only=local_files_only,
+        **tokenizer_arguments,
     )
+    if endpoint.bind_existing_pad_token:
+        _bind_existing_pad_token(endpoint, tokenizer)
     return validate_loaded_tokenizer(
         endpoint,
         tokenizer,
