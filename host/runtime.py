@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from host.model_profiles import (
-    GRANITE_3_3_2B_HOST_PROFILE_ID,
     pinned_host_profile,
+    supported_host_profile_ids,
 )
 from host.training import (
     HostValidationRecord,
@@ -55,19 +55,25 @@ def default_host_profile() -> ModelProfile:
     training_backend = os.getenv("HOST_TRAINING_BACKEND", "mock").strip().lower()
     selected_profile = os.getenv("HOST_MODEL_PROFILE", "mock").strip()
     if selected_profile != "mock":
-        if selected_profile != GRANITE_3_3_2B_HOST_PROFILE_ID:
+        if selected_profile not in supported_host_profile_ids():
             raise HostRuntimeError(
                 f"unsupported real Host profile: {selected_profile!r}"
             )
         if training_backend != "transformers":
             raise HostRuntimeError(
-                "the pinned Granite Host requires "
+                "a pinned real Host requires "
                 "HOST_TRAINING_BACKEND=transformers"
             )
-        return pinned_host_profile(serving_backend=serving_backend)
+        try:
+            return pinned_host_profile(
+                selected_profile,
+                serving_backend=serving_backend,
+            )
+        except ValueError as exc:
+            raise HostRuntimeError(str(exc)) from exc
     if training_backend != "mock":
         raise HostRuntimeError(
-            "HOST_MODEL_PROFILE must select the pinned Granite profile when "
+            "HOST_MODEL_PROFILE must select a pinned real Host profile when "
             "HOST_TRAINING_BACKEND=transformers"
         )
     ollama_model = os.getenv("HOST_OLLAMA_MODEL", "granite3.3:2b")

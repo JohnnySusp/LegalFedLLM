@@ -12,13 +12,22 @@ from pydantic import (
     model_validator,
 )
 
-from host.model_profiles import pinned_host_profile
+from host.model_profiles import (
+    GRANITE_3_3_2B_HOST_PROFILE_ID,
+    MISTRAL_NEMO_HOST_PROFILE_ID,
+    pinned_host_profile,
+)
 from shared.crypto import sha256_hex
 from shared.protocol import HASH_PATTERN, ModelProfile, parse_utc, utc_text
 from shared.reference_dataset import ReferenceDatasetIdentity
 
 
-HOST_TRAINING_CONTRACT_ID = "granite-3.3-2b-real-host-v1"
+GRANITE_HOST_TRAINING_CONTRACT_ID = "granite-3.3-2b-real-host-v1"
+MISTRAL_NEMO_HOST_TRAINING_CONTRACT_ID = (
+    "mistral-nemo-instruct-2407-real-host-v1"
+)
+# Backward-compatible public name for the original Granite contract.
+HOST_TRAINING_CONTRACT_ID = GRANITE_HOST_TRAINING_CONTRACT_ID
 INITIAL_HOST_ADAPTER_POLICY = "fresh_zero_effect_lora_v0"
 PRIMARY_HOST_VALIDATION_METRIC = "macro_mean_answer_token_ce"
 SECONDARY_HOST_VALIDATION_METRIC = "token_weighted_answer_token_ce"
@@ -29,11 +38,12 @@ class HostTrainingContract(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
-class GraniteHostTrainingContract(HostTrainingContract):
+class PinnedHostTrainingContract(HostTrainingContract):
     schema_version: Literal["1.0"] = "1.0"
-    contract_id: Literal["granite-3.3-2b-real-host-v1"] = (
-        HOST_TRAINING_CONTRACT_ID
-    )
+    contract_id: Literal[
+        "granite-3.3-2b-real-host-v1",
+        "mistral-nemo-instruct-2407-real-host-v1",
+    ] = GRANITE_HOST_TRAINING_CONTRACT_ID
     host_model_profile_hash: str = Field(pattern=HASH_PATTERN)
     initial_adapter_policy: Literal["fresh_zero_effect_lora_v0"] = (
         INITIAL_HOST_ADAPTER_POLICY
@@ -53,7 +63,7 @@ class GraniteHostTrainingContract(HostTrainingContract):
     contract_hash: str = Field(pattern=HASH_PATTERN)
 
     @model_validator(mode="after")
-    def validate_contract_hash(self) -> "GraniteHostTrainingContract":
+    def validate_contract_hash(self) -> "PinnedHostTrainingContract":
         expected = sha256_hex(
             self.model_dump(mode="json", exclude={"contract_hash"})
         )
@@ -65,17 +75,26 @@ class GraniteHostTrainingContract(HostTrainingContract):
     def create(
         cls,
         model_profile: ModelProfile,
-    ) -> "GraniteHostTrainingContract":
+    ) -> "PinnedHostTrainingContract":
         expected = pinned_host_profile(
-            serving_backend=model_profile.serving_backend
+            model_profile.profile_id,
+            serving_backend=model_profile.serving_backend,
         )
         if model_profile.profile_hash() != expected.profile_hash():
             raise ValueError(
-                "real Host training requires the exact pinned Granite Host profile"
+                "real Host training requires an exact pinned Host profile"
             )
+        contract_ids = {
+            GRANITE_3_3_2B_HOST_PROFILE_ID: (
+                GRANITE_HOST_TRAINING_CONTRACT_ID
+            ),
+            MISTRAL_NEMO_HOST_PROFILE_ID: (
+                MISTRAL_NEMO_HOST_TRAINING_CONTRACT_ID
+            ),
+        }
         payload = {
             "schema_version": "1.0",
-            "contract_id": HOST_TRAINING_CONTRACT_ID,
+            "contract_id": contract_ids[model_profile.profile_id],
             "host_model_profile_hash": model_profile.profile_hash(),
             "initial_adapter_policy": INITIAL_HOST_ADAPTER_POLICY,
             "authoritative_public_data_epochs": 5,
@@ -86,6 +105,10 @@ class GraniteHostTrainingContract(HostTrainingContract):
             "rejected_candidate_policy": REJECTED_CANDIDATE_POLICY,
         }
         return cls(**payload, contract_hash=sha256_hex(payload))
+
+
+# Keep imports and serialized Granite records from earlier milestones valid.
+GraniteHostTrainingContract = PinnedHostTrainingContract
 
 
 class HostTrainingExecutionProfile(HostTrainingContract):
@@ -159,7 +182,7 @@ def host_execution_profile_from_environment() -> HostTrainingExecutionProfile:
 
 class HostAdapterInitializationRecord(HostTrainingContract):
     schema_version: Literal["1.0"] = "1.0"
-    contract: GraniteHostTrainingContract
+    contract: PinnedHostTrainingContract
     contract_hash: str = Field(pattern=HASH_PATTERN)
     model_profile_hash: str = Field(pattern=HASH_PATTERN)
     execution_profile: HostTrainingExecutionProfile

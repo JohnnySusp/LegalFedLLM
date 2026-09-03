@@ -7,6 +7,10 @@ from shared.protocol import ModelProfile
 
 POC_DTW_PROFILE_VERSION = "qwen3-1.7b--granite3.3-2b-v1"
 POC_DTW_PROFILE_ID = f"dtw:{POC_DTW_PROFILE_VERSION}"
+MISTRAL_NEMO_DTW_PROFILE_VERSION = (
+    "qwen3-1.7b--mistral-nemo-instruct-2407-v1"
+)
+MISTRAL_NEMO_DTW_PROFILE_ID = f"dtw:{MISTRAL_NEMO_DTW_PROFILE_VERSION}"
 GRANITE_IDENTITY_DTW_PROFILE_VERSION = (
     "granite3.3-2b-client--granite3.3-2b-host-v1"
 )
@@ -180,9 +184,64 @@ GRANITE_IDENTITY_DTW_PROFILE = BidirectionalAlignmentProfile(
 )
 
 
+MISTRAL_NEMO_HOST_ENDPOINT = TokenizerEndpoint(
+    role="host",
+    profile_id="mistral-nemo-instruct-2407-host-lora-v1",
+    model_id="mistralai/Mistral-Nemo-Instruct-2407",
+    model_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
+    model_class="MistralForCausalLM",
+    model_type="mistral",
+    tokenizer_id="mistralai/Mistral-Nemo-Instruct-2407",
+    tokenizer_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
+    tokenizer_class="PreTrainedTokenizerFast",
+    vocabulary_size=131072,
+    tokenizer_chat_template_hash=(
+        "e4676cb56dffea7782fd3e2b577cfaf1e123537e6ef49b3ec7caa6c095c62272"
+    ),
+    chat_template_mode="standard",
+    tokenizer_artifact_sha256=(
+        "e11c71726323d33da7b8d6f6f269f1988931c0a52b7122bcdd8c05042974e0db"
+    ),
+    tokenizer_base_vocabulary_size=131072,
+    tokenizer_vocabulary_size=131072,
+    tokenizer_max_token_id=131071,
+    word_boundary_marker="Ġ",
+    bos_token="<s>",
+    bos_token_id=1,
+    eos_token="</s>",
+    eos_token_id=2,
+    pad_token="<pad>",
+    pad_token_id=10,
+    unk_token="<unk>",
+    unk_token_id=0,
+    additional_special_token_ids=(),
+    model_max_length=1000000000000000019884624838656,
+    padding_side="right",
+    fix_mistral_regex=True,
+    bind_existing_pad_token=True,
+)
+
+
+MISTRAL_NEMO_DTW_PROFILE = BidirectionalAlignmentProfile(
+    profile_id=MISTRAL_NEMO_DTW_PROFILE_ID,
+    strategy="dtw",
+    profile_version=MISTRAL_NEMO_DTW_PROFILE_VERSION,
+    client=POC_DTW_PROFILE.client,
+    host=MISTRAL_NEMO_HOST_ENDPOINT,
+    client_to_host_owner="coordinator",
+    host_to_client_owner="client",
+)
+
+
 _SUPPORTED_PROFILES = {
     POC_DTW_PROFILE_ID: POC_DTW_PROFILE,
     GRANITE_IDENTITY_DTW_PROFILE_ID: GRANITE_IDENTITY_DTW_PROFILE,
+    MISTRAL_NEMO_DTW_PROFILE_ID: MISTRAL_NEMO_DTW_PROFILE,
+}
+
+_HOST_ENDPOINTS = {
+    POC_DTW_PROFILE.host.profile_id: POC_DTW_PROFILE.host,
+    MISTRAL_NEMO_HOST_ENDPOINT.profile_id: MISTRAL_NEMO_HOST_ENDPOINT,
 }
 
 
@@ -197,6 +256,17 @@ def resolve_alignment_profile(profile_id: str) -> BidirectionalAlignmentProfile:
         supported = ", ".join(supported_alignment_profile_ids())
         raise UnsupportedAlignmentProfile(
             f"unsupported alignment profile {profile_id!r}; supported: {supported}"
+        ) from None
+
+
+def resolve_host_tokenizer_endpoint(profile_id: str) -> TokenizerEndpoint:
+    try:
+        return _HOST_ENDPOINTS[profile_id]
+    except KeyError:
+        supported = ", ".join(_HOST_ENDPOINTS)
+        raise UnsupportedAlignmentProfile(
+            f"unsupported Host tokenizer profile {profile_id!r}; "
+            f"supported: {supported}"
         ) from None
 
 

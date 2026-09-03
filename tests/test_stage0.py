@@ -705,7 +705,7 @@ class ProtocolValidationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 HostRuntimeError,
-                "exact pinned Granite Host profile",
+                "unsupported pinned Host profile",
             ):
                 HostRuntime(
                     data_dir=Path(directory) / "host",

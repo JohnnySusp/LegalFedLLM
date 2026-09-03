@@ -9,7 +9,10 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from shared.alignment_profiles import POC_DTW_PROFILE
+from shared.alignment_profiles import (
+    MISTRAL_NEMO_HOST_ENDPOINT,
+    POC_DTW_PROFILE,
+)
 from shared.crypto import sha256_hex
 from shared.tokenizer_validation import (
     TokenizerValidationError,
@@ -99,44 +102,6 @@ def synthetic_pad_endpoint():
         tokenizer_max_token_id=3,
         pad_token="<pad>",
         pad_token_id=3,
-        bind_existing_pad_token=True,
-    )
-
-
-def mistral_nemo_endpoint():
-    return replace(
-        POC_DTW_PROFILE.host,
-        profile_id="mistral-nemo-instruct-2407-host-tokenizer-v1",
-        model_id="mistralai/Mistral-Nemo-Instruct-2407",
-        model_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
-        model_class="MistralForCausalLM",
-        model_type="mistral",
-        tokenizer_id="mistralai/Mistral-Nemo-Instruct-2407",
-        tokenizer_revision="04d8a90549d23fc6bd7f642064003592df51e9b3",
-        tokenizer_class="PreTrainedTokenizerFast",
-        vocabulary_size=131072,
-        tokenizer_chat_template_hash=(
-            "e4676cb56dffea7782fd3e2b577cfaf1e123537e6ef49b3ec7caa6c095c62272"
-        ),
-        tokenizer_artifact_sha256=(
-            "e11c71726323d33da7b8d6f6f269f1988931c0a52b7122bcdd8c05042974e0db"
-        ),
-        tokenizer_base_vocabulary_size=131072,
-        tokenizer_vocabulary_size=131072,
-        tokenizer_max_token_id=131071,
-        word_boundary_marker="Ġ",
-        bos_token="<s>",
-        bos_token_id=1,
-        eos_token="</s>",
-        eos_token_id=2,
-        pad_token="<pad>",
-        pad_token_id=10,
-        unk_token="<unk>",
-        unk_token_id=0,
-        additional_special_token_ids=(),
-        model_max_length=1000000000000000019884624838656,
-        padding_side="right",
-        fix_mistral_regex=True,
         bind_existing_pad_token=True,
     )
 
@@ -526,7 +491,7 @@ class RealMistralNemoTokenizerAcceptanceTests(unittest.TestCase):
             "",
         ).lower() in {"1", "true", "yes"}
         cls.validated = load_pinned_tokenizer(
-            mistral_nemo_endpoint(),
+            MISTRAL_NEMO_HOST_ENDPOINT,
             cache_dir=cache_dir,
             token=token,
             local_files_only=local_only,

@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from coordinator.service import ConflictError, CoordinatorService, HostGateway
 from host.model_profiles import (
     GRANITE_3_3_2B_HOST_PROFILE_ID,
+    MISTRAL_NEMO_HOST_PROFILE_ID,
     pinned_host_profile,
 )
 from host.main import create_app as create_host_app
@@ -34,6 +35,8 @@ from host.training import (
     HostValidationRecord,
     HostValidationSampleMetric,
     GraniteHostTrainingContract,
+    MISTRAL_NEMO_HOST_TRAINING_CONTRACT_ID,
+    PinnedHostTrainingContract,
     HostTrainingExecutionProfile,
     host_execution_profile_from_environment,
 )
@@ -41,6 +44,7 @@ from shared.adapter_checkpoint import (
     AdapterCheckpointMetadata,
     AdapterCheckpointStore,
 )
+from shared.alignment_profiles import MISTRAL_NEMO_DTW_PROFILE_VERSION
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import load_package_samples, write_knowledge_artifact
@@ -53,6 +57,7 @@ from shared.protocol import (
     HostTrainingJob,
     HostTrainingJobReceipt,
     KnowledgePackage,
+    ModelProfile,
     HostReferenceDatasetBundle,
     RoundCreateRequest,
     RoundManifest,
@@ -327,6 +332,7 @@ def host_round_bundle(
     maximum_knowledge_package_bytes: int = 1024 * 1024,
     host_public_data_epochs: int = 5,
     alignment: AlignmentConfig | None = None,
+    host_model_profile: ModelProfile | None = None,
 ) -> tuple[RoundManifest, HostReferenceDatasetBundle]:
     reference = reference or [
         reference_sample("dp-1"),
@@ -358,7 +364,7 @@ def host_round_bundle(
         round_id=round_id,
         coordinator_id="coordinator",
         current_host_adapter_version=0,
-        host_model_profile=pinned_host_profile(),
+        host_model_profile=host_model_profile or pinned_host_profile(),
         selected_client_profile_hashes={"client-a": "b" * 64},
         request=request,
         submission_deadline=(
@@ -791,6 +797,14 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
         profile = pinned_host_profile()
         contract = GraniteHostTrainingContract.create(profile)
 
+        self.assertEqual(
+            profile.profile_hash(),
+            "842b754defd7751a8b9a415757bbd760a870009045eb2cc4b5c2f045a7dbde44",
+        )
+        self.assertEqual(
+            contract.contract_hash,
+            "b9ed41565df46babcc3dbe4593a96ba5cdd60ccfe453fd1ea874ee193b3486dd",
+        )
         self.assertEqual(contract.host_model_profile_hash, profile.profile_hash())
         self.assertEqual(contract.initial_adapter_policy, "fresh_zero_effect_lora_v0")
         self.assertEqual(contract.authoritative_public_data_epochs, 5)
@@ -813,8 +827,40 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
         changed = pinned_host_profile().model_copy(
             update={"model_revision": "main"}
         )
-        with self.assertRaisesRegex(ValueError, "exact pinned Granite"):
+        with self.assertRaisesRegex(ValueError, "exact pinned Host"):
             GraniteHostTrainingContract.create(changed)
+
+    def test_mistral_nemo_uses_its_own_pinned_contract_and_tokenizer(self) -> None:
+        profile = pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID)
+        contract = PinnedHostTrainingContract.create(profile)
+        execution = HostTrainingExecutionProfile(
+            device="cpu",
+            precision="float32",
+            gradient_checkpointing=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+
+        self.assertEqual(
+            contract.contract_id,
+            MISTRAL_NEMO_HOST_TRAINING_CONTRACT_ID,
+        )
+        self.assertEqual(
+            profile.profile_hash(),
+            "8bbca6cdac9166d516e1061fc7df65450b1bf7a1d94aed7fb47350efafb7f652",
+        )
+        self.assertEqual(
+            contract.contract_hash,
+            "e6fe93ba0b6f8f1b3eea0cad42a7939d5ddf6a4c1d73709146d815fbcf0cc44f",
+        )
+        self.assertEqual(contract.host_model_profile_hash, profile.profile_hash())
+        self.assertEqual(backend.tokenizer_endpoint.profile_id, profile.profile_id)
+        self.assertTrue(backend.tokenizer_endpoint.fix_mistral_regex)
+        self.assertTrue(backend.tokenizer_endpoint.bind_existing_pad_token)
 
     def test_execution_profile_uses_the_upstream_host_defaults(self) -> None:
         profile = HostTrainingExecutionProfile()
@@ -871,6 +917,17 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
                 pinned_host_profile().profile_hash(),
             )
 
+        nemo_environment = {
+            "HOST_MODEL_PROFILE": MISTRAL_NEMO_HOST_PROFILE_ID,
+            "HOST_TRAINING_BACKEND": "transformers",
+            "HOST_SERVING_BACKEND": "mock",
+        }
+        with mock.patch.dict(os.environ, nemo_environment, clear=False):
+            self.assertEqual(
+                default_host_profile().profile_hash(),
+                pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID).profile_hash(),
+            )
+
         with mock.patch.dict(
             os.environ,
             {"HOST_TRAINING_BACKEND": "transformers"},
@@ -880,19 +937,23 @@ class GraniteHostTrainingContractTests(unittest.TestCase):
             with self.assertRaisesRegex(HostRuntimeError, "HOST_MODEL_PROFILE"):
                 default_host_profile()
 
-    def test_environment_profile_supports_the_one_epoch_smoke_override(self) -> None:
+    def test_environment_profile_supports_the_one_step_smoke_override(self) -> None:
         with mock.patch.dict(
             os.environ,
             {
                 "HOST_TRAINING_DEVICE": "cpu",
                 "HOST_TRAINING_PRECISION": "float32",
                 "HOST_PUBLIC_DATA_EPOCHS": "1",
+                "HOST_GRADIENT_ACCUMULATION_STEPS": "1",
+                "HOST_WARMUP_RATIO": "0",
                 "HOST_GRADIENT_CHECKPOINTING": "true",
             },
             clear=False,
         ):
             profile = host_execution_profile_from_environment()
         self.assertEqual(profile.public_data_epochs, 1)
+        self.assertEqual(profile.gradient_accumulation_steps, 1)
+        self.assertEqual(profile.warmup_ratio, 0.0)
         self.assertTrue(profile.gradient_checkpointing)
 
     def test_validation_record_rejects_metric_and_binding_tampering(self) -> None:
@@ -1898,4 +1959,94 @@ class RealHostAdapterAcceptanceTests(unittest.TestCase):
             self.assertEqual(
                 runtime.validation_baseline(manifest).record_hash,
                 validation.record_hash,
+            )
+
+
+@unittest.skipUnless(
+    os.getenv("LEGALFEDLLM_RUN_REAL_NEMO_HOST_TESTS", "").lower()
+    in {"1", "true", "yes"},
+    "set LEGALFEDLLM_RUN_REAL_NEMO_HOST_TESTS=true on the Host",
+)
+class RealMistralNemoHostAcceptanceTests(unittest.TestCase):
+    def test_initialize_infer_train_reject_and_restart(self) -> None:
+        profile = pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID)
+        execution = host_execution_profile_from_environment()
+        self.assertEqual(execution.device, "cuda")
+        self.assertEqual(execution.precision, "bfloat16")
+        self.assertEqual(execution.public_data_epochs, 1)
+        self.assertEqual(execution.micro_batch_size, 1)
+        self.assertEqual(execution.gradient_accumulation_steps, 1)
+        self.assertEqual(execution.learning_rate, 3e-5)
+        self.assertEqual(execution.warmup_ratio, 0.0)
+        self.assertTrue(execution.gradient_checkpointing)
+
+        manifest, bundle = host_round_bundle(
+            reference=[reference_sample("nemo-dp-smoke-0001")],
+            round_id="mistral-nemo-real-host-smoke",
+            maximum_sequence_length=128,
+            host_public_data_epochs=1,
+            alignment=AlignmentConfig(
+                strategy="dtw",
+                profile_version=MISTRAL_NEMO_DTW_PROFILE_VERSION,
+            ),
+            host_model_profile=profile,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=backend,
+                force_validation_failure=True,
+            )
+            self.assertTrue(
+                runtime.real_adapter.initialization.zero_effect_verified
+            )
+            self.assertTrue(runtime.real_adapter.initialization.reload_verified)
+
+            runtime.load_reference_data(bundle)
+            package = runtime.generate_reference_knowledge(manifest)
+            self.assertEqual(package.sample_ids, manifest.sample_ids)
+            self.assertTrue(
+                package.verify_signature(runtime.identity.public_key_b64)
+            )
+
+            artifact = Path(directory) / "nemo-smoke.safetensors"
+            job = write_test_host_training_job(manifest, artifact)
+            runtime.load_training_job(job, artifact)
+            result = runtime.train_candidate(job)
+            self.assertEqual(result.optimizer_step_count, 1)
+            self.assertTrue(result.lora_tensors_changed)
+            self.assertTrue(result.frozen_base_unchanged)
+            self.assertTrue(result.reload_verified)
+
+            decision = runtime.validate_candidate_and_decide(job)
+            self.assertFalse(decision.adapter_promoted)
+            self.assertTrue(decision.rejected_candidate_discarded)
+            post_decision = runtime.generate_post_decision_reference_knowledge(
+                manifest
+            )
+            self.assertEqual(post_decision.adapter_version, 0)
+
+            restarted_backend = TransformersPeftHostBackend(
+                data_dir=directory,
+                model_profile=profile,
+                execution_profile=execution,
+            )
+            restarted_runtime = HostRuntime(
+                data_dir=directory,
+                model_profile=profile,
+                training_execution_profile=execution,
+                peft_backend=restarted_backend,
+                force_validation_failure=True,
+            )
+            self.assertEqual(restarted_runtime.adapter_version, 0)
+            self.assertEqual(
+                restarted_runtime.candidate_validation_decision(manifest),
+                decision,
             )

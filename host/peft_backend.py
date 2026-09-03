@@ -13,7 +13,7 @@ from host.training import (
     HostAdapterInitializationRecord,
     HostValidationRecord,
     HostValidationSampleMetric,
-    GraniteHostTrainingContract,
+    PinnedHostTrainingContract,
     HostTrainingExecutionProfile,
 )
 from shared.answer_only import AnswerOnlyCollator
@@ -22,7 +22,7 @@ from shared.adapter_checkpoint import (
     AdapterCheckpointStore,
     write_atomic_json,
 )
-from shared.alignment_profiles import POC_DTW_PROFILE
+from shared.alignment_profiles import resolve_host_tokenizer_endpoint
 from shared.distillation_artifact import TENSOR_NAMES, load_host_training_artifact
 from shared.protocol import (
     HostCandidateTrainingResult,
@@ -292,7 +292,16 @@ class TransformersPeftHostBackend:
         self.data_dir = Path(data_dir).resolve()
         self.model_profile = model_profile
         self.execution_profile = execution_profile
-        self.contract = GraniteHostTrainingContract.create(model_profile)
+        self.contract = PinnedHostTrainingContract.create(model_profile)
+        self.tokenizer_endpoint = resolve_host_tokenizer_endpoint(
+            model_profile.profile_id
+        )
+        tokenizer_mismatches = self.tokenizer_endpoint.mismatches(model_profile)
+        if tokenizer_mismatches:
+            raise ValueError(
+                "pinned Host tokenizer endpoint differs from ModelProfile: "
+                + ", ".join(tokenizer_mismatches)
+            )
         self.knowledge_batch_size = (
             int(os.getenv("HOST_KNOWLEDGE_BATCH_SIZE", "1"))
             if knowledge_batch_size is None
@@ -320,7 +329,7 @@ class TransformersPeftHostBackend:
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
         validated_tokenizer = load_pinned_tokenizer(
-            POC_DTW_PROFILE.host,
+            self.tokenizer_endpoint,
             cache_dir=os.getenv("HF_HOME"),
             token=os.getenv("HF_TOKEN") or None,
         )
@@ -744,7 +753,7 @@ class TransformersPeftHostBackend:
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
         validated_tokenizer = load_pinned_tokenizer(
-            POC_DTW_PROFILE.host,
+            self.tokenizer_endpoint,
             cache_dir=os.getenv("HF_HOME"),
             token=os.getenv("HF_TOKEN") or None,
         )
@@ -944,7 +953,7 @@ class TransformersPeftHostBackend:
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
         validated_tokenizer = load_pinned_tokenizer(
-            POC_DTW_PROFILE.host,
+            self.tokenizer_endpoint,
             cache_dir=os.getenv("HF_HOME"),
             token=os.getenv("HF_TOKEN") or None,
         )
@@ -1052,7 +1061,7 @@ class TransformersPeftHostBackend:
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
         validated_tokenizer = load_pinned_tokenizer(
-            POC_DTW_PROFILE.host,
+            self.tokenizer_endpoint,
             cache_dir=os.getenv("HF_HOME"),
             token=os.getenv("HF_TOKEN") or None,
         )
