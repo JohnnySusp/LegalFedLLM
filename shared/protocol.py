@@ -13,7 +13,7 @@ from shared.reference_dataset import (
     ReferenceSample,
 )
 
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 PACKAGE_SCHEMA_VERSION = "2.0"
 KNOWLEDGE_ARTIFACT_FORMAT = "safetensors"
 KNOWLEDGE_ARTIFACT_SCHEMA_VERSION = "2.0"
@@ -261,7 +261,6 @@ class RoundCreateRequest(ContractModel):
     host_public_data_epochs: Literal[1, 5] = 5
     client_public_data_epochs: Literal[1] = 1
     client_public_validation_fraction: Literal[0.1] = 0.1
-    alignment: AlignmentConfig = Field(default_factory=AlignmentConfig)
     distillation: DistillationConfig = Field(default_factory=DistillationConfig)
     dp_policy: DifferentialPrivacyPolicy = Field(default_factory=DifferentialPrivacyPolicy)
     maximum_knowledge_package_bytes: int = Field(
@@ -306,7 +305,7 @@ class RoundCreateRequest(ContractModel):
 
 
 class RoundManifest(ContractModel):
-    protocol_version: Literal["1.0"] = PROTOCOL_VERSION
+    protocol_version: Literal["1.1"] = PROTOCOL_VERSION
     round_id: str = Field(min_length=1, max_length=128)
     selected_client_ids: list[str]
     selected_client_profile_hashes: dict[str, str]
@@ -326,7 +325,7 @@ class RoundManifest(ContractModel):
     host_public_data_epochs: Literal[1, 5]
     client_public_data_epochs: Literal[1]
     client_public_validation_fraction: Literal[0.1]
-    alignment: AlignmentConfig
+    selected_client_alignment_profiles: dict[str, str]
     distillation: DistillationConfig
     dp_policy: DifferentialPrivacyPolicy
     maximum_knowledge_package_bytes: int = Field(ge=1024)
@@ -360,6 +359,36 @@ class RoundManifest(ContractModel):
             for value in self.selected_client_profile_hashes.values()
         ):
             raise ValueError("selected Client profile hashes must be SHA-256 hex")
+        if set(self.selected_client_alignment_profiles) != set(
+            self.selected_client_ids
+        ):
+            raise ValueError(
+                "selected Client alignment profiles must match selected Client IDs"
+            )
+        strategies: set[str] = set()
+        for profile_id in self.selected_client_alignment_profiles.values():
+            if not isinstance(profile_id, str) or not profile_id.strip():
+                raise ValueError(
+                    "selected Client alignment profile IDs must be non-blank strings"
+                )
+            strategy, separator, version = profile_id.partition(":")
+            if separator != ":" or not version or strategy not in {
+                "mock_identity",
+                "dtw",
+            }:
+                raise ValueError(
+                    "selected Client alignment profile IDs must use "
+                    "mock_identity:<version> or dtw:<version>"
+                )
+            if len(profile_id) > 256:
+                raise ValueError(
+                    "selected Client alignment profile IDs must not exceed 256 characters"
+                )
+            strategies.add(strategy)
+        if len(strategies) != 1:
+            raise ValueError(
+                "selected Client alignment profiles must use one alignment strategy"
+            )
         if (
             self.sample_ids is not None
             and len(self.sample_ids) != len(set(self.sample_ids))
@@ -381,6 +410,34 @@ class RoundManifest(ContractModel):
         if self.manifest_hash != expected:
             raise ValueError("manifest_hash does not match the manifest payload")
         return self
+
+    def alignment_profile_id_for(self, client_id: str) -> str:
+        try:
+            return self.selected_client_alignment_profiles[client_id]
+        except KeyError:
+            raise ValueError(
+                f"Client {client_id!r} has no signed alignment assignment"
+            ) from None
+
+    @property
+    def alignment_strategy(self) -> str:
+        first_client_id = self.selected_client_ids[0]
+        return self.alignment_profile_id_for(first_client_id).split(":", 1)[0]
+
+    @property
+    def host_package_alignment_profile_id(self) -> str:
+        """Return the deterministic Host-package alignment anchor for the round."""
+
+        return self.alignment_profile_id_for(self.selected_client_ids[0])
+
+    @property
+    def homogeneous_alignment_profile_id(self) -> str:
+        profile_ids = set(self.selected_client_alignment_profiles.values())
+        if len(profile_ids) != 1:
+            raise ValueError(
+                "round has multiple Client alignment profiles"
+            )
+        return next(iter(profile_ids))
 
     def hash_payload(self) -> dict[str, Any]:
         return self.model_dump(
@@ -405,6 +462,7 @@ class RoundManifest(ContractModel):
         current_host_adapter_version: int,
         host_model_profile: ModelProfile,
         selected_client_profile_hashes: dict[str, str],
+        selected_client_alignment_profiles: dict[str, str],
         request: RoundCreateRequest,
         submission_deadline: str,
     ) -> "RoundManifest":
@@ -422,6 +480,9 @@ class RoundManifest(ContractModel):
             "round_id": round_id,
             "selected_client_ids": request.selected_client_ids,
             "selected_client_profile_hashes": selected_client_profile_hashes,
+            "selected_client_alignment_profiles": (
+                selected_client_alignment_profiles
+            ),
             "trusted_client_quorum": request.trusted_client_quorum,
             "current_host_adapter_version": current_host_adapter_version,
             "host_model_profile": host_model_profile.model_dump(mode="json"),
@@ -440,7 +501,6 @@ class RoundManifest(ContractModel):
             "client_public_validation_fraction": (
                 request.client_public_validation_fraction
             ),
-            "alignment": request.alignment.model_dump(mode="json"),
             "distillation": request.distillation.model_dump(mode="json"),
             "dp_policy": request.dp_policy.model_dump(mode="json"),
             "maximum_knowledge_package_bytes": request.maximum_knowledge_package_bytes,
@@ -570,7 +630,7 @@ class KnowledgeArtifactDescriptor(ContractModel):
 
 
 class KnowledgePackage(ContractModel):
-    protocol_version: Literal["1.0"] = PROTOCOL_VERSION
+    protocol_version: Literal["1.1"] = PROTOCOL_VERSION
     package_schema_version: Literal["2.0"] = PACKAGE_SCHEMA_VERSION
     round_id: str
     manifest_hash: str = Field(pattern=HASH_PATTERN)

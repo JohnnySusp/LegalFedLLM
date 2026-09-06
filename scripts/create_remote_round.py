@@ -17,10 +17,6 @@ from client.model_profiles import (
     QWEN_PROFILE_ID,
 )
 from coordinator.quorum import TrustedClientQuorumPolicy
-from shared.alignment_profiles import (
-    GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION,
-    MISTRAL_NEMO_DTW_PROFILE_VERSION,
-)
 from shared.env_bootstrap import load_env_file
 from shared.prompt import PROMPT_TEMPLATE
 
@@ -78,26 +74,12 @@ def selected_round_slots() -> list[RoundClientSlot]:
     return [available[name] for name in names]
 
 
-def alignment_version_for_profiles(profile_ids: set[str]) -> str:
-    if profile_ids == {QWEN_PROFILE_ID}:
-        return MISTRAL_NEMO_DTW_PROFILE_VERSION
-    if profile_ids == {GRANITE_3_3_2B_CLIENT_PROFILE_ID}:
-        return GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION
-    if profile_ids == {QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID}:
-        raise ValueError(
-            "a live round currently signs one alignment profile; "
-            "Qwen and Granite Clients cannot yet share one round"
-        )
-    raise ValueError(f"unsupported selected Client profiles: {sorted(profile_ids)}")
-
-
 PRIVATE_LABEL_FORMAT = "chat_sft_answer_only_v1"
 
 
 def build_round_request(
     *,
     slots: list[RoundClientSlot],
-    alignment_version: str,
     expected_quorum: int,
 ) -> dict[str, Any]:
     return {
@@ -114,10 +96,6 @@ def build_round_request(
         "host_public_data_epochs": int(
             os.getenv("ROUND_HOST_PUBLIC_DATA_EPOCHS", "5")
         ),
-        "alignment": {
-            "strategy": "dtw",
-            "profile_version": alignment_version,
-        },
         "submission_window_seconds": int(
             os.getenv("ROUND_SUBMISSION_WINDOW_SECONDS", "21600")
         ),
@@ -158,9 +136,6 @@ def main() -> int:
     ).rstrip("/")
     admin_token = _required_secret("ADMIN_TOKEN")
     slots = selected_round_slots()
-    profile_ids = {slot.profile_id for slot in slots}
-    alignment_version = alignment_version_for_profiles(profile_ids)
-
     override_text = os.getenv(
         "COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE",
         "",
@@ -173,7 +148,6 @@ def main() -> int:
 
     round_request = build_round_request(
         slots=slots,
-        alignment_version=alignment_version,
         expected_quorum=expected_quorum,
     )
 
@@ -201,7 +175,9 @@ def main() -> int:
                 "selected_client_ids": manifest["selected_client_ids"],
                 "trusted_client_quorum": manifest["trusted_client_quorum"],
                 "host_public_data_epochs": manifest["host_public_data_epochs"],
-                "alignment": manifest["alignment"],
+                "selected_client_alignment_profiles": manifest[
+                    "selected_client_alignment_profiles"
+                ],
             },
             indent=2,
             sort_keys=True,

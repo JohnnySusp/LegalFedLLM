@@ -26,6 +26,7 @@ GRANITE_IDENTITY_DTW_PROFILE_ID = (
 GRANITE_3_3_2B_CLIENT_PROFILE_ID = (
     "granite-3.3-2b-instruct-client-lora-v1"
 )
+MOCK_IDENTITY_PROFILE_ID = "mock_identity:1"
 
 
 class UnsupportedAlignmentProfile(ValueError):
@@ -287,6 +288,35 @@ def resolve_host_tokenizer_endpoint(profile_id: str) -> TokenizerEndpoint:
             f"supported: {supported}"
         ) from None
 
+
+def resolve_alignment_profile_id_for_pair(
+    *,
+    client_profile: ModelProfile,
+    host_profile: ModelProfile,
+) -> str:
+    if (
+        client_profile.training_backend == "mock"
+        and host_profile.training_backend == "mock"
+    ):
+        return MOCK_IDENTITY_PROFILE_ID
+
+    matches = [
+        profile.profile_id
+        for profile in _SUPPORTED_PROFILES.values()
+        if not profile.client.mismatches(client_profile)
+        and not profile.host.mismatches(host_profile)
+    ]
+    if not matches:
+        raise UnsupportedAlignmentProfile(
+            "no approved alignment profile matches the registered Client and "
+            "Host model/tokenizer profiles"
+        )
+    if len(matches) != 1:
+        raise UnsupportedAlignmentProfile(
+            "multiple approved alignment profiles match the registered Client "
+            "and Host model/tokenizer profiles"
+        )
+    return matches[0]
 
 def validate_alignment_pair(
     profile_id: str,

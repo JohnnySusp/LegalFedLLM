@@ -357,8 +357,8 @@ def host_round_bundle(
         top_k=top_k,
         maximum_knowledge_package_bytes=maximum_knowledge_package_bytes,
         host_public_data_epochs=host_public_data_epochs,
-        alignment=alignment or AlignmentConfig(),
     )
+    alignment = alignment or AlignmentConfig()
     manifest = RoundManifest.create_signed(
         identity=Ed25519Identity(Ed25519PrivateKey.generate()),
         round_id=round_id,
@@ -366,6 +366,9 @@ def host_round_bundle(
         current_host_adapter_version=0,
         host_model_profile=host_model_profile or pinned_host_profile(),
         selected_client_profile_hashes={"client-a": "b" * 64},
+        selected_client_alignment_profiles={
+            "client-a": alignment.profile_id
+        },
         request=request,
         submission_deadline=(
             datetime.now(timezone.utc) + timedelta(hours=1)
@@ -499,10 +502,7 @@ def write_signed_host_package(
         sender_role="host",
         model_profile=manifest.host_model_profile,
         adapter_version=adapter_version,
-        alignment_profile_id=(
-            f"{manifest.alignment.strategy}:"
-            f"{manifest.alignment.profile_version}"
-        ),
+        alignment_profile_id=manifest.homogeneous_alignment_profile_id,
         reference_dataset_id=manifest.reference_dataset_id,
         reference_dataset_hash=manifest.reference_dataset_hash,
         top_k=manifest.top_k,

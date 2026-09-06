@@ -556,7 +556,6 @@ class FedMKTIntegrationTests(unittest.TestCase):
         from shared.crypto import Ed25519Identity
         from shared.prompt import PROMPT_TEMPLATE
         from shared.protocol import (
-            AlignmentConfig,
             RoundCreateRequest,
             RoundManifest,
         )
@@ -573,10 +572,6 @@ class FedMKTIntegrationTests(unittest.TestCase):
             truncation_policy="reject",
             top_k=2,
             host_public_data_epochs=1,
-            alignment=AlignmentConfig(
-                strategy="dtw",
-                profile_version="test-v1",
-            ),
             maximum_host_training_job_bytes=1024 * 1024,
         )
         manifest = RoundManifest.create_signed(
@@ -587,6 +582,10 @@ class FedMKTIntegrationTests(unittest.TestCase):
             host_model_profile=model_profile(self.host_endpoint),
             selected_client_profile_hashes={
                 client_id: "b" * 64 for client_id in self.selected_client_ids
+            },
+            selected_client_alignment_profiles={
+                client_id: "dtw:test-v1"
+                for client_id in self.selected_client_ids
             },
             request=request,
             submission_deadline=(
@@ -660,6 +659,158 @@ class FedMKTIntegrationTests(unittest.TestCase):
                 service.store.exists(
                     "rounds/round-1/validated_distillation_dataset.json"
                 )
+            )
+
+    def test_coordinator_prepares_mixed_alignment_host_training_job(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+
+        from coordinator.service import CoordinatorService, HostGateway
+        from shared.crypto import Ed25519Identity
+        from shared.prompt import PROMPT_TEMPLATE
+        from shared.protocol import RoundCreateRequest, RoundManifest
+
+        selected = ["client-b", "client-a"]
+        request = RoundCreateRequest(
+            selected_client_ids=selected,
+            trusted_client_quorum=2,
+            reference_dataset_id="reference-1",
+            reference_dataset_hash="1" * 64,
+            sample_ids=list(self.sample_ids),
+            prompt_template=PROMPT_TEMPLATE,
+            label_format="causal_lm",
+            maximum_sequence_length=128,
+            truncation_policy="reject",
+            top_k=2,
+            host_public_data_epochs=1,
+            maximum_host_training_job_bytes=1024 * 1024,
+        )
+        manifest = RoundManifest.create_signed(
+            identity=Ed25519Identity(Ed25519PrivateKey.generate()),
+            round_id="round-mixed",
+            coordinator_id="coordinator",
+            current_host_adapter_version=3,
+            host_model_profile=model_profile(self.host_endpoint),
+            selected_client_profile_hashes={
+                "client-b": model_profile(self.client_endpoint).profile_hash(),
+                "client-a": model_profile(
+                    self.granite_client_endpoint
+                ).profile_hash(),
+            },
+            selected_client_alignment_profiles={
+                "client-b": self.profile.profile_id,
+                "client-a": self.granite_profile.profile_id,
+            },
+            request=request,
+            submission_deadline=(
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
+        )
+        mixed_packages = [
+            package(
+                "client-b",
+                "client",
+                self.client_endpoint,
+                self.sample_ids,
+                self.profile.profile_id,
+            ),
+            package(
+                "client-a",
+                "client",
+                self.granite_client_endpoint,
+                self.sample_ids,
+                self.granite_profile.profile_id,
+            ),
+        ]
+        mixed_samples = {
+            "client-b": self.client_samples["client-b"],
+            "client-a": [
+                sample(
+                    sample_id,
+                    ce_loss,
+                    source_ids=[1, 2, 3],
+                    top_k_ids=[[1, 4], [2, 4], [3, 4]],
+                    logit_offset=index / 10,
+                )
+                for index, (sample_id, ce_loss) in enumerate(
+                    zip(self.sample_ids, [0.40, 0.35, 0.25, 0.10])
+                )
+            ],
+        }
+        reports = {
+            client_id: self.safety_reports[client_id]
+            for client_id in selected
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = CoordinatorService(
+                data_dir=directory,
+                host_gateway=HostGateway("http://host", "test-token"),
+            )
+            reference_bundle = SimpleNamespace(reference_samples=[object()])
+            encoded = [
+                SimpleNamespace(sample_id=sample_id, labels=self.labels[sample_id])
+                for sample_id in self.sample_ids
+            ]
+            profiles = {
+                self.profile.profile_id: self.profile,
+                self.granite_profile.profile_id: self.granite_profile,
+            }
+            with (
+                mock.patch(
+                    "coordinator.service.resolve_alignment_profile",
+                    side_effect=lambda profile_id: profiles[profile_id],
+                ),
+                mock.patch(
+                    "coordinator.service.load_pinned_tokenizer",
+                    side_effect=[
+                        self.host_tokenizer,
+                        self.client_tokenizer,
+                        self.granite_client_tokenizer,
+                    ],
+                ) as tokenizer_loader,
+                mock.patch.object(
+                    service,
+                    "_host_reference_dataset_bundle",
+                    return_value=reference_bundle,
+                ),
+                mock.patch(
+                    "coordinator.service.encode_reference_samples",
+                    return_value=encoded,
+                ),
+            ):
+                job = service._prepare_host_training_job(  # noqa: SLF001
+                    manifest=manifest,
+                    baseline=self.host_package,
+                    baseline_samples=self.host_samples,
+                    packages=mixed_packages,
+                    client_samples=mixed_samples,
+                    reports=reports,
+                )
+
+            self.assertEqual(tokenizer_loader.call_count, 3)
+            self.assertEqual(job.accepted_client_ids, selected)
+            audit = service.store.read_json(
+                "rounds/round-mixed/host_training_job/integration_audit.json"
+            )
+            self.assertEqual(
+                [value["alignment_profile_id"] for value in audit["alignments"]],
+                [self.profile.profile_id, self.granite_profile.profile_id],
+            )
+            self.assertEqual(
+                [value["client_ids"] for value in audit["alignments"]],
+                [["client-b"], ["client-a"]],
+            )
+            self.assertTrue(
+                service.store.path(
+                    "rounds/round-mixed/host_training_job/"
+                    "trainer_inputs.safetensors"
+                ).is_file()
             )
 
     def test_mixed_client_profiles_use_independent_signed_mappings(self) -> None:

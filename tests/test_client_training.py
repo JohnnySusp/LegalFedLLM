@@ -30,7 +30,9 @@ from client.training import (
     load_private_examples,
     private_dataset_semantic_hash,
 )
+from host.model_profiles import pinned_host_profile
 from host.runtime import default_host_profile
+from shared.alignment_profiles import POC_DTW_PROFILE_ID
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import LoraProfile, ModelProfile, RoundCreateRequest, RoundManifest
@@ -96,13 +98,26 @@ def manifest_for(
         top_k=3,
         training_epochs=1,
     )
+    host_profile = (
+        default_host_profile()
+        if profile.training_backend == "mock"
+        else pinned_host_profile()
+    )
+    alignment_profile_id = (
+        "mock_identity:1"
+        if profile.training_backend == "mock"
+        else POC_DTW_PROFILE_ID
+    )
     return RoundManifest.create_signed(
         identity=identity,
         round_id=round_id,
         coordinator_id="coordinator",
         current_host_adapter_version=0,
-        host_model_profile=default_host_profile(),
+        host_model_profile=host_profile,
         selected_client_profile_hashes={"client-a": profile.profile_hash()},
+        selected_client_alignment_profiles={
+            "client-a": alignment_profile_id
+        },
         request=request,
         submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
     )

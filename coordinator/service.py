@@ -16,6 +16,7 @@ from coordinator.quorum import TrustedClientQuorumPolicy
 from shared.alignment_profiles import (
     UnsupportedAlignmentProfile,
     resolve_alignment_profile,
+    resolve_alignment_profile_id_for_pair,
     validate_alignment_pair,
 )
 from shared.crypto import Ed25519Identity, canonical_json_bytes
@@ -493,11 +494,32 @@ class CoordinatorService:
             if host_identity.model_profile is None or host_identity.adapter_version is None:
                 raise ConflictError("Host identity is missing its model profile or adapter")
 
-            if request.alignment.strategy != "mock_identity":
+            try:
+                selected_client_alignment_profiles = {
+                    client_id: resolve_alignment_profile_id_for_pair(
+                        client_profile=registration.model_profile,
+                        host_profile=host_identity.model_profile,
+                    )
+                    for client_id, registration in registrations.items()
+                }
+            except UnsupportedAlignmentProfile as exc:
+                raise ConflictError(str(exc)) from exc
+
+            alignment_strategies = {
+                profile_id.split(":", 1)[0]
+                for profile_id in selected_client_alignment_profiles.values()
+            }
+            if len(alignment_strategies) != 1:
+                raise ConflictError(
+                    "selected Client alignment profiles use incompatible strategies"
+                )
+            alignment_strategy = next(iter(alignment_strategies))
+
+            if alignment_strategy == "dtw":
                 try:
-                    for registration in registrations.values():
+                    for client_id, registration in registrations.items():
                         validate_alignment_pair(
-                            request.alignment.profile_id,
+                            selected_client_alignment_profiles[client_id],
                             client_profile=registration.model_profile,
                             host_profile=host_identity.model_profile,
                         )
@@ -543,6 +565,9 @@ class CoordinatorService:
                     client_id: registration.model_profile.profile_hash()
                     for client_id, registration in registrations.items()
                 },
+                selected_client_alignment_profiles=(
+                    selected_client_alignment_profiles
+                ),
                 request=request,
                 submission_deadline=utc_text(deadline),
             )
@@ -567,6 +592,9 @@ class CoordinatorService:
                     "round_id": round_id,
                     "clients": request.selected_client_ids,
                     "quorum": request.trusted_client_quorum,
+                    "selected_client_alignment_profiles": (
+                        selected_client_alignment_profiles
+                    ),
                 },
             )
             return manifest
@@ -720,7 +748,7 @@ class CoordinatorService:
                     )
                     return
             if state.state in {"SEALED", "DISTILLING"}:
-                if manifest.alignment.strategy == "dtw":
+                if manifest.alignment_strategy == "dtw":
                     if process_dtw:
                         deferred_dtw = manifest, state
                 else:
@@ -763,8 +791,8 @@ class CoordinatorService:
                 raise ConflictError("sample order does not match the manifest")
             if package.top_k != manifest.top_k:
                 raise ConflictError("top-k does not match the manifest")
-            expected_alignment = (
-                f"{manifest.alignment.strategy}:{manifest.alignment.profile_version}"
+            expected_alignment = manifest.alignment_profile_id_for(
+                package.sender_id
             )
             if package.alignment_profile_id != expected_alignment:
                 raise ConflictError("alignment profile does not match the manifest")
@@ -869,7 +897,7 @@ class CoordinatorService:
                 state.message = "trusted quorum reached; submission set sealed"
                 state.updated_at = utc_text(self.now_fn())
                 self._write_state(state)
-                if manifest.alignment.strategy != "dtw":
+                if manifest.alignment_strategy != "dtw":
                     await self._process_sealed_round(manifest, state)
                 state = self.get_state(manifest.round_id)
 
@@ -1040,10 +1068,7 @@ class CoordinatorService:
                 "Host package top-k differs from the manifest"
             )
 
-        expected_alignment = (
-            f"{manifest.alignment.strategy}:"
-            f"{manifest.alignment.profile_version}"
-        )
+        expected_alignment = manifest.host_package_alignment_profile_id
 
         if package.alignment_profile_id != expected_alignment:
             raise ConflictError(
@@ -1153,19 +1178,44 @@ class CoordinatorService:
         if cached is not None:
             return cached
 
-        profile = resolve_alignment_profile(manifest.alignment.profile_id)
+        package_client_ids = {package.sender_id for package in packages}
+        ordered_profile_ids = list(
+            dict.fromkeys(
+                manifest.alignment_profile_id_for(client_id)
+                for client_id in manifest.selected_client_ids
+                if client_id in package_client_ids
+            )
+        )
+        alignment_profiles = {
+            profile_id: resolve_alignment_profile(profile_id)
+            for profile_id in ordered_profile_ids
+        }
+        host_anchor = resolve_alignment_profile(
+            manifest.host_package_alignment_profile_id
+        )
+        host_endpoints = {
+            profile.host for profile in alignment_profiles.values()
+        }
+        if len(host_endpoints) != 1:
+            raise ConflictError(
+                "selected Client alignment profiles do not share one Host endpoint"
+            )
+
         cache_dir = os.getenv("HF_HOME") or None
         token = os.getenv("HF_TOKEN") or None
         host_tokenizer = load_pinned_tokenizer(
-            profile.host,
+            host_anchor.host,
             cache_dir=cache_dir,
             token=token,
         )
-        client_tokenizer = load_pinned_tokenizer(
-            profile.client,
-            cache_dir=cache_dir,
-            token=token,
-        )
+        client_tokenizers = {
+            profile_id: load_pinned_tokenizer(
+                profile.client,
+                cache_dir=cache_dir,
+                token=token,
+            )
+            for profile_id, profile in alignment_profiles.items()
+        }
         bundle = self._host_reference_dataset_bundle(manifest)
         encoded = encode_reference_samples(
             bundle.reference_samples,
@@ -1176,8 +1226,8 @@ class CoordinatorService:
         )
         try:
             batch = integrate_distillation_round(
-                profile=profile,
-                client_tokenizer=client_tokenizer,
+                alignment_profiles=alignment_profiles,
+                client_tokenizers=client_tokenizers,
                 host_tokenizer=host_tokenizer,
                 mapping_cache=VocabularyMappingCache(
                     self.store.path("vocabulary_mappings")
@@ -1198,7 +1248,7 @@ class CoordinatorService:
             )
         except TrustedClientQuorumError as exc:
             raise TrustedQuorumError(str(exc)) from exc
-        pad_token_id = profile.host.pad_token_id
+        pad_token_id = host_anchor.host.pad_token_id
         if pad_token_id is None:
             raise ConflictError("approved Host tokenizer has no padding token")
         target = self.store.path(artifact_path)
@@ -1536,7 +1586,7 @@ class CoordinatorService:
     ) -> None:
         if state.state not in {"SEALED", "DISTILLING"}:
             return
-        if manifest.alignment.strategy == "dtw":
+        if manifest.alignment_strategy == "dtw":
             cached_job = self._load_host_training_job(manifest)
             if cached_job is not None:
                 state.state = "DISTILLING"
@@ -1650,7 +1700,7 @@ class CoordinatorService:
                 )
                 for client_id in state.sealed_client_ids
             }
-            if manifest.alignment.strategy == "dtw":
+            if manifest.alignment_strategy == "dtw":
                 job = await asyncio.to_thread(
                     self._prepare_host_training_job,
                     manifest=manifest,

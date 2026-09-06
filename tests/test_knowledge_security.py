@@ -65,6 +65,9 @@ class KnowledgePackageSecurityTests(unittest.TestCase):
             selected_client_profile_hashes={
                 "client-a": default_client_profile().profile_hash()
             },
+            selected_client_alignment_profiles={
+                "client-a": "mock_identity:1"
+            },
             request=request,
             submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
         )

@@ -75,7 +75,7 @@ training examples remain on the Client machine.
 | Exact submission acknowledgement reconciliation | Implemented and regression-tested |
 | Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
 | Real multi-Client round | Not yet demonstrated |
-| Mixed Qwen + Granite Clients in one live manifest | Not yet supported |
+| Mixed Qwen + Granite per-Client alignment and Host integration | Implemented and model-free tested; real heterogeneous execution still pending |
 | Automatic promoted-PEFT → Ollama publication | Not implemented |
 | Production-calibrated malicious-package/LoRA classifier | Not complete |
 | Formal DP-SGD/privacy guarantee | Not claimed |
@@ -266,9 +266,15 @@ These contracts pin model/tokenizer revisions, tokenizer artifact hashes,
 special-token state, vocabulary ranges, padding behavior, chat-template hashes,
 and word-boundary rules. Unknown or mismatched profiles fail closed.
 
-A live manifest currently carries one alignment identity. A Qwen Client and a
-Granite Client therefore cannot yet participate together in the same live round;
-per-Client alignment identities in one heterogeneous manifest remain future work.
+A signed live manifest now carries a deterministic Client-ID keyed alignment mapping.
+The Coordinator derives each assignment from the selected Client's registered
+model/tokenizer profile, the signed Host profile, and the approved alignment registry;
+callers do not choose the mapping. Unknown pairs fail closed. Protocol `1.1` binds this
+representation into the signed manifest. Model-free regression coverage verifies a
+mixed Qwen + Granite → Mistral Nemo manifest, Client-specific package enforcement,
+quorum sealing, duplicate rejection, canonical manifest hashing/signing, and Host
+training-input construction with an independent tokenizer/alignment contract for each
+accepted Client. Real Qwen + Granite model execution remains pending.
 
 ## Repository layout
 
@@ -461,7 +467,7 @@ artifact. The manifest binds at least:
 - sender identity and public-key trust context;
 - model and tokenizer profile;
 - adapter identity;
-- exact alignment profile;
+- exact Client-specific alignment assignment for Client packages;
 - reference-dataset identity and ordered sample set;
 - artifact byte size and SHA-256;
 - top-k setting;
@@ -577,7 +583,7 @@ state.
 After Host publication, the Client:
 
 1. downloads and verifies the signed Host package;
-2. checks exact round/reference/alignment identities;
+2. checks exact round/reference identities and its signed Client-specific alignment assignment;
 3. aligns Host sparse knowledge into the Client tokenizer space;
 4. selects Host-teacher samples using the reverse CE rule;
 5. creates an immutable reverse-training job;
@@ -996,7 +1002,8 @@ The current repository does **not** establish:
 - forward Client-to-Host teaching in the verified real experiment: Qwen was
   selected on `0 / 565` forward samples;
 - a real multi-Client federated round;
-- mixed Qwen + Granite per-Client alignment identities inside one live manifest;
+- a real Qwen + Granite heterogeneous round and reverse synchronization on
+  separate physical Clients;
 - a production-calibrated malicious-Knowledge-Package detector;
 - an independently validated production SafeFed-style Qwen LoRA probe;
 - formal DP-SGD or differential-privacy accounting;
@@ -1016,7 +1023,8 @@ PoC trust score is not a production security certification.
 
 The main open experimental questions are:
 
-1. run a real multi-Client round under the normal majority/minimum-2 quorum;
+1. run the first real Qwen + Granite multi-Client round under the normal
+   majority/minimum-2 quorum and capture each Client's reverse synchronization;
 2. measure scenarios in which an eligible Client actually wins some forward
    DualMinCE samples, and report teacher-selection counts explicitly;
 3. independently train/calibrate the Client safety probe and evaluate malicious

@@ -10,10 +10,12 @@ from pathlib import Path
 
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
+from host.model_profiles import pinned_host_profile
 from client.training import (
     TrainingExecutionProfile,
     execution_profile_from_environment,
 )
+from shared.alignment_profiles import POC_DTW_PROFILE_ID
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_core.safety import inspect_knowledge_package
 from shared.knowledge_artifact import load_package_samples
@@ -117,8 +119,11 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 round_id=round_id,
                 coordinator_id="coordinator",
                 current_host_adapter_version=0,
-                host_model_profile=mock_host_profile(),
+                host_model_profile=pinned_host_profile(),
                 selected_client_profile_hashes={"client-a": profile.profile_hash()},
+                selected_client_alignment_profiles={
+                    "client-a": POC_DTW_PROFILE_ID
+                },
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=2)),
             )

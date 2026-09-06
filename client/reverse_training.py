@@ -928,8 +928,7 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
         profile = resolve_alignment_profile(
-            f"{job.manifest.alignment.strategy}:"
-            f"{job.manifest.alignment.profile_version}"
+            job.manifest.alignment_profile_id_for(job.client_id)
         )
         if profile.client.profile_id != self.model_profile.profile_id:
             raise ValueError("Client validation alignment profile differs")

@@ -12,15 +12,10 @@ from client.model_profiles import (
 )
 from scripts.create_remote_round import (
     RoundClientSlot,
-    alignment_version_for_profiles,
     build_round_request,
 )
 from scripts.run_host_stack import _uvicorn_command, validate_environment
 from scripts.run_remote_round import enabled_client_slots
-from shared.alignment_profiles import (
-    GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION,
-    MISTRAL_NEMO_DTW_PROFILE_VERSION,
-)
 
 
 class HostStackConfigurationTests(unittest.TestCase):
@@ -123,29 +118,33 @@ class RemoteRoundConfigurationTests(unittest.TestCase):
                     profile_id=QWEN_PROFILE_ID,
                 )
             ],
-            alignment_version=MISTRAL_NEMO_DTW_PROFILE_VERSION,
             expected_quorum=1,
         )
 
         self.assertEqual(request["label_format"], "chat_sft_answer_only_v1")
 
-    def test_profile_selects_the_exact_nemo_alignment(self) -> None:
-        self.assertEqual(
-            alignment_version_for_profiles({QWEN_PROFILE_ID}),
-            MISTRAL_NEMO_DTW_PROFILE_VERSION,
-        )
-        self.assertEqual(
-            alignment_version_for_profiles(
-                {GRANITE_3_3_2B_CLIENT_PROFILE_ID}
-            ),
-            GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION,
+    def test_mixed_round_request_defers_alignment_to_the_coordinator(self) -> None:
+        request = build_round_request(
+            slots=[
+                RoundClientSlot(
+                    name="client-1",
+                    client_id="legal-client-1",
+                    profile_id=QWEN_PROFILE_ID,
+                ),
+                RoundClientSlot(
+                    name="client-2",
+                    client_id="legal-client-2",
+                    profile_id=GRANITE_3_3_2B_CLIENT_PROFILE_ID,
+                ),
+            ],
+            expected_quorum=2,
         )
 
-    def test_mixed_profiles_fail_until_per_client_manifests_exist(self) -> None:
-        with self.assertRaisesRegex(ValueError, "one alignment profile"):
-            alignment_version_for_profiles(
-                {QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID}
-            )
+        self.assertEqual(
+            request["selected_client_ids"],
+            ["legal-client-1", "legal-client-2"],
+        )
+        self.assertNotIn("alignment", request)
 
 
 class DeploymentFileContractTests(unittest.TestCase):

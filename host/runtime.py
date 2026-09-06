@@ -356,10 +356,7 @@ class HostRuntime:
                 sender_role="host",
                 model_profile=self.model_profile,
                 adapter_version=active["version"],
-                alignment_profile_id=(
-                    f"{manifest.alignment.strategy}:"
-                    f"{manifest.alignment.profile_version}"
-                ),
+                alignment_profile_id=manifest.host_package_alignment_profile_id,
                 reference_dataset_id=manifest.reference_dataset_id,
                 reference_dataset_hash=manifest.reference_dataset_hash,
                 top_k=manifest.top_k,
@@ -404,10 +401,7 @@ class HostRuntime:
             package = KnowledgePackage.model_validate(
                 self.store.read_json(cache_path)
             )
-            expected_alignment = (
-                f"{manifest.alignment.strategy}:"
-                f"{manifest.alignment.profile_version}"
-            )
+            expected_alignment = manifest.host_package_alignment_profile_id
             if package.round_id != manifest.round_id:
                 raise ValueError("cached Host package belongs to another round")
             if package.manifest_hash != manifest.manifest_hash:
@@ -632,7 +626,7 @@ class HostRuntime:
             raise HostRuntimeError(
                 "Host training job is bound to another model profile"
             )
-        if manifest.alignment.strategy != "dtw":
+        if manifest.alignment_strategy != "dtw":
             raise HostRuntimeError("real Host training requires DTW alignment")
         if self.training_execution_profile is None:
             raise HostRuntimeError(

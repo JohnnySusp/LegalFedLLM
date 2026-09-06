@@ -9,7 +9,10 @@ from typing import Literal
 import torch
 from pydantic import Field, model_validator
 
-from shared.alignment_profiles import BidirectionalAlignmentProfile
+from shared.alignment_profiles import (
+    BidirectionalAlignmentProfile,
+    TokenizerEndpoint,
+)
 from shared.crypto import sha256_hex
 from shared.fedmkt_core.ml.sparse_targets import (
     SparseTargetBatch,
@@ -313,25 +316,15 @@ def _validate_host_contract(
     host_package: KnowledgePackage,
     host_samples: Sequence[KnowledgeSample],
     host_tokenizer: ValidatedTokenizer,
-    profile: BidirectionalAlignmentProfile,
+    host_endpoint: TokenizerEndpoint,
 ) -> dict[str, KnowledgeSample]:
-    if profile.strategy != "dtw":
-        raise DistillationIntegrationError("the integrated path requires DTW")
-    if profile.client_to_host_owner != "coordinator":
+    if host_tokenizer.endpoint != host_endpoint:
         raise DistillationIntegrationError(
-            "Client-to-Host alignment is not assigned to the Coordinator"
-        )
-    if host_tokenizer.endpoint != profile.host:
-        raise DistillationIntegrationError(
-            "validated Host tokenizer differs from the alignment profile"
+            "validated Host tokenizer differs from the alignment profiles"
         )
     if host_package.sender_role != "host":
         raise DistillationIntegrationError("Host package sender_role is not host")
-    if host_package.alignment_profile_id != profile.profile_id:
-        raise DistillationIntegrationError(
-            "Host package uses another alignment profile"
-        )
-    mismatches = profile.host.mismatches(host_package.model_profile)
+    mismatches = host_endpoint.mismatches(host_package.model_profile)
     if mismatches:
         raise DistillationIntegrationError(
             "Host package differs from the approved Host endpoint: "
@@ -514,17 +507,11 @@ def integrate_distillation_round(
         raise DistillationIntegrationError(
             "validated Host tokenizer differs from the alignment profiles"
         )
-    try:
-        host_profile = profiles[host_package.alignment_profile_id]
-    except KeyError:
-        raise DistillationIntegrationError(
-            "Host package alignment profile is not approved for this round"
-        ) from None
     host_by_id = _validate_host_contract(
         host_package=host_package,
         host_samples=host_samples,
         host_tokenizer=host_tokenizer,
-        profile=host_profile,
+        host_endpoint=host_endpoint,
     )
     package_by_id: dict[str, KnowledgePackage] = {}
     for package in client_packages:

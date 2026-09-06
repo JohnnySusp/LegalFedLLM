@@ -109,6 +109,9 @@ def reverse_fixture(
         current_host_adapter_version=0,
         host_model_profile=host_profile(),
         selected_client_profile_hashes={"client-a": profile.profile_hash()},
+        selected_client_alignment_profiles={
+            "client-a": "mock_identity:1"
+        },
         request=request,
         submission_deadline="2026-08-26T00:00:00Z",
     )

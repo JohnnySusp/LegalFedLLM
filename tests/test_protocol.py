@@ -10,7 +10,6 @@ from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_runtime import deterministic_knowledge_samples
 from shared.knowledge_artifact import serialize_knowledge_artifact
 from shared.protocol import (
-    AlignmentConfig,
     HostCandidateTrainingResult,
     HostCandidateValidationResult,
     KnowledgePackage,
@@ -124,7 +123,6 @@ class ProtocolSecurityTests(unittest.TestCase):
                 sample_ids=["sample-1"],
                 prompt_template="Question: {question}\nAnswer: {answer}",
                 top_k=3,
-                alignment=AlignmentConfig(strategy="mock_identity"),
             )
             manifest = RoundManifest.create_signed(
                 identity=coordinator,
@@ -134,6 +132,9 @@ class ProtocolSecurityTests(unittest.TestCase):
                 host_model_profile=profile("host"),
                 selected_client_profile_hashes={
                     "client-a": profile("client").profile_hash()
+                },
+                selected_client_alignment_profiles={
+                    "client-a": "mock_identity:1"
                 },
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=1)),

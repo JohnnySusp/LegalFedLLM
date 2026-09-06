@@ -56,7 +56,6 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         *,
         selected_client_ids: list[str],
         quorum: int,
-        alignment: dict | None = None,
     ) -> RoundManifest:
         payload = {
             "selected_client_ids": selected_client_ids,
@@ -67,9 +66,6 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "prompt_template": "{question} {answer}",
             "top_k": 2,
         }
-
-        if alignment is not None:
-            payload["alignment"] = alignment
 
         response = await stack.coordinator_request(
             "POST",
@@ -95,7 +91,7 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(denied.status_code, 401)
             await self._register(stack, app)
 
-    async def test_non_mock_alignment_is_rejected(self) -> None:
+    async def test_round_request_rejects_caller_supplied_alignment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stack = Stack(directory)
             _, app = stack.client("client-a")
@@ -120,7 +116,7 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-            self.assertEqual(response.status_code, 409, response.text)
+            self.assertEqual(response.status_code, 422, response.text)
 
     async def test_pinned_dtw_pair_is_admitted_with_fixed_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -152,18 +148,14 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "truncation_policy": "reject",
                     "top_k": 2,
                     "host_public_data_epochs": 1,
-                    "alignment": {
-                        "strategy": "dtw",
-                        "profile_version": POC_DTW_PROFILE_VERSION,
-                    },
                 },
             )
 
             self.assertEqual(response.status_code, 201, response.text)
             manifest = RoundManifest.model_validate(response.json())
             self.assertEqual(
-                manifest.alignment.profile_id,
-                f"dtw:{POC_DTW_PROFILE_VERSION}",
+                manifest.selected_client_alignment_profiles,
+                {"client-a": f"dtw:{POC_DTW_PROFILE_VERSION}"},
             )
             self.assertEqual(manifest.host_public_data_epochs, 1)
             self.assertEqual(

@@ -19,6 +19,7 @@ from client.training import (
     load_private_examples,
     private_dataset_semantic_hash,
 )
+from host.model_profiles import pinned_host_profile
 from shared.knowledge_artifact import load_package_samples
 from shared.prompt import PROMPT_TEMPLATE
 from shared.protocol import KnowledgePackage, KnowledgeSample, RoundManifest, utc_text
@@ -105,6 +106,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
         reference_identity = reference_dataset_identity(reference_samples)
 
         stack = Stack(root)
+        stack.host_runtime.model_profile = pinned_host_profile()
         profile = pinned_client_profile(QWEN_PROFILE_ID)
         execution_profile = TrainingExecutionProfile(
             backend="transformers",
@@ -130,7 +132,22 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
             gateway,
             admin_token_override=stack.client_admin_token,
         )
-        _, app_b = stack.client("client-b")
+        runtime_b = ClientRuntime(
+            data_dir=root / "client-b",
+            client_id="client-b",
+            model_profile=profile,
+            training_execution_profile=execution_profile,
+        )
+        gateway_b = CoordinatorGateway(
+            "http://coordinator",
+            stack.registration_token,
+            transport=stack.coordinator_transport,
+        )
+        app_b = create_client_app(
+            runtime_b,
+            gateway_b,
+            admin_token_override=stack.client_admin_token,
+        )
         for client_app in (app, app_b):
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=client_app),

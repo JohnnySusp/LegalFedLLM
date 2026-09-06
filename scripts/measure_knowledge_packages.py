@@ -267,6 +267,9 @@ async def measure(
                     "client"
                 ).profile_hash()
             },
+            selected_client_alignment_profiles={
+                "measurement-client": "mock_identity:1"
+            },
             request=request,
             submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
         )

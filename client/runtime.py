@@ -27,7 +27,12 @@ from client.training import (
     private_dataset_semantic_hash,
 )
 from shared.adapter_checkpoint import AdapterCheckpointStore
-from shared.alignment_profiles import resolve_alignment_profile
+from shared.alignment_profiles import (
+    MOCK_IDENTITY_PROFILE_ID,
+    UnsupportedAlignmentProfile,
+    resolve_alignment_profile,
+    validate_alignment_pair,
+)
 from shared.client_reverse_artifact import (
     load_client_reverse_training_artifact,
     write_client_reverse_training_artifact,
@@ -395,6 +400,26 @@ class ClientRuntime:
             raise ClientRuntimeError(
                 "signed manifest is bound to another Client model profile"
             )
+        alignment_profile_id = manifest.alignment_profile_id_for(
+            self.client_id
+        )
+        if alignment_profile_id == MOCK_IDENTITY_PROFILE_ID:
+            if (
+                self.model_profile.training_backend != "mock"
+                or manifest.host_model_profile.training_backend != "mock"
+            ):
+                raise ClientRuntimeError(
+                    "mock identity alignment requires mock Client and Host profiles"
+                )
+        else:
+            try:
+                validate_alignment_pair(
+                    alignment_profile_id,
+                    client_profile=self.model_profile,
+                    host_profile=manifest.host_model_profile,
+                )
+            except UnsupportedAlignmentProfile as exc:
+                raise ClientRuntimeError(str(exc)) from exc
         if manifest.prompt_template_hash != self.model_profile.prompt_template_hash:
             raise ClientRuntimeError(
                 "signed manifest prompt differs from the Client ModelProfile"
@@ -1033,9 +1058,8 @@ class ClientRuntime:
                 sender_role="client",
                 model_profile=self.model_profile,
                 adapter_version=adapter_version,
-                alignment_profile_id=(
-                    f"{manifest.alignment.strategy}:"
-                    f"{manifest.alignment.profile_version}"
+                alignment_profile_id=manifest.alignment_profile_id_for(
+                    self.client_id
                 ),
                 reference_dataset_id=manifest.reference_dataset_id,
                 reference_dataset_hash=manifest.reference_dataset_hash,
@@ -2043,10 +2067,7 @@ class ClientRuntime:
                 "Host package top-k differs from the manifest"
             )
 
-        expected_alignment = (
-            f"{manifest.alignment.strategy}:"
-            f"{manifest.alignment.profile_version}"
-        )
+        expected_alignment = manifest.host_package_alignment_profile_id
 
         if host_package.alignment_profile_id != expected_alignment:
             raise ValueError(
@@ -2117,7 +2138,9 @@ class ClientRuntime:
                 reference_by_id[sample_id]
                 for sample_id in partition.transfer_sample_ids
             ]
-            profile = resolve_alignment_profile(host_package.alignment_profile_id)
+            profile = resolve_alignment_profile(
+                manifest.alignment_profile_id_for(self.client_id)
+            )
             client_cache = os.getenv("CLIENT_TOKENIZER_CACHE_DIR") or None
             local_only = os.getenv(
                 "LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY", "true"

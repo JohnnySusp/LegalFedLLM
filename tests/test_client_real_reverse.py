@@ -26,7 +26,6 @@ from shared.fedmkt_core.reverse_integration import integrate_reverse_distillatio
 from shared.knowledge_artifact import serialize_knowledge_artifact
 from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import (
-    AlignmentConfig,
     ClientReverseTrainingJob,
     KnowledgePackage,
     KnowledgeSample,
@@ -195,10 +194,6 @@ class RealClientReverseAcceptanceTests(unittest.TestCase):
             training_epochs=1,
             host_public_data_epochs=1,
             client_public_data_epochs=1,
-            alignment=AlignmentConfig(
-                strategy="dtw",
-                profile_version=POC_DTW_PROFILE_VERSION,
-            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -211,6 +206,9 @@ class RealClientReverseAcceptanceTests(unittest.TestCase):
                 host_model_profile=_host_fixture_profile(),
                 selected_client_profile_hashes={
                     "client-a": profile.profile_hash()
+                },
+                selected_client_alignment_profiles={
+                    "client-a": f"dtw:{POC_DTW_PROFILE_VERSION}"
                 },
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=2)),
