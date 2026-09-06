@@ -11,6 +11,7 @@ from typing import Any, Callable
 import httpx
 
 from coordinator.reference_data import CoordinatorReferenceData
+from coordinator.quorum import TrustedClientQuorumPolicy
 
 from shared.alignment_profiles import (
     UnsupportedAlignmentProfile,
@@ -300,6 +301,7 @@ class CoordinatorService:
         maximum_clock_skew_seconds: int = 900,
         reference_dataset_path: str | Path | None = None,
         validation_dataset_path: str | Path | None = None,
+        quorum_policy: TrustedClientQuorumPolicy | None = None,
         now_fn: Callable[[], Any] = utc_now,
     ):
         self.coordinator_id = coordinator_id
@@ -311,6 +313,7 @@ class CoordinatorService:
         self.registration_token = registration_token
         self.admin_token = admin_token
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
+        self.quorum_policy = quorum_policy
         self.now_fn = now_fn
 
         if (
@@ -465,6 +468,17 @@ class CoordinatorService:
         async with self._lock:
             request = self._resolve_round_request(request)
 
+            if self.quorum_policy is not None:
+                try:
+                    resolved_quorum = self.quorum_policy.resolve(
+                        len(request.selected_client_ids)
+                    )
+                except ValueError as exc:
+                    raise ConflictError(str(exc)) from exc
+                request = request.model_copy(
+                    update={"trusted_client_quorum": resolved_quorum}
+                )
+
             registrations = {
                 client_id: self.get_registration(client_id)
                 for client_id in request.selected_client_ids
@@ -568,6 +582,44 @@ class CoordinatorService:
         if not self.store.exists(path):
             raise NotFoundError(f"round {round_id!r} does not exist")
         return RoundState.model_validate(self.store.read_json(path))
+
+    def get_submission_receipt(
+        self,
+        round_id: str,
+        client_id: str,
+    ) -> SubmissionReceipt:
+        manifest = self.get_manifest(round_id)
+        state = self.get_state(round_id)
+        if client_id not in manifest.selected_client_ids:
+            raise NotFoundError("accepted Client submission does not exist")
+
+        package_path = (
+            f"rounds/{round_id}/submissions/{client_id}/package.json"
+        )
+        if not self.store.exists(package_path):
+            raise NotFoundError("accepted Client submission does not exist")
+
+        package = KnowledgePackage.model_validate(
+            self.store.read_json(package_path)
+        )
+        if (
+            package.round_id != round_id
+            or package.sender_id != client_id
+            or client_id not in state.accepted_client_ids
+            or package.package_hash not in state.submission_hashes
+        ):
+            raise ConflictError(
+                "persisted Client submission is inconsistent with round state"
+            )
+
+        return SubmissionReceipt(
+            round_id=round_id,
+            client_id=client_id,
+            package_hash=package.package_hash,
+            state=state.state,
+            accepted_count=len(state.accepted_client_ids),
+            quorum=manifest.trusted_client_quorum,
+        )
 
     def get_safety_reports(self, round_id: str) -> dict[str, SafetyReport]:
         manifest = self.get_manifest(round_id)
@@ -745,10 +797,11 @@ class CoordinatorService:
             self._write_state(state)
             try:
                 self._verify_dp(manifest, package)
-                samples = load_package_samples(
-                    artifact_path,
+                safety = await asyncio.to_thread(
+                    self._inspect_submitted_knowledge_package,
+                    manifest,
                     package,
-                    maximum_bytes=manifest.maximum_knowledge_package_bytes,
+                    artifact_path,
                 )
             except CoordinatorError as exc:
                 self._record_package_rejection(
@@ -764,7 +817,6 @@ class CoordinatorService:
                     [str(exc)],
                 )
                 raise ConflictError(str(exc)) from exc
-            safety = inspect_knowledge_package(package, samples)
             self.store.write_json(
                 f"rounds/{manifest.round_id}/safety/{package.sender_id}.json",
                 safety.model_dump(mode="json"),
@@ -829,6 +881,19 @@ class CoordinatorService:
                 accepted_count=len(state.accepted_client_ids),
                 quorum=manifest.trusted_client_quorum,
             )
+
+    @staticmethod
+    def _inspect_submitted_knowledge_package(
+        manifest: RoundManifest,
+        package: KnowledgePackage,
+        artifact_path: str | Path,
+    ) -> SafetyReport:
+        samples = load_package_samples(
+            artifact_path,
+            package,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+        return inspect_knowledge_package(package, samples)
 
     def _record_package_rejection(
         self,

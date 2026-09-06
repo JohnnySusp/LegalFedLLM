@@ -20,19 +20,22 @@ core. They must not be treated as accidental drift during later upstream reviews
 
 ## Pinned alignment profiles
 
-The proof of concept supports two exact Client-to-validation-Host pairs:
+The proof of concept supports four exact Client-to-Host pairs:
 
 | Client | Validation Host | Alignment identifier |
 | --- | --- | --- |
 | Qwen 3 1.7B | Granite 3.3 2B | `dtw:qwen3-1.7b--granite3.3-2b-v1` |
 | Granite 3.3 2B | Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` |
+| Qwen 3 1.7B | Mistral Nemo 12B | `dtw:qwen3-1.7b--mistral-nemo-instruct-2407-v1` |
+| Granite 3.3 2B | Mistral Nemo 12B | `dtw:granite3.3-2b-client--mistral-nemo-instruct-2407-v1` |
 
 The Qwen pair exercises heterogeneous DTW mapping. The Granite pair uses separate
 Client and Host protocol identities over the same pinned tokenizer and therefore
-produces an exact vocabulary mapping while traversing the same DTW path. Granite
-is a temporary validation Host, not the selected production Host. A future Host
-requires new signed Qwen-to-Host and Granite-to-Host profiles and a new acceptance
-run.
+produces an exact vocabulary mapping while traversing the same DTW path. Mistral
+Nemo is the selected remote Host; Granite remains a compatibility Host. The live
+round manifest currently carries one alignment identity, so different Client
+profiles are not mixed in one live round yet. A future Host requires new signed
+Client-to-Host profiles and a new acceptance run.
 
 Client-to-Host alignment is owned by the Coordinator; Host-to-Client alignment is
 owned by the Client flow. Both directions use the same shared pure alignment
@@ -74,6 +77,7 @@ The pinned runtime tokenizer facts are:
 | --- | --- | --- | --- | --- |
 | Qwen Client | `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4` | 151643 / 151669 | 151668 | `Ġ` |
 | Granite Client / validation Host | `91168e938f05796aa6dcca7e485e4b30ab52785320c7a6391ecef86e6c84681e` | 49152 / 49159 | 49158 | `Ġ` |
+| Mistral Nemo Host | `e11c71726323d33da7b8d6f6f269f1988931c0a52b7122bcdd8c05042974e0db` | 131072 / 131072 | 131071 | `Ġ` |
 
 Validation also checks the exact runtime class, dense addressable ID range,
 special-token state, model maximum length, padding side and existing chat-

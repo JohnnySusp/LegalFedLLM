@@ -1,0 +1,94 @@
+x-client-build: &client-build
+  context: .
+  dockerfile: client/Dockerfile
+  target: client-ml
+
+x-client-environment: &client-environment
+  CLIENT_TRAINING_BACKEND: transformers
+  CLIENT_TRAINING_DEVICE: ${CLIENT_TRAINING_DEVICE:-cuda}
+  CLIENT_TRAINING_PRECISION: ${CLIENT_TRAINING_PRECISION:-bfloat16}
+  CLIENT_TRAINING_QUANTIZATION: none
+  CLIENT_PRIVATE_DATA_PATH: /private/train.jsonl
+  CLIENT_MICRO_BATCH_SIZE: ${CLIENT_MICRO_BATCH_SIZE:-1}
+  CLIENT_GRADIENT_ACCUMULATION_STEPS: ${CLIENT_GRADIENT_ACCUMULATION_STEPS:-8}
+  CLIENT_LEARNING_RATE: ${CLIENT_LEARNING_RATE:-2e-4}
+  CLIENT_TRAINING_SEED: ${CLIENT_TRAINING_SEED:-42}
+  CLIENT_GRADIENT_CHECKPOINTING: ${CLIENT_GRADIENT_CHECKPOINTING:-true}
+  CLIENT_VERIFY_FROZEN_BASE_CHECKSUM: ${CLIENT_VERIFY_FROZEN_BASE_CHECKSUM:-false}
+  CLIENT_KNOWLEDGE_BATCH_SIZE: ${CLIENT_KNOWLEDGE_BATCH_SIZE:-1}
+  CLIENT_FORCE_REVERSE_VALIDATION_FAILURE: ${CLIENT_FORCE_REVERSE_VALIDATION_FAILURE:-false}
+  COORDINATOR_URL: ${COORDINATOR_URL:-http://127.0.0.1:8000}
+  COORDINATOR_TIMEOUT_SECONDS: ${COORDINATOR_TIMEOUT_SECONDS:-60}
+  COORDINATOR_RECONCILIATION_TIMEOUT_SECONDS: ${COORDINATOR_RECONCILIATION_TIMEOUT_SECONDS:-30}
+  COORDINATOR_RECONCILIATION_POLL_SECONDS: ${COORDINATOR_RECONCILIATION_POLL_SECONDS:-1}
+  REGISTRATION_TOKEN: ${REGISTRATION_TOKEN:?set REGISTRATION_TOKEN}
+  MAXIMUM_CLOCK_SKEW_SECONDS: ${MAXIMUM_CLOCK_SKEW_SECONDS:-900}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+  HF_HOME: /models/huggingface
+  HF_TOKEN: ${HF_TOKEN:-}
+  LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY: ${LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY:-false}
+
+x-client-service: &client-service
+  image: ${CLIENT_IMAGE:-legalfedllm-client-dev:latest}
+  build: *client-build
+  init: true
+  network_mode: host
+  gpus: all
+  shm_size: 2gb
+  restart: unless-stopped
+
+services:
+  client-1:
+    <<: *client-service
+    profiles: ["qwen"]
+    command: ["uvicorn", "client.main:app", "--host", "127.0.0.1", "--port", "${QWEN_CLIENT_PORT:-8001}"]
+    environment:
+      <<: *client-environment
+      CLIENT_DATA_DIR: /data/client
+      CLIENT_ID: ${QWEN_CLIENT_ID:-legal-client-1}
+      CLIENT_MODEL_PROFILE: ${QWEN_CLIENT_MODEL_PROFILE:-qwen3-1.7b-lora-v1}
+      CLIENT_MODEL_ID: ${QWEN_CLIENT_MODEL_ID:-legalfedllm/client-qwen}
+      CLIENT_SERVING_BACKEND: ${QWEN_CLIENT_SERVING_BACKEND:-ollama}
+      CLIENT_OLLAMA_MODEL: ${QWEN_CLIENT_OLLAMA_MODEL:-qwen3:1.7b}
+      CLIENT_PRIVATE_DATASET_ID: ${QWEN_CLIENT_PRIVATE_DATASET_ID:-qwen-client-private-v1}
+      CLIENT_ADMIN_TOKEN: ${QWEN_CLIENT_ADMIN_TOKEN:-}
+      CLIENT_SAFEFED_PROBE_MANIFEST_PATH: ${QWEN_CLIENT_SAFEFED_PROBE_MANIFEST_PATH:-/safety-probe/probe.json}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${QWEN_CLIENT_PORT:-8001}/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - client_1_data:/data/client
+      - huggingface_cache:/models/huggingface
+      - ${QWEN_CLIENT_PRIVATE_DATA_DIR:-./data/client-private-qwen}:/private:ro
+      - ${QWEN_CLIENT_SAFEFED_PROBE_DIR:-./data/client-safety-probe}:/safety-probe:ro
+
+  client-2:
+    <<: *client-service
+    profiles: ["granite"]
+    command: ["uvicorn", "client.main:app", "--host", "127.0.0.1", "--port", "${GRANITE_CLIENT_PORT:-8002}"]
+    environment:
+      <<: *client-environment
+      CLIENT_DATA_DIR: /data/client
+      CLIENT_ID: ${GRANITE_CLIENT_ID:-legal-client-2}
+      CLIENT_MODEL_PROFILE: ${GRANITE_CLIENT_MODEL_PROFILE:-granite-3.3-2b-instruct-client-lora-v1}
+      CLIENT_MODEL_ID: ${GRANITE_CLIENT_MODEL_ID:-legalfedllm/client-granite}
+      CLIENT_SERVING_BACKEND: ${GRANITE_CLIENT_SERVING_BACKEND:-ollama}
+      CLIENT_OLLAMA_MODEL: ${GRANITE_CLIENT_OLLAMA_MODEL:-granite3.3:2b}
+      CLIENT_PRIVATE_DATASET_ID: ${GRANITE_CLIENT_PRIVATE_DATASET_ID:-granite-client-private-v1}
+      CLIENT_ADMIN_TOKEN: ${GRANITE_CLIENT_ADMIN_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${GRANITE_CLIENT_PORT:-8002}/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - client_2_data:/data/client
+      - huggingface_cache:/models/huggingface
+      - ${GRANITE_CLIENT_PRIVATE_DATA_DIR:-./data/client-private-granite}:/private:ro
+
+volumes:
+  client_1_data:
+  client_2_data:
+  huggingface_cache:

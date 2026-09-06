@@ -8,6 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from coordinator.quorum import TrustedClientQuorumPolicy
 from coordinator.service import CoordinatorError, CoordinatorService, HostGateway
 from shared.knowledge_transport import (
     KnowledgeTransportError,
@@ -60,6 +61,35 @@ def service_from_environment() -> CoordinatorService:
     validation_dataset_path = (
         os.getenv("COORDINATOR_VALIDATION_DATASET_PATH") or None
     )
+    quorum_policy_name = os.getenv(
+        "COORDINATOR_QUORUM_POLICY",
+        "explicit",
+    ).strip().lower()
+    if quorum_policy_name not in {"explicit", "majority"}:
+        raise ValueError(
+            "COORDINATOR_QUORUM_POLICY must be explicit or majority"
+        )
+    quorum_override_text = os.getenv(
+        "COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE",
+        "",
+    ).strip()
+    quorum_policy = (
+        TrustedClientQuorumPolicy(
+            minimum=int(
+                os.getenv(
+                    "COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM",
+                    "2",
+                )
+            ),
+            override=(
+                int(quorum_override_text)
+                if quorum_override_text
+                else None
+            ),
+        )
+        if quorum_policy_name == "majority"
+        else None
+    )
 
     return CoordinatorService(
         data_dir=os.getenv(
@@ -84,6 +114,7 @@ def service_from_environment() -> CoordinatorService:
         ),
         reference_dataset_path=reference_dataset_path,
         validation_dataset_path=validation_dataset_path,
+        quorum_policy=quorum_policy,
     )
 
 
@@ -126,7 +157,20 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "service": "legalfedllm-coordinator"}
+        policy = coordinator.quorum_policy
+        return {
+            "status": "ok",
+            "service": "legalfedllm-coordinator",
+            "quorum_policy": "majority" if policy is not None else "explicit",
+            "minimum_trusted_client_quorum": (
+                str(policy.minimum) if policy is not None else "request"
+            ),
+            "trusted_client_quorum_override": (
+                str(policy.override)
+                if policy is not None and policy.override is not None
+                else "none"
+            ),
+        }
 
     @app.get("/v1/identity", response_model=ServiceIdentity)
     async def identity() -> ServiceIdentity:
@@ -167,6 +211,25 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
     @app.get("/v1/rounds/{round_id}/status", response_model=RoundState)
     async def round_status(round_id: str) -> RoundState:
         return await coordinator.round_status(round_id)
+
+    @app.get(
+        "/v1/rounds/{round_id}/submissions/{client_id}/receipt",
+        response_model=SubmissionReceipt,
+    )
+    async def submission_receipt(
+        round_id: str,
+        client_id: str,
+        x_client_id: str | None = Header(default=None),
+        x_registration_token: str | None = Header(default=None),
+    ) -> SubmissionReceipt:
+        coordinator.require_registration_token(x_registration_token)
+        if x_client_id != client_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Client identity does not match the receipt request",
+            )
+        coordinator.get_registration(client_id)
+        return coordinator.get_submission_receipt(round_id, client_id)
 
     @app.get(
         "/v1/rounds/{round_id}/safety",

@@ -15,6 +15,7 @@ from client.main import create_app as create_client_app
 from client.reverse_training import ClientReverseDecision
 from client.runtime import ClientRuntime, default_client_profile
 from coordinator.main import create_app as create_coordinator_app
+from coordinator.quorum import TrustedClientQuorumPolicy
 from coordinator.service import CoordinatorService, HostGateway
 from host.main import create_app as create_host_app
 from host.runtime import HostRuntime
@@ -36,6 +37,7 @@ class Stack:
         force_validation_failure: bool = False,
         reference_dataset_path: str | Path | None = None,
         validation_dataset_path: str | Path | None = None,
+        quorum_policy: TrustedClientQuorumPolicy | None = None,
         now_fn=None,
     ):
         self.root = Path(root)
@@ -69,6 +71,7 @@ class Stack:
             admin_token=self.admin_token,
             reference_dataset_path=reference_dataset_path,
             validation_dataset_path=validation_dataset_path,
+            quorum_policy=quorum_policy,
             **kwargs,
         )
         self.coordinator_app = create_coordinator_app(self.coordinator_service)
@@ -109,6 +112,108 @@ class Stack:
 
 
 class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_majority_quorum_is_resolved_from_selected_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(
+                directory,
+                quorum_policy=TrustedClientQuorumPolicy(minimum=2),
+            )
+            for client_id in ("client-a", "client-b", "client-c"):
+                _, app = stack.client(client_id)
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://client",
+                    headers=stack.client_headers,
+                ) as client:
+                    registered = await client.post("/v1/register")
+                    self.assertEqual(registered.status_code, 201, registered.text)
+
+            created = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a", "client-b", "client-c"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "legal-reference-v1",
+                    "reference_dataset_hash": sha256_hex(b"legal-reference-v1"),
+                    "sample_ids": ["contract-001"],
+                    "prompt_template": "Question: {question}\nAnswer: {answer}",
+                },
+            )
+
+            self.assertEqual(created.status_code, 201, created.text)
+            self.assertEqual(created.json()["trusted_client_quorum"], 2)
+
+    async def test_minimum_quorum_requires_override_for_one_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(
+                directory,
+                quorum_policy=TrustedClientQuorumPolicy(minimum=2),
+            )
+            _, app = stack.client("client-a")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                registered = await client.post("/v1/register")
+                self.assertEqual(registered.status_code, 201, registered.text)
+
+            rejected = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "legal-reference-v1",
+                    "reference_dataset_hash": sha256_hex(b"legal-reference-v1"),
+                    "sample_ids": ["contract-001"],
+                    "prompt_template": "Question: {question}\nAnswer: {answer}",
+                },
+            )
+
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertIn(
+                "below the minimum trusted Client quorum",
+                rejected.text,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            stack = Stack(
+                directory,
+                quorum_policy=TrustedClientQuorumPolicy(
+                    minimum=2,
+                    override=1,
+                ),
+            )
+            _, app = stack.client("client-a")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                registered = await client.post("/v1/register")
+                self.assertEqual(registered.status_code, 201, registered.text)
+
+            created = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "legal-reference-v1",
+                    "reference_dataset_hash": sha256_hex(b"legal-reference-v1"),
+                    "sample_ids": ["contract-001"],
+                    "prompt_template": "Question: {question}\nAnswer: {answer}",
+                },
+            )
+
+            self.assertEqual(created.status_code, 201, created.text)
+            self.assertEqual(created.json()["trusted_client_quorum"], 1)
+
     async def test_bounded_asynchronous_round_persists_and_syncs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stack = Stack(directory)

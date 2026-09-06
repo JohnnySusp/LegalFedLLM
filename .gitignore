@@ -3,6 +3,8 @@
 .env.*
 compose.yaml.*
 !.env.example
+config/*.env
+!config/*.env.example
 
 # Python environments and caches
 .venv/

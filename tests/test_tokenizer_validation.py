@@ -10,6 +10,7 @@ from types import ModuleType
 from unittest.mock import patch
 
 from shared.alignment_profiles import (
+    GRANITE_MISTRAL_NEMO_DTW_PROFILE,
     MISTRAL_NEMO_HOST_ENDPOINT,
     POC_DTW_PROFILE,
 )
@@ -339,6 +340,10 @@ RUN_REAL_NEMO_TOKENIZER_TESTS = os.getenv(
     "LEGALFEDLLM_RUN_REAL_NEMO_TOKENIZER_TESTS",
     "",
 ).lower() in {"1", "true", "yes"}
+RUN_REAL_GRANITE_NEMO_TOKENIZER_TESTS = os.getenv(
+    "LEGALFEDLLM_RUN_REAL_GRANITE_NEMO_TOKENIZER_TESTS",
+    "",
+).lower() in {"1", "true", "yes"}
 
 
 @unittest.skipUnless(
@@ -510,6 +515,95 @@ class RealMistralNemoTokenizerAcceptanceTests(unittest.TestCase):
         self.assertEqual(tokenizer.vocab_size, 131072)
         self.assertEqual(len(tokenizer), 131072)
         self.assertEqual(len(tokenizer.get_vocab()), 131072)
+
+
+@unittest.skipUnless(
+    RUN_REAL_GRANITE_NEMO_TOKENIZER_TESTS,
+    "set LEGALFEDLLM_RUN_REAL_GRANITE_NEMO_TOKENIZER_TESTS=true for pinned artifacts",
+)
+class RealGraniteNemoTokenizerAcceptanceTests(unittest.TestCase):
+    def test_actual_granite_and_nemo_map_and_align_in_both_directions(
+        self,
+    ) -> None:
+        from shared.fedmkt_core.ml.token_alignment import transform_step_logits
+        from shared.vocabulary_mapping import VocabularyMappingCache
+
+        cache_dir = os.getenv("LEGALFEDLLM_TOKENIZER_CACHE") or None
+        token = os.getenv("HF_TOKEN") or None
+        local_only = os.getenv(
+            "LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY",
+            "",
+        ).lower() in {"1", "true", "yes"}
+        client = load_pinned_tokenizer(
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE.client,
+            cache_dir=cache_dir,
+            token=token,
+            local_files_only=local_only,
+        )
+        host = load_pinned_tokenizer(
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE.host,
+            cache_dir=cache_dir,
+            token=token,
+            local_files_only=local_only,
+        )
+        text = "Ελληνικό δίκαιο. Article 5: contract"
+        client_ids = client.tokenizer.encode(text, add_special_tokens=False)
+        host_ids = host.tokenizer.encode(text, add_special_tokens=False)
+        self.assertTrue(client_ids)
+        self.assertTrue(host_ids)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = VocabularyMappingCache(directory)
+            directions = (
+                (
+                    "client_to_host",
+                    client,
+                    host,
+                    client_ids,
+                    host_ids,
+                ),
+                (
+                    "host_to_client",
+                    host,
+                    client,
+                    host_ids,
+                    client_ids,
+                ),
+            )
+            for direction, source, target, source_ids, target_ids in directions:
+                with self.subTest(direction=direction):
+                    resolved = cache.resolve(
+                        profile=GRANITE_MISTRAL_NEMO_DTW_PROFILE,
+                        direction=direction,
+                        source=source,
+                        target=target,
+                        requested_token_ids=[source_ids[0]],
+                    )
+                    logits, indices = transform_step_logits(
+                        base_model_tokenizer=target.tokenizer,
+                        blending_model_tokenizer=source.tokenizer,
+                        base_model_vocab=target.tokenizer.get_vocab(),
+                        base_model_input_ids=target_ids,
+                        blending_model_input_ids=source_ids,
+                        blending_model_per_step_logits=[
+                            [0.75] for _ in source_ids
+                        ],
+                        blending_model_per_step_indices=[
+                            [source_ids[0]] for _ in source_ids
+                        ],
+                        blending_to_base_mapping=(
+                            resolved.mapping.as_upstream_token_mapping()
+                        ),
+                        base_model_special_token=(
+                            target.endpoint.word_boundary_marker
+                        ),
+                        blending_model_special_token=(
+                            source.endpoint.word_boundary_marker
+                        ),
+                    )
+                    self.assertEqual(len(logits), len(target_ids))
+                    self.assertEqual(len(indices), len(target_ids))
+                    self.assertTrue(all(row for row in indices))
 
 
 if __name__ == "__main__":

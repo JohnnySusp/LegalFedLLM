@@ -57,11 +57,21 @@ class CoordinatorGateway:
         registration_token: str,
         *,
         timeout_seconds: float = 60.0,
+        reconciliation_timeout_seconds: float = 30.0,
+        reconciliation_poll_seconds: float = 1.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
+        if timeout_seconds <= 0:
+            raise ValueError("Coordinator timeout must be positive")
+        if reconciliation_timeout_seconds < 0:
+            raise ValueError("Coordinator reconciliation timeout cannot be negative")
+        if reconciliation_poll_seconds <= 0:
+            raise ValueError("Coordinator reconciliation poll interval must be positive")
         self.base_url = base_url.rstrip("/")
         self.registration_token = registration_token
         self.timeout_seconds = timeout_seconds
+        self.reconciliation_timeout_seconds = reconciliation_timeout_seconds
+        self.reconciliation_poll_seconds = reconciliation_poll_seconds
         self.transport = transport
 
     async def _request(
@@ -188,6 +198,87 @@ class CoordinatorGateway:
             )
         return SubmissionReceipt.model_validate(response.json())
 
+    async def accepted_submission_receipt(
+        self,
+        package: KnowledgePackage,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SubmissionReceipt | None:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=(
+                self.timeout_seconds
+                if timeout_seconds is None
+                else timeout_seconds
+            ),
+            transport=self.transport,
+        ) as client:
+            response = await client.get(
+                (
+                    f"/v1/rounds/{package.round_id}/submissions/"
+                    f"{package.sender_id}/receipt"
+                ),
+                headers={
+                    "X-Client-ID": package.sender_id,
+                    "X-Registration-Token": self.registration_token,
+                },
+            )
+
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=(
+                    f"Coordinator returned {response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
+
+        receipt = SubmissionReceipt.model_validate(response.json())
+        if (
+            receipt.round_id != package.round_id
+            or receipt.client_id != package.sender_id
+            or receipt.package_hash != package.package_hash
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Coordinator reports a different accepted Client "
+                    "submission for this round"
+                ),
+            )
+        return receipt
+
+    async def reconcile_submission(
+        self,
+        package: KnowledgePackage,
+    ) -> SubmissionReceipt | None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.reconciliation_timeout_seconds
+        poll_seconds = self.reconciliation_poll_seconds
+
+        while True:
+            remaining = deadline - loop.time()
+            request_timeout = min(
+                self.timeout_seconds,
+                max(0.1, remaining),
+            )
+            try:
+                receipt = await self.accepted_submission_receipt(
+                    package,
+                    timeout_seconds=request_timeout,
+                )
+            except httpx.RequestError:
+                receipt = None
+            if receipt is not None:
+                return receipt
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(poll_seconds, remaining))
+
     async def status(self, round_id: str) -> RoundState:
         return RoundState.model_validate(
             await self._request("GET", f"/v1/rounds/{round_id}/status")
@@ -246,6 +337,12 @@ def gateway_from_environment() -> CoordinatorGateway:
         os.getenv("COORDINATOR_URL", "http://coordinator:8000"),
         os.getenv("REGISTRATION_TOKEN", "development-registration-token"),
         timeout_seconds=float(os.getenv("COORDINATOR_TIMEOUT_SECONDS", "60")),
+        reconciliation_timeout_seconds=float(
+            os.getenv("COORDINATOR_RECONCILIATION_TIMEOUT_SECONDS", "30")
+        ),
+        reconciliation_poll_seconds=float(
+            os.getenv("COORDINATOR_RECONCILIATION_POLL_SECONDS", "1")
+        ),
     )
 
 
@@ -381,10 +478,22 @@ def create_app(
             )
         else:
             package = client_runtime.create_knowledge_package(manifest)
-        receipt = await coordinator.submit(
-            package,
-            client_runtime.package_artifact_path(package),
-        )
+        try:
+            receipt = await coordinator.submit(
+                package,
+                client_runtime.package_artifact_path(package),
+            )
+        except httpx.RequestError as exc:
+            receipt = await coordinator.reconcile_submission(package)
+            if receipt is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Coordinator submission acknowledgement was ambiguous "
+                        "and the exact package was not confirmed accepted; "
+                        "the pending Client package was retained"
+                    ),
+                ) from exc
         client_runtime.commit_knowledge_submission(
             manifest=manifest,
             package=package,

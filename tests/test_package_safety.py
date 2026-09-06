@@ -132,6 +132,32 @@ class PackageSafetyTests(unittest.TestCase):
         self.assertLess(sharp_score, normal_score)
         self.assertLess(flat_score, normal_score)
 
+
+    def test_repeated_output_patterns_reduce_distribution_safety(self) -> None:
+        repeated = sample(
+            "repeated",
+            logits=[[2.0, 0.0]] * 8,
+            token_ids=[[10, 11]] * 8,
+            logsumexp=[2.5] * 8,
+            ce_loss=0.5,
+        )
+        varied = sample(
+            "varied",
+            logits=[[2.0 + index * 0.01, 0.0] for index in range(8)],
+            token_ids=[[10 + index, 20 + index] for index in range(8)],
+            logsumexp=[2.5 + index * 0.01 for index in range(8)],
+            ce_loss=0.5,
+        )
+
+        repeated_score = inspect_knowledge_package(
+            package("repeated"), [repeated]
+        ).score_components["distribution_safety"]
+        varied_score = inspect_knowledge_package(
+            package("varied"), [varied]
+        ).score_components["distribution_safety"]
+
+        self.assertLess(repeated_score, varied_score)
+
     def test_single_client_peer_evidence_is_neutral(self) -> None:
         host = sample("s1", logits=[[2.0, 0.0]], logsumexp=[2.5], ce_loss=0.5)
         client = sample("s1", logits=[[2.0, 0.0]], logsumexp=[2.4], ce_loss=0.4)

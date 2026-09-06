@@ -21,6 +21,8 @@ from host.model_profiles import (
 from shared.alignment_profiles import (
     GRANITE_IDENTITY_DTW_PROFILE_ID,
     GRANITE_IDENTITY_DTW_PROFILE_VERSION,
+    GRANITE_MISTRAL_NEMO_DTW_PROFILE_ID,
+    GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION,
     MISTRAL_NEMO_DTW_PROFILE_ID,
     MISTRAL_NEMO_DTW_PROFILE_VERSION,
     MISTRAL_NEMO_HOST_ENDPOINT,
@@ -96,6 +98,7 @@ class AlignmentProfileContractTests(unittest.TestCase):
                 POC_DTW_PROFILE_ID,
                 GRANITE_IDENTITY_DTW_PROFILE_ID,
                 MISTRAL_NEMO_DTW_PROFILE_ID,
+                GRANITE_MISTRAL_NEMO_DTW_PROFILE_ID,
             ),
         )
         profile = resolve_alignment_profile(POC_DTW_PROFILE_ID)
@@ -138,6 +141,19 @@ class AlignmentProfileContractTests(unittest.TestCase):
         self.assertTrue(nemo.host.bind_existing_pad_token)
         self.assertEqual(nemo.host.pad_token_id, 10)
 
+        granite_nemo = resolve_alignment_profile(
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE_ID
+        )
+        self.assertEqual(
+            granite_nemo.profile_version,
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE_VERSION,
+        )
+        self.assertEqual(
+            granite_nemo.client.profile_id,
+            GRANITE_3_3_2B_CLIENT_PROFILE_ID,
+        )
+        self.assertEqual(granite_nemo.host, MISTRAL_NEMO_HOST_ENDPOINT)
+
     def test_qwen_and_granite_are_approved_client_profiles(self) -> None:
         self.assertEqual(
             supported_profile_ids(),
@@ -173,6 +189,19 @@ class AlignmentProfileContractTests(unittest.TestCase):
             host_profile=pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID),
         )
         self.assertEqual(profile.profile_id, MISTRAL_NEMO_DTW_PROFILE_ID)
+
+    def test_exact_granite_client_to_mistral_nemo_pair_is_accepted(self) -> None:
+        profile = validate_alignment_pair(
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE_ID,
+            client_profile=pinned_client_profile(
+                GRANITE_3_3_2B_CLIENT_PROFILE_ID
+            ),
+            host_profile=pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID),
+        )
+        self.assertEqual(
+            profile.profile_id,
+            GRANITE_MISTRAL_NEMO_DTW_PROFILE_ID,
+        )
 
     def test_unknown_profile_fails_closed(self) -> None:
         with self.assertRaisesRegex(

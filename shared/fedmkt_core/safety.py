@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 import math
 import statistics
@@ -210,9 +211,7 @@ def _pre_alignment_components(
     pattern_risk = 0.0
     if len(row_records) >= 8:
         top_tokens = [record[6] for record in row_records]
-        dominant_fraction = max(
-            top_tokens.count(token_id) for token_id in set(top_tokens)
-        ) / len(top_tokens)
+        dominant_fraction = max(Counter(top_tokens).values()) / len(top_tokens)
         summaries = [
             (
                 round(record[1], 6),
@@ -223,9 +222,7 @@ def _pre_alignment_components(
             )
             for record in row_records
         ]
-        repeated_fraction = max(
-            summaries.count(value) for value in set(summaries)
-        ) / len(summaries)
+        repeated_fraction = max(Counter(summaries).values()) / len(summaries)
         pattern_risk = max(
             _ramp(dominant_fraction, 0.95, 1.0),
             _ramp(repeated_fraction, 0.95, 1.0),
