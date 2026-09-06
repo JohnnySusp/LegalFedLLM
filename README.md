@@ -1,328 +1,362 @@
 # LegalFedLLM
 
-LegalFedLLM is a protocol-first proof of concept for bidirectional, FedMKT-style
-knowledge transfer between heterogeneous language models in legal environments.
-Participants keep private examples and model-native LoRA tensors local. They
-exchange signed Knowledge Packages containing outputs over a shared public
-reference dataset instead of attempting to average structurally incompatible
-adapters.
+LegalFedLLM is a protocol-first proof of concept for **bidirectional federated
+knowledge transfer between heterogeneous language models** in legal-domain
+workloads.
 
-The repository currently combines:
+The project does not aggregate LoRA tensors across incompatible models. Each
+participant keeps its own base model and model-native LoRA adapter local. What
+crosses the federation boundary is a signed **Knowledge Package** produced over
+a common reference dataset: retained token IDs and logits, answer-token loss
+evidence, model/tokenizer identities, dataset identities, hashes, signatures,
+and related provenance.
 
-1. a deterministic mock backend for fast protocol, persistence and security
-   testing;
-2. a real canonical shared-reference-dataset boundary;
-3. a deterministic importer for the pinned 2012 Greek Law Digest thesis copy;
-4. signed schema 2.0 Knowledge Packages with exact `safetensors` artifacts; and
-5. one real Qwen Client path using Transformers and PEFT LoRA;
-6. an operational CPU path from heterogeneous signed Client packages through
-   exact tokenizer validation, demand-driven vocabulary mapping, DTW alignment,
-   binary trust eligibility, minimum-CE selection and sparse trainer targets;
-   and
-7. a real Granite Host path for baseline inference, selective LoRA candidate
-   training, private D^V validation, atomic promotion or rejection, signed
-   post-decision publication and Coordinator round finalization; and
-8. a real Qwen reverse-distillation path with immutable sparse jobs, archived-
-   parent LoRA training, public held-out validation, a hash-bound SafeFed-style
-   LoRA probe gate and compare-and-swap candidate adoption.
-
-The accepted real-Client run trained a Qwen LoRA candidate, performed teacher-
-forced inference over all 565 accepted D^P samples, produced real top-k logits
-and answer-only cross-entropy losses, created a signed schema 2.0 package and
-validated the existing Coordinator intake path. The alignment layer additionally
-supports Qwen and Granite Client identities against a temporary Granite validation
-Host. The repository includes a full-D^P acceptance runner; its authoritative
-Bazzite report remains local under the ignored `artifacts/` boundary.
-
-The copyrighted GLD source PDF, generated datasets, private Client examples,
-downloaded model files and trained adapters remain local and are excluded from
-Git.
-
-## Current implementation boundary
-
-The real Client path is:
+The real split-machine topology currently exercised by the repository is:
 
 ```text
-signed round manifest
-        ↓
-verified, frozen D^P sample order
-        ↓
-private Client JSONL examples
-        ↓
-pinned base model and tokenizer
-        ↓
-answer-only PEFT LoRA training
-        ↓
-adapter-only checkpoint validation and atomic promotion
-        ↓
-teacher-forced inference over D^P
-        ↓
-raw top-k token IDs and logits + answer-only CE per sample
-        ↓
-deterministic safetensors Knowledge Artifact
-        ↓
-signed schema 2.0 Client Knowledge Package
-        ↓
-bounded multipart Coordinator intake and immutable persistence
+local machine                                      remote NVIDIA A40 container
+
+private Client JSONL
+      ↓
+Qwen3 1.7B + PEFT LoRA
+      ↓
+D^P inference
+      ↓
+signed Client Knowledge Package
+      ───────────────────────────────────────────→ Coordinator
+                                                    ↓
+                                            verification + safety
+                                                    ↓
+                                         Qwen ↔ Nemo DTW alignment
+                                                    ↓
+                                           DualMinCE selection
+                                                    ↓
+                                         Mistral Nemo Host LoRA
+                                                    ↓
+                                         hidden D^V validation
+                                                    ↓
+                                        promote or roll back Host
+                                                    ↓
+                                      signed Host Knowledge Package
+      ←─────────────────────────────────────────────┘
+      ↓
+automatic Client sync
+      ↓
+Host → Qwen reverse alignment / selective distillation
+      ↓
+Qwen candidate quality + safety gates
+      ↓
+promote, reject, or discard stale candidate
 ```
 
-For the pinned Qwen-to-Granite profile, the real Host path continues through:
+No Client LoRA tensor is sent to the Coordinator or Host. Raw private Client
+training examples remain on the Client machine.
+
+> **Research boundary:** LegalFedLLM is a thesis proof of concept, not a
+> production federated-learning platform. The repository contains real-model
+> training and heterogeneous knowledge-transfer paths, but it does not claim
+> formal differential privacy, production-calibrated poisoning detection,
+> production identity management, or encrypted transport/storage.
+
+## Status at a glance
+
+| Capability | Current status |
+| --- | --- |
+| Deterministic protocol/mock path | Implemented and regression-tested |
+| Canonical shared-reference dataset boundary | Implemented |
+| Signed Knowledge Package transport | Implemented |
+| Qwen3 1.7B real Client LoRA training | Implemented and real-tested |
+| Qwen real D^P Knowledge Package generation | Implemented and real-tested |
+| Qwen → Mistral Nemo heterogeneous DTW alignment | Implemented and real-tested |
+| SafeFed-inspired Knowledge Package screening/trust | Implemented as a PoC defense-in-depth layer |
+| Mistral Nemo real Host LoRA training | Implemented and real-tested on NVIDIA A40 |
+| Hidden D^V Host validation and promotion/rollback | Implemented and real-tested |
+| Automatic Host → Qwen reverse distillation | Implemented and real-tested |
+| Exact submission acknowledgement reconciliation | Implemented and regression-tested |
+| Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
+| Real multi-Client round | Not yet demonstrated |
+| Mixed Qwen + Granite Clients in one live manifest | Not yet supported |
+| Automatic promoted-PEFT → Ollama publication | Not implemented |
+| Production-calibrated malicious-package/LoRA classifier | Not complete |
+| Formal DP-SGD/privacy guarantee | Not claimed |
+
+The normal Coordinator quorum policy is **majority with a minimum trusted quorum
+of 2**. A one-Client quorum override exists only for controlled proof-of-concept
+testing.
+
+## Verified real cross-machine round
+
+A fresh unattended bidirectional run has been verified with:
+
+- a local **Qwen/Qwen3-1.7B** Client;
+- a remote **mistralai/Mistral-Nemo-Instruct-2407** Host;
+- the Coordinator colocated with the Host on an NVIDIA A40 container;
+- one private-data Client epoch;
+- five Host reference-data epochs;
+- one reverse Client reference-data epoch;
+- DTW alignment;
+- DualMinCE teacher selection;
+- top-k `4`;
+- maximum sequence length `4096` with truncation rejected; and
+- `chat_sft_answer_only_v1` supervision.
+
+The verified run produced:
+
+| Measurement | Result |
+| --- | --- |
+| Coordinator terminal state | `COMPLETED` |
+| Client Knowledge Package submission | normal `201 Created` acknowledgement |
+| Manual acknowledgement recovery | not required |
+| Client D^P samples | 565 |
+| Client stored token rows | 133,336 |
+| Client Knowledge Artifact | 6,943,336 bytes |
+| Post-alignment Client safety | accepted, trust score `0.33` |
+| Forward Host-teacher selections | 565 / 565 |
+| Forward Qwen-teacher selections | 0 / 565 |
+| Host reference-data epochs | 5 |
+| Host optimizer steps | 710 |
+| Host adapter | 0 → 1, promoted |
+| D^V macro mean answer-token CE | `2.4609236204 → 1.9685784675` |
+| Required D^V improvement | `0.001` |
+| Observed D^V improvement | `0.4923451529` |
+| Reverse Host-teacher samples | 508 |
+| Qwen training adapter | 1 → 2 |
+| Reverse candidate decision | `candidate_accepted` |
+| Client `last_completed_round` | `round-000001` |
+| tmux evidence result | `PASS` |
+
+The Qwen package was not rejected by the safety layer. It was accepted, aligned,
+and eligible for selective distillation. However, the Host baseline had the
+lower answer-token CE on every D^P sample, so DualMinCE selected the Host as the
+forward teacher on all 565 samples.
+
+That means the run verifies the full forward protocol, safety, tokenizer
+alignment, selection, Host training, D^V validation, publication, automatic
+sync, and reverse path. It does **not** show that Qwen knowledge caused the Host
+validation improvement, because the Qwen Client was selected as teacher on
+`0 / 565` forward samples.
+
+The reverse direction is different: the promoted Host was selected as teacher
+on 508 transfer samples, so the run contains substantive selected-teacher
+**Host-to-Qwen** transfer.
+
+The numerical values above describe one experiment. They are not protocol
+constants or general model-performance claims.
+
+## Architecture and protocol boundary
+
+LegalFedLLM follows the FedMKT/FATE-LLM idea of transferring model behavior
+instead of averaging heterogeneous model parameters.
+
+A normal round is:
 
 ```text
-verified Client and Host Knowledge Packages
-        ↓
-trust-gated DTW alignment and minimum-CE teacher selection
-        ↓
-immutable bounded sparse Host training artifact
-        ↓
-selective Granite LoRA candidate training and reload verification
-        ↓
-private active-versus-candidate evaluation over D^V
-        ↓
-atomic promotion or candidate discard with an immutable decision audit
-        ↓
-post-decision Host inference over D^P
-        ↓
-signed Host Knowledge Package verification and round completion
-        ↓
-Client-owned Host-to-Client alignment and strict lower-CE selection
-        ↓
-immutable 90% D^P reverse-training job
-        ↓
-one-epoch Qwen LoRA candidate training and reload verification
-        ↓
-independent 10% D^P quality and SafeFed-style safety gates
-        ↓
-atomic promotion, rejection or stale-parent discard
+1. Coordinator signs a round manifest.
+2. Selected Clients verify the manifest and exact D^P identity/order.
+3. Each Client trains its own local LoRA on private examples.
+4. Each Client runs teacher-forced inference over D^P.
+5. Each Client signs and uploads a Knowledge Package + safetensors artifact.
+6. Coordinator verifies transport, identity, replay, dataset and safety rules.
+7. Eligible Client outputs are aligned into the Host tokenizer space.
+8. DualMinCE chooses one teacher per D^P sample.
+9. Host trains a model-native LoRA candidate from sparse targets.
+10. Host evaluates active and candidate adapters on hidden D^V.
+11. Host promotes or rolls back the candidate.
+12. Host publishes a signed post-decision Knowledge Package over D^P.
+13. Clients verify the Host package and execute Client-owned reverse alignment.
+14. A Client trains a local reverse candidate only when Host-teacher samples exist.
+15. Independent Client quality and safety gates decide local adoption.
+16. Client commits the round only after the reverse decision completes.
 ```
 
-The complete mock path remains available, including deterministic Client reverse
-training decisions. Mock validation and safety values are protocol fixtures, not
-evidence about a real model or classifier.
+The core architectural rule is:
 
-No Client LoRA tensor is sent to the Coordinator or Host. Private prompt and
-answer text is absent from the signed package metadata and numerical artifact.
+```text
+model-specific weights stay model-specific
+knowledge crosses the federation boundary
+```
 
-## Implemented capabilities
+There is no heterogeneous LoRA averaging step.
 
-- **Protocol-first baseline:** signed manifests and Knowledge Packages,
-  bounded asynchronous rounds, filesystem persistence, replay protection,
-  deterministic DualMinCE selection, Host validation and rollback, Client
-  synchronization and an Ollama serving boundary.
-- **Shared dataset boundary:** canonical samples, JSONL I/O, semantic
-  identity, deterministic D^P/D^V splitting, Coordinator snapshots, selected-
-  Client delivery and independent Client/Host verification.
-- **GLD importer:** deterministic extraction from the pinned source,
-  reviewed follow-up handling, subsection disambiguation, text-hygiene checks,
-  corpus auditing and reproducible D^P/D^V generation.
-- **Scalable signed packages:** schema 2.0 JSON envelopes, schema 1.0
-  `safetensors` artifacts, exact descriptor binding, bounded multipart transport,
-  immutable persistence, security regressions and complete mock-round use in both
-  directions.
-- **Pinned real Client contracts:** exact model/tokenizer revisions,
-  strict private-data schema, answer-only labels and manifest-bound training
-  settings.
-- **Checkpoint lifecycle:** round-specific training records,
-  adapter-only checkpoints, validation, atomic promotion and restart recovery.
-- **Real PEFT execution:** CUDA/BF16 Transformers training, fresh
-  save/reload validation and deterministic probe-logit equivalence.
-- **Training hardening:** optimizer-step and finite-loss checks,
-  changed-LoRA verification, optional frozen-base checksum, failure cleanup and
-  one process-local ML lock.
-- **Real D^P knowledge generation:** exact signed sample order,
-  overlength rejection, batched no-grad inference, raw top-k extraction and
-  answer-only causal CE.
-- **Real package submission:** existing artifact writer, signature and
-  multipart intake reused without a parallel real-only protocol; immutable retry
-  and exact training/checkpoint provenance are enforced.
-- **FedMKT alignment parity:** the approved DTW path, tie behavior,
-  bidirectional mappings, cumulative cost matrix and sparse logit transformation
-  are protected by fixed golden tests.
-- **Pinned heterogeneous profiles:** exact Qwen and Granite Client identities,
-  the temporary Granite validation Host, immutable tokenizer artifacts and two
-  fail-closed Client-to-Host alignment contracts.
-- **Operational sparse distillation inputs:** persistent hashed vocabulary maps,
-  per-Client DTW alignment, trust/quorum enforcement, deterministic minimum-CE
-  selection, answer-only labels and bounded CPU float32 sparse targets.
-- **Real Granite Host lifecycle:** exact pinned baseline inference, immutable
-  sparse training jobs, answer-only `0.9` supervised plus `0.1` selected-teacher
-  optimization, changed-LoRA and frozen-base checks, candidate reload
-  equivalence and restart-safe candidate storage.
-- **Private Host validation and finalization:** macro mean answer-token CE over
-  D^V controls the `0.001` promotion threshold; token-weighted CE is retained as
-  a diagnostic, per-sample D^V metrics remain Host-local, rejected candidate
-  weights are discarded, and the accepted adapter produces a signed D^P Host
-  package before the Coordinator completes the round.
-- **Immutable Client reverse jobs:** deterministic 90/10 D^P partitioning,
-  Client-owned Host-to-Client alignment, strict Host-better selection, retained
-  Client self-targets, one public-data epoch and exact parent/package/artifact
-  hash binding.
-- **Real Qwen reverse candidate lifecycle:** archived-parent loading,
-  answer-only `0.9` supervised plus `0.1` sparse distillation loss, LoRA-only
-  optimization, frozen-base verification, safetensors save/reload equivalence
-  and restart-safe candidate storage.
-- **Independent Client adoption gates:** macro held-out answer-token CE may
-  regress by at most `0.001`; token-weighted CE and teacher-forced exact-match/
-  ROUGE-L remain diagnostics; a Qwen-specific SafeFed-style probe must report
-  maliciousness below `0.8`; stale parents and either failed gate discard the
-  candidate without overwriting a newer adapter.
-- **Full-corpus validation runner:** exact D^P identity enforcement, signed
-  deterministic package round-trips, mixed-client alignment, two-pass
-  determinism checks and a machine-readable local resource report.
+## Implemented components
+
+The repository currently includes:
+
+- signed round manifests and Knowledge Packages;
+- Ed25519 service/Client identities;
+- filesystem-backed round and checkpoint state;
+- deterministic replay/nonce protection;
+- canonical reference-dataset hashing and ordered sample identities;
+- deterministic D^P/D^V splitting;
+- a reviewed Greek Law Digest importer for the thesis dataset;
+- real Transformers/PEFT Client and Host training backends;
+- answer-only causal supervision;
+- `safetensors` Knowledge Artifacts;
+- bounded multipart package transport;
+- exact tokenizer-artifact validation;
+- demand-driven vocabulary mapping;
+- FedMKT-compatible DTW token alignment;
+- sparse top-k trainer targets instead of full-vocabulary dense targets;
+- minimum-CE / DualMinCE teacher selection;
+- SafeFed-inspired package plausibility and post-alignment trust analysis;
+- trust-gated selective distillation;
+- Host D^V validation and atomic promotion/rollback;
+- immutable Client reverse-training jobs;
+- Qwen reverse LoRA candidate training and adoption gates;
+- exact accepted-submission receipt reconciliation;
+- local Client Ollama serving integration; and
+- split-machine tmux orchestration with preserved run evidence.
+
+The deterministic mock path remains available for protocol and failure-policy
+regression tests. Mock loss/safety values are fixtures; they are not real-model
+measurements.
+
+## Pinned model profiles
+
+### Clients
+
+| Profile | Model | Revision | Current role/status |
+| --- | --- | --- | --- |
+| `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | Real Client path with private training, D^P package generation and reverse training verified |
+| `granite-3.3-2b-instruct-client-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Pinned Client identity/alignment profile; no authoritative full private-training round yet |
+
+The Qwen profile uses `Qwen3ForCausalLM`, `Qwen2TokenizerFast`, vocabulary size
+151,936 and the non-thinking Qwen chat-template mode. The Granite profile uses
+`GraniteForCausalLM`, `GPT2TokenizerFast` and vocabulary size 49,159.
+
+Both Client profiles use the current PoC LoRA contract:
+
+```text
+rank:             8
+alpha:            16
+dropout:          0.05
+target modules:   q_proj, k_proj, v_proj, o_proj
+bias:             none
+task:             CAUSAL_LM
+```
+
+### Hosts
+
+| Profile | Model | Revision | Current role/status |
+| --- | --- | --- | --- |
+| `mistral-nemo-instruct-2407-host-lora-v1` | `mistralai/Mistral-Nemo-Instruct-2407` | `04d8a90549d23fc6bd7f642064003592df51e9b3` | Current remote Host with real A40 training/validation path verified |
+| `granite-3.3-2b-instruct-host-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Retained compatibility Host profile |
+
+The pinned Mistral Nemo Host uses `MistralForCausalLM`,
+`PreTrainedTokenizerFast`, vocabulary size 131,072 and the same rank-8 LoRA
+target modules. Its serving backend is deliberately `mock`; its training backend
+is real Transformers/PEFT.
+
+`compose.host-ml.yaml` remains the local Granite ML Compose profile. The Mistral
+Nemo Host path runs directly from a Python virtual environment on the remote A40
+container.
+
+## Pinned alignment profiles
+
+LegalFedLLM recognizes four exact bidirectional tokenizer-alignment contracts:
+
+| Client | Host | Alignment ID | Status |
+| --- | --- | --- | --- |
+| Qwen3 1.7B | Granite 3.3 2B | `dtw:qwen3-1.7b--granite3.3-2b-v1` | Supported compatibility/validation profile |
+| Granite 3.3 2B | Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` | Supported compatibility/validation profile |
+| Qwen3 1.7B | Mistral Nemo | `dtw:qwen3-1.7b--mistral-nemo-instruct-2407-v1` | Real heterogeneous profile verified |
+| Granite 3.3 2B | Mistral Nemo | `dtw:granite3.3-2b-client--mistral-nemo-instruct-2407-v1` | Supported profile; no full real round yet |
+
+These contracts pin model/tokenizer revisions, tokenizer artifact hashes,
+special-token state, vocabulary ranges, padding behavior, chat-template hashes,
+and word-boundary rules. Unknown or mismatched profiles fail closed.
+
+A live manifest currently carries one alignment identity. A Qwen Client and a
+Granite Client therefore cannot yet participate together in the same live round;
+per-Client alignment identities in one heterogeneous manifest remain future work.
 
 ## Repository layout
 
 ```text
 LegalFedLLM/
-├── client/
-│   ├── Dockerfile              Lightweight and ML image targets
-│   ├── main.py                 Client HTTP API and shared ML lock
-│   ├── runtime.py              Client state, package and round integration
-│   ├── model_profiles.py       Exact pinned Client model profiles
-│   ├── training.py             Data contracts and checkpoint lifecycle
-│   ├── peft_backend.py         Real Transformers/PEFT execution
-│   ├── reverse_training.py     Reverse candidate, validation and decision flow
-│   ├── safety_probe.py         Strict SafeFed-style linear-probe artifact gate
-│   └── knowledge.py            D^P encoding and KnowledgeSample conversion
-├── coordinator/
-│   ├── main.py                 Public federation API
-│   ├── service.py              Round orchestration and Host gateway
-│   └── reference_data.py       Coordinator-owned D^P/D^V boundary
-├── host/
-│   ├── main.py                 Private internal Host API
-│   ├── runtime.py              Host state, validation and publication flow
-│   ├── model_profiles.py       Exact pinned Granite Host profile
-│   ├── training.py             Host execution and validation contracts
-│   └── peft_backend.py         Real Granite LoRA and inference execution
-├── shared/
-│   ├── alignment_profiles.py   Approved per-Client alignment contracts
-│   ├── protocol.py             Manifests, profiles and package schemas
-│   ├── knowledge_artifact.py   Deterministic safetensors artifact I/O
-│   ├── knowledge_transport.py  Bounded streaming multipart transport
-│   ├── client_reverse_artifact.py  Bounded reverse-training artifact I/O
-│   ├── reference_dataset.py    Canonical schema, JSONL I/O and hashing
-│   ├── prompt.py               Shared reference-prompt renderer
-│   ├── crypto.py               Ed25519 and canonical SHA-256 helpers
-│   ├── storage.py              Atomic cross-platform persistence
-│   ├── ollama.py               Optional Ollama serving connector
-│   ├── fedmkt_runtime.py       Mock/real FedMKT boundary
-│   └── fedmkt_core/
-│       ├── selection.py        Dependency-free DualMinCE selection
-│       ├── safety.py           Protocol-first safety checks
-│       ├── UPSTREAM.md         FATE-LLM extraction and adaptation record
-│       └── ml/                 Adapted optional FedMKT components
-├── tools/datasets/
-│   ├── inspect_gld_layout.py   Offline PDF layout inspection
-│   └── gld_pdf_to_jsonl.py     Deterministic pinned-GLD importer
-├── tests/
-│   ├── test_client_training.py
-│   ├── test_client_knowledge.py
-│   ├── test_client_real_package.py
-│   ├── test_client_real_model.py
-│   ├── test_client_real_reverse.py
-│   ├── test_client_reverse_training.py
-│   └── ...                     Dataset, package, transport and round tests
+├── client/                     Client API, training, package generation,
+│                               reverse training and local safety probe
+├── coordinator/                round lifecycle, quorum, package intake,
+│                               safety/trust, Host integration and persistence
+├── host/                       Host API, pinned profiles, real PEFT training,
+│                               validation and post-decision publication
+├── shared/                     protocol, crypto, datasets, artifacts,
+│   └── fedmkt_core/            FedMKT parity/adaptation, alignment, selection,
+│       └── ml/                 optional upstream-derived ML components
+├── config/
+│   ├── container.env.example   remote Host/Coordinator template
+│   └── clients.env.example     split Client template
 ├── scripts/
-│   ├── demo_round.py           Containerized mock-round driver
+│   ├── bootstrap.py            role-aware private environment bootstrap
+│   ├── create_remote_round.py  Host-side split-round creation
+│   ├── run_host_stack.py       direct Host + Coordinator process launcher
+│   ├── run_remote_round.py     Client register/train/participate/sync driver
+│   ├── run_split_round_tmux.sh split-machine orchestration/evidence dashboard
+│   ├── validate_fedmkt_alignment.py
 │   ├── measure_knowledge_packages.py
-│   └── validate_fedmkt_alignment.py  Full-D^P alignment acceptance runner
-├── .env.example
-├── compose.yaml
+│   └── demo_round.py
+├── tests/                      model-free and opt-in real-model regression tests
+├── tools/datasets/             source-specific GLD inspection/import tooling
+├── compose.yaml                local development stack
+├── compose.clients.yaml        role-separated Qwen/Granite Client stack
+├── compose.host-ml.yaml        local Granite Host ML override
 ├── requirements.txt
 └── THIRD_PARTY_NOTICES.md
 ```
 
-All Python dependencies are consolidated in `requirements.txt`. Heavy ML imports
-remain lazy where practical so the ordinary test suite does not load a model or
-require a GPU.
+Generated/runtime state is intentionally outside the tracked source boundary.
+`.gitignore` excludes `.env*`, `data/`, `artifacts/`, logs, PEM/private-key files,
+virtual environments, and local delivery archives.
 
-## Pinned Client profiles
+## Clean-clone and private-state contract
 
-The real training and package-generation acceptance profile is:
+A clean checkout contains source code, model/profile contracts, Compose files,
+environment templates, tests, and bootstrap tooling. It does not contain:
 
-| Field | Value |
-| --- | --- |
-| Profile | `qwen3-1.7b-lora-v1` |
-| Model/tokenizer | `Qwen/Qwen3-1.7B` |
-| Revision | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
-| Model class | `Qwen3ForCausalLM` |
-| Tokenizer class | `Qwen2TokenizerFast` |
-| Vocabulary | 151,936 tokens |
-| Chat mode | Qwen non-thinking |
-| LoRA rank / alpha / dropout | 8 / 16 / 0.05 |
-| LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
-| Precision | BF16 |
-| Quantization | none |
+- deployment secrets;
+- Ed25519 private keys;
+- private Client training examples;
+- downloaded model weights;
+- trained adapters;
+- runtime round state;
+- the copyrighted Greek Law Digest PDF; or
+- generated thesis D^P/D^V datasets.
 
-Granite 3.3 2B is also pinned as a Client identity for heterogeneous alignment
-validation:
+Create role-specific private environment files with `scripts/bootstrap.py`.
+The command creates the file only when absent and reuses it rather than silently
+overwriting it.
 
-| Field | Value |
-| --- | --- |
-| Profile | `granite-3.3-2b-instruct-client-lora-v1` |
-| Model/tokenizer | `ibm-granite/granite-3.3-2b-instruct` |
-| Revision | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
-| Model class/type | `GraniteForCausalLM` / `granite` |
-| Tokenizer class | `GPT2TokenizerFast` |
-| Vocabulary | 49,159 tokens |
-| Chat mode | Standard Granite instruct template |
-| Ollama base | `granite3.3:2b` |
+Host/Coordinator example:
 
-The Granite Client profile is approved for the deterministic alignment runner;
-it has not yet completed a real private-data LoRA training and package-generation
-acceptance run. An arbitrary Hugging Face or Ollama model is not automatically a
-supported training or alignment profile.
-
-## Temporary validation Host and alignment profiles
-
-The temporary alignment-validation Host is:
-
-| Field | Value |
-| --- | --- |
-| Profile | `granite-3.3-2b-instruct-host-lora-v1` |
-| Model/tokenizer | `ibm-granite/granite-3.3-2b-instruct` |
-| Revision | `652c333dc5066f2a1764854a1bcd0ce67163d74f` |
-| Model class/type | `GraniteForCausalLM` / `granite` |
-| Tokenizer class | `GPT2TokenizerFast` |
-| Vocabulary | 49,159 tokens |
-| Chat mode | Standard Granite instruct template |
-| LoRA rank / alpha / dropout | 8 / 16 / 0.05 |
-| LoRA targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
-| Ollama base | `granite3.3:2b` |
-
-The approved signed pairs are:
-
-| Client | Alignment identity | Purpose |
-| --- | --- | --- |
-| Qwen 3 1.7B | `dtw:qwen3-1.7b--granite3.3-2b-v1` | Heterogeneous Qwen-to-Granite mapping and DTW |
-| Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` | Separate Client/Host identities over the same tokenizer |
-
-The public Granite checkpoint is licensed under Apache 2.0 and does not require
-gated model access. Its Host role is provisional and validates the transfer
-mechanism; it is not a production Host selection. Choosing another Host requires
-new signed Qwen-to-Host and Granite-to-Host profiles and another full acceptance
-run. An adapter for one base model or size is not compatible with another.
-
-Relevant dependency pins are:
-
-```text
-accelerate==1.14.0
-peft==0.20.0
-rapidfuzz==3.14.5
-safetensors==0.8.0
-sentencepiece==0.2.2
-torch==2.13.0
-transformers==4.57.6
-PyMuPDF==1.28.0
+```bash
+python scripts/bootstrap.py host \
+  --output .env.host \
+  --runtime-root /scratch/legalfedllm-test
 ```
 
-The adapted FedMKT code uses RapidFuzz Levenshtein distance in place of
-`editdistance` for Python 3.14 wheel compatibility. See
-`shared/fedmkt_core/UPSTREAM.md` and `THIRD_PARTY_NOTICES.md`.
+Client example, using the Host-issued registration token:
+
+```bash
+python scripts/bootstrap.py client \
+  --output .env.remote-client \
+  --registration-token '<host-issued registration token>'
+```
+
+For controlled one-Client proof-of-concept testing only, the Host bootstrap
+supports:
+
+```bash
+python scripts/bootstrap.py host \
+  --output .env.host \
+  --runtime-root /scratch/legalfedllm-test \
+  --trusted-quorum-override 1
+```
+
+Do not use the one-Client override as the normal federation configuration.
 
 ## Private Client training data
 
-The real Client reads local UTF-8 JSONL. Each line has exactly this logical form:
+Real Client training reads local UTF-8 JSONL. Each record has the logical form:
 
 ```json
 {
@@ -333,140 +367,18 @@ The real Client reads local UTF-8 JSONL. Each line has exactly this logical form
 }
 ```
 
-Requirements include:
+The Client enforces unique/non-empty IDs, non-empty prompt/answer strings,
+deterministic order and hashing, a supported schema, and answer-only
+supervision. Overlength examples fail rather than being silently truncated.
 
-- unique non-empty example IDs;
-- non-empty prompt and answer strings;
-- one consistent supported schema;
-- deterministic order and dataset hashing;
-- no truncation of examples that exceed the signed sequence limit; and
-- answer-only supervision under `chat_sft_answer_only_v1`.
-
-Compose mounts the host directory configured by `CLIENT_PRIVATE_DATA_DIR` as
-read-only `/private`, with the training file expected at `/private/train.jsonl`.
-The examples and their text never enter Coordinator storage. Training records
-persist only identity hashes, counts, settings and measured execution results.
-
-## Round-bound training and checkpoints
-
-For real training, the signed manifest fixes:
-
-- the selected Client and exact model-profile hash;
-- D^P identity and ordered sample IDs;
-- prompt-template and label-format identity;
-- maximum sequence length and `truncation_policy=reject`;
-- training epochs and top-k; and
-- DP-policy report fields.
-
-The execution profile fixes the local device, precision, micro-batch size,
-gradient accumulation, learning rate, seed, scheduler and optional frozen-base
-checksum.
-
-A candidate is promoted only when all of the following succeed:
-
-- at least one optimizer step ran;
-- training loss is finite and non-negative;
-- at least one LoRA tensor differs from its parent;
-- the checkpoint contains adapter files rather than full base-model weights;
-- metadata, tensor shapes, ranks and target modules match the pinned profile;
-- an optional full frozen-base checksum remains unchanged; and
-- a fresh base-model-plus-adapter reload matches the in-memory probe logits at
-  strict `atol=1e-4`.
-
-Candidate and Trainer staging directories are removed after success or failure.
-A failed run cannot advance the current-adapter pointer or create a completed
-round record.
-
-The Client uses one process-local ML lock for both real training and real knowledge
-generation. Work runs outside FastAPI's event loop, `/health` stays responsive and
-a concurrent training or generation request receives HTTP 409.
-
-## Real D^P knowledge contract
-
-Every reference sample is rendered with the same pinned chat and answer-only
-label contract used for private training.
-
-```text
-input              rendered public prompt + gold answer + tokenizer terminator
-stored positions   every non-padding source position
-top-k              highest raw model logits at each stored position
-sample metric      causal CE averaged over supervised answer targets only
-padding            allowed for batches, removed from stored samples
-inference          eval mode, no gradients, use_cache=False
-order              exact signed D^P sample order
-overlength         reject; never truncate
-```
-
-The package generator loads the archived round-specific adapter named by the
-validated training record, not whichever adapter happens to be current later.
-Pending retries reuse the exact signed package and exact artifact bytes without a
-second inference run.
-
-## Client reverse distillation and adoption
-
-Client synchronization first verifies the signed post-decision Host package and
-reuses the accepted Client package, adapter snapshot and pinned Host-to-Client
-alignment profile. D^P is deterministically divided into an approximately 90%
-transfer subset and a 10% Client-validation subset. Both subsets retain signed
-order, and their semantic hashes are bound into the reverse job.
-
-Every transfer sample remains in the training artifact. The Host supplies the
-sparse target only when its answer-token mean CE is strictly lower; ties and
-Client-winning samples retain the Client distribution. If no sample selects the
-Host, synchronization records a successful no-op and does not train an adapter.
-Otherwise the real Qwen path:
-
-1. loads the immutable checkpoint that produced the accepted Client package;
-2. trains for exactly one public-data epoch using `0.9` supervised answer CE plus
-   `0.1` selected-teacher sparse CE at temperature `1.0`;
-3. requires finite losses, an optimizer step, changed LoRA tensors, an unchanged
-   frozen base and fresh-load probe-logit equivalence;
-4. evaluates parent and candidate on the held-out public subset;
-5. runs the independent SafeFed-style LoRA-delta probe; and
-6. promotes only when both gates pass and the current pointer still names the
-   archived parent.
-
-The quality rule is non-regression rather than mandatory improvement:
-
-```text
-candidate macro answer-token CE <= parent macro answer-token CE + 0.001
-```
-
-Token-weighted answer-token CE, teacher-forced exact match and teacher-forced
-ROUGE-L are recorded as diagnostics. They are not averaged with the safety
-score. The safety rule is independently:
-
-```text
-maliciousness probability < 0.8
-```
-
-The real safety gate requires `CLIENT_SAFEFED_PROBE_MANIFEST_PATH` to name a
-local JSON manifest whose adjacent `linear_probe.safetensors` contains a
-float32 linear weight and bias. The manifest fixes the exact Qwen model-profile
-hash and revision, LoRA profile hash, ordered first-layer LoRA-B keys and sizes,
-L2 normalization, threshold, training/validation-corpus hashes and weights
-SHA-256. Pickled probe files are not accepted. The repository deliberately does
-not ship unvalidated classifier weights; a missing, mismatched or tampered probe
-fails real reverse training closed.
-
-The probe follows SafeFed-LLM's first-layer LoRA-B delta and linear-probe design,
-but this local candidate gate is a LegalFedLLM adaptation. It is not a claim of
-reproducing SafeFed-LLM's complete federated defense or paper results. See the
-[SafeFed-LLM paper](https://arxiv.org/abs/2601.07177) and
-[official implementation](https://github.com/dmqx/Safe-FedLLM).
-
-The decision record binds the job, parent and candidate hashes, both validation
-records, probe artifact/report hashes, both independent gates and the observed
-active pointer. A failed gate discards candidate weights while retaining the
-audit. If another round has already advanced the Client, the decision is
-`stale_parent`; compare-and-swap discards the stale candidate and never
-overwrites the newer checkpoint. Retrying `/sync` reuses the same decision
-bytes. A Host candidate rollback is not an eligibility block: the retained
-accepted Host may still teach samples on which its CE is strictly lower.
+For the role-separated Client Compose stack, the configured private directory is
+mounted read-only and the training file is expected as `/private/train.jsonl`.
+The raw private examples are never written to Coordinator storage or included in
+a Knowledge Package.
 
 ## Reference dataset boundary
 
-A canonical reference sample contains:
+A canonical reference record contains:
 
 ```json
 {
@@ -477,7 +389,7 @@ A canonical reference sample contains:
   "chapter": "Example Chapter",
   "section": "Example Section",
   "question": "What is the question?",
-  "gold_answer": "The original gold answer.",
+  "gold_answer": "The reference target answer.",
   "source": {
     "document_id": "example-document",
     "page_start": 10,
@@ -486,334 +398,426 @@ A canonical reference sample contains:
 }
 ```
 
-The authoritative runtime format is UTF-8 JSONL with one sample per line. Pretty
-JSON files are generated only for human inspection.
-
-The semantic dataset hash covers the schema, dataset ID/version and ordered
-`sample_id`, `chapter`, `section`, `question` and `gold_answer` fields. Source page
-metadata is provenance and is excluded from the semantic hash.
+The authoritative runtime representation is UTF-8 JSONL with one sample per
+line. The semantic hash binds the schema, dataset identity, and ordered
+`sample_id`, `chapter`, `section`, `question`, and `gold_answer` values. Source
+page metadata is provenance and is not part of the semantic hash.
 
 The generic split groups samples by `(chapter, section)` and preserves source
 order. A one-sample section belongs entirely to D^P. Otherwise D^P receives the
-first `floor(0.8 * n)` samples and D^V receives the remainder. GLD-dependent
-follow-up pairs are grouped by the source-specific importer before this generic
-split, so a base question and its dependent follow-up cannot be separated.
+first `floor(0.8 * n)` samples and D^V receives the remainder. Source-specific
+GLD follow-up grouping is resolved before the generic split.
 
-The shared prompt renderer produces:
+### Thesis GLD identities
 
-```text
-Chapter: {chapter}
-
-Section: {section}
-
-Question: {question}
-
-Answer:
-```
-
-`gold_answer` remains a separate target and is not inserted into this public
-prompt string.
-
-### Accepted GLD corpus identity
-
-The authoritative importer run used PyMuPDF 1.28.0 and the pinned 713-page Greek
-Law Digest source.
+The reviewed thesis dataset is derived from a pinned 713-page 2012 Greek Law
+Digest source copy.
 
 | Dataset | Samples | Semantic SHA-256 |
 | --- | ---: | --- |
-| Complete corpus | 738 | `cf5c81dcecaab58848c1afb0e99f86bcf5fd32823c2aaee34a65f6f4a2ccd0e8` |
-| D^P reference corpus | 565 | `5d855a429d43b70eb146aeb11cda1f675c05d6465bea0792796fdcd8d6ceb231` |
-| D^V validation corpus | 173 | `1e40a74799b9900ff8b9a9e05dd379fd0c00226370625f7da1fdca13142b83b5` |
+| Complete canonical corpus | 738 | `cf5c81dcecaab58848c1afb0e99f86bcf5fd32823c2aaee34a65f8a3dc21d49` |
+| D^P shared reference set | 565 | `5d855a429d43b70eb146aeb11cda1f675c05d6465bea0792796fdcd8d6ceb231` |
+| D^V hidden validation set | 173 | `1e40a74799b9900ff8b9a9e05dd379fd0c00226370625f7da1fdca13142b83b5` |
 
-The accepted audit reported zero unresolved follow-ups, duplicate canonical
-prompts, contributing-firm/profile contamination, out-of-scope samples and
-blocking issues.
+D^P is distributed only to selected Clients for a signed round. D^V has no
+public Client download endpoint and remains on the Coordinator/Host side for
+candidate validation.
+
+The Greek Law Digest source is private/copyrighted. Neither the source PDF nor
+the generated thesis dataset belongs in the public repository.
+
+### Offline GLD tooling
+
+Source-specific inspection/import code remains outside the generic dataset
+boundary under `tools/datasets/`. The workflow is deliberately review-oriented:
+ambiguous structure should produce deterministic warnings or blocking review
+rather than silent guessing.
+
+Generated files should be regenerated from importer rules rather than manually
+edited. Provenance, source identity, sample count, and semantic hashes must stay
+reproducible.
+
+## Prompt and answer-only supervision
+
+Client and Host training use the shared supervision label:
+
+```text
+chat_sft_answer_only_v1
+```
+
+Prompt rendering is model/tokenizer-specific, but loss is computed only over the
+answer portion. The same answer-token boundary is used when producing CE
+evidence for teacher selection and validation.
+
+Overlength training/reference rows are rejected when the active profile uses the
+`reject` truncation policy.
 
 ## Knowledge Package and Artifact contract
 
-Knowledge Package schema 2.0 is one signed logical object with two transported
-parts:
+A Knowledge Package is a signed JSON envelope plus a bounded `safetensors`
+artifact. The manifest binds at least:
+
+- round identity;
+- sender identity and public-key trust context;
+- model and tokenizer profile;
+- adapter identity;
+- exact alignment profile;
+- reference-dataset identity and ordered sample set;
+- artifact byte size and SHA-256;
+- top-k setting;
+- nonce/replay state; and
+- signature.
+
+The artifact stores sparse knowledge rather than full dense vocabulary logits.
+For each answer-token row it retains top-k token IDs/logits plus evidence needed
+for exact CE checks and alignment.
+
+Coordinator validation checks tensor names, dtypes, shapes, offsets,
+finite-valued data, vocabulary bounds, top-k consistency, sample offsets,
+artifact size/hash, and package/manifest identities before the package can be
+accepted.
+
+## FedMKT alignment and teacher selection
+
+Different tokenizers cannot compare token IDs directly. LegalFedLLM therefore
+maps tokenizer pieces into a shared word/character representation and applies a
+DTW-based alignment adapted from FedMKT/FATE-LLM.
+
+The implementation keeps the alignment deterministic and cacheable:
 
 ```text
-canonical signed JSON envelope
-        +
-exact safetensors numerical artifact
+Client sparse logits
+      ↓
+Client token strings / word-boundary mapping
+      ↓
+DTW alignment against Host tokenization
+      ↓
+aligned sparse teacher evidence
+      ↓
+Host-vs-teacher answer-token CE comparison
+      ↓
+DualMinCE teacher choice per sample
 ```
 
-The envelope's descriptor binds the exact artifact bytes:
+The Client does not automatically become a teacher merely because its package
+was accepted. Safety eligibility and selective CE comparison are separate
+conditions. If the Host is better on a sample, the Host remains the teacher for
+that sample.
 
-```json
-{
-  "format": "safetensors",
-  "schema_version": "1.0",
-  "byte_size": 4809632,
-  "sha256": "<SHA-256 of exact artifact bytes>",
-  "sample_count": 565,
-  "sample_ids_sha256": "<SHA-256 of the canonical ordered ID list>",
-  "total_token_count": 133336,
-  "top_k": 4
-}
-```
+## Safety model
 
-The byte size and token count above are from the accepted real Step 3 package;
-run-specific hashes are deliberately not frozen as project constants.
+LegalFedLLM adapts the defense-in-depth idea of Safe-FedLLM to behavioral
+Knowledge Packages rather than treating heterogeneous Client parameters as
+aggregatable updates.
 
-Artifact schema 1.0 contains exactly six tensors. `N` is the sample count, `T`
-the total stored token count and `K` top-k.
-
-| Tensor | Dtype | Shape | Purpose |
-| --- | --- | --- | --- |
-| `sample_offsets` | `int64` | `[N + 1]` | Variable-length sample boundaries |
-| `source_input_ids` | `int32` | `[T]` | Sender-tokenizer input IDs |
-| `attention_lengths` | `int32` | `[N]` | Unmasked length per sample |
-| `top_k_token_ids` | `int32` | `[T, K]` | Sender-tokenizer top-k IDs |
-| `top_k_logits` | `float32` | `[T, K]` | Raw top-k logits |
-| `ce_losses` | `float32` | `[N]` | Per-sample cross-entropy loss |
-
-The verification chain is:
+The safety path includes:
 
 ```text
-Ed25519 signature
-    → signed package metadata and package hash
-    → artifact descriptor
-    → exact artifact byte size and SHA-256
-    → strict tensor, shape, dtype, order and finite-number validation
+structural validation
+      ↓
+pre-alignment plausibility checks
+      ↓
+post-alignment disagreement analysis
+      ↓
+trust score / eligibility
+      ↓
+trust-gated teacher selection
+      ↓
+hidden D^V Host outcome validation
+      ↓
+promotion or rollback
 ```
 
-Multipart upload/download is bounded and streaming. Rejected or interrupted
-transfers are cleaned up. Accepted Coordinator submissions are immutable:
+Pre-alignment checks are intentionally cheap and deterministic. They catch
+malformed/non-finite artifacts, invalid token IDs/order, and gross pathological
+concentration/repetition without assuming that natural Qwen/Nemo vocabulary
+heterogeneity is malicious.
+
+Repeated-frequency calculations use linear-time counting rather than repeated
+full-list scans. Artifact loading and CPU-heavy pre-alignment inspection run off
+the Coordinator event-loop thread so health/status/receipt endpoints remain
+responsive while safety inspection is in progress. Safety still gates durable
+acceptance; the Coordinator does not report an accepted receipt before the
+package has passed the required checks and been persisted.
+
+Post-alignment checks compare behavior after heterogeneous token spaces have
+been normalized enough for meaningful disagreement analysis. Trust can gate or
+down-weight selective distillation.
+
+Hidden D^V validation is an additional outcome barrier, not a complete poisoning
+proof. Targeted/backdoor behavior outside D^V coverage can still evade aggregate
+validation metrics, so the safety layers are complementary rather than
+interchangeable.
+
+The Client reverse path also contains local candidate quality/safety gates. Any
+LoRA-delta probe should be described as an experimental LegalFedLLM heuristic,
+not as literal SafeFed-LMM equivalence.
+
+## Host training and D^V promotion
+
+After package acceptance and alignment, the Coordinator constructs sparse Host
+trainer inputs. The Host trains a model-native LoRA candidate; no Client LoRA
+weights are inserted into the Host.
+
+The Host then evaluates the active adapter and candidate on hidden D^V using the
+same answer-only loss contract. The decision is fail-closed:
 
 ```text
-rounds/<round-id>/submissions/<client-id>/package.json
-rounds/<round-id>/submissions/<client-id>/knowledge.safetensors
+candidate improves by required margin → promote atomically
+candidate does not improve            → keep active adapter
+validation/training failure            → do not promote
 ```
 
-### Knowledge-package representation measurement
+The post-decision Host Knowledge Package is generated from the active adapter
+after that decision, so Clients sync from the actual promoted/retained Host
+state.
 
-The retained measurement utility compares schema 2.0 metadata plus the exact
-artifact with the former embedded-JSON representation:
+## Client reverse distillation and adoption
+
+After Host publication, the Client:
+
+1. downloads and verifies the signed Host package;
+2. checks exact round/reference/alignment identities;
+3. aligns Host sparse knowledge into the Client tokenizer space;
+4. selects Host-teacher samples using the reverse CE rule;
+5. creates an immutable reverse-training job;
+6. trains a model-native Client LoRA candidate when transfer samples exist;
+7. evaluates local quality/safety gates; and
+8. commits or rejects the candidate before marking the round complete.
+
+Reverse training is Client-owned. The Coordinator/Host never installs a Client
+adapter.
+
+## Submission acknowledgement and retry semantics
+
+Knowledge submission is transactional from the Client's point of view. The
+Client keeps the exact pending package, artifact, and adapter snapshot until it
+has authoritative evidence that the exact package was accepted.
+
+If the POST acknowledgement is lost or ambiguous, the Client can query:
+
+```text
+GET /v1/rounds/{round_id}/submissions/{client_id}/receipt
+```
+
+The receipt lookup is authenticated and must match the exact round, Client, and
+package hash. The Client commits only when the exact package is confirmed
+accepted. Wrong hash/client/round or an unaccepted submission fails closed and
+leaves the pending package intact.
+
+This recovery path handles lost acknowledgements without turning retries into a
+second logical submission.
+
+## tmux split-round orchestration
+
+`scripts/run_split_round_tmux.sh` orchestrates the role-separated real test while
+keeping the remote Host/Coordinator and local Client visibly separate.
+
+It creates panes/windows for:
+
+```text
+remote Host/Coordinator + remote GPU monitor
+round runner / automatic round creation
+local Client logs + local GPU monitor
+Coordinator state / final evidence collector
+SSH tunnel
+```
+
+The script uses an SSH ControlMaster so the user enters the remote password once.
+The tunnel is used for Coordinator traffic; the remote Host remains bound to
+loopback.
+
+The generated cleanup script stops the tmux session, Client runtime, and SSH
+ControlMaster while preserving run evidence.
+
+### Final evidence behavior
+
+Runner exit does not immediately freeze Coordinator evidence. The finalizer:
+
+```text
+records runner exit
+      ↓
+continues observing persisted Coordinator state
+      ↓
+COMPLETED / SKIPPED / ABORTED
+      or bounded evidence timeout
+      ↓
+writes coordinator-final-state.json
+      ↓
+captures final Client health
+      ↓
+computes PASS / FAIL
+```
+
+Observation is evidence collection only. It does not retry a submission, call
+`/sync`, mutate Client state, or otherwise recover a failed run automatically.
+
+## Remote NVIDIA A40 environment
+
+The remote Host/Coordinator path is designed around a writable runtime root such
+as:
+
+```text
+/scratch/legalfedllm-test
+```
+
+with a source checkout under:
+
+```text
+/scratch/legalfedllm-test/work/LegalFedLLM
+```
+
+and a Python virtual environment under:
+
+```text
+/scratch/legalfedllm-test/.venv
+```
+
+The real Host/Coordinator services run directly from that virtual environment,
+not through Docker. The Host binds to `127.0.0.1:8002`; the Coordinator binds to
+`127.0.0.1:8000` and is exposed to the local Client only through SSH forwarding.
+
+The verified environment uses an NVIDIA A40 with CUDA/BF16-capable PyTorch,
+Transformers, PEFT, Accelerate, Triton, and safetensors.
+
+### Remote container command limitations
+
+The remote environment is intentionally treated as a constrained container, not
+as a normal workstation/server installation.
+
+In particular:
+
+- `ss` is not available/supported in the container;
+- do not infer port state from an empty unsupported port-inspection command;
+- use `ps` to inspect the actual LegalFedLLM/Uvicorn processes;
+- use direct `curl` requests to `/health` to confirm whether Host/Coordinator are
+  alive or stopped;
+- `lsof` or `fuser` may be useful when installed, but they should not replace the
+  process/health check;
+- `nvidia-smi` is available for GPU/VRAM monitoring; and
+- use the writable `/scratch` runtime tree rather than assuming ordinary home or
+  system paths are writable.
+
+A practical cleanup check is:
 
 ```bash
-python scripts/measure_knowledge_packages.py \
-  --reference data/derived/gld2012/reference.jsonl
+ps -ef | grep -E \
+  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+  | grep -v grep || true
 ```
 
-It refuses a reference dataset whose count or semantic hash differs from the
-accepted 565-sample D^P. The accepted deterministic mock run used top-k 20:
+followed by direct health checks:
 
-| Representation | Client | Host |
-| --- | ---: | ---: |
-| Canonical package JSON | 16,246 B | 16,234 B |
-| `safetensors` artifact | 1,121,448 B | 1,121,448 B |
-| Logical package | 1,137,694 B | 1,137,682 B |
-| Multipart body | 1,138,040 B | 1,138,028 B |
-| Equivalent embedded JSON | 2,159,947 B | 2,160,046 B |
-| Size reduction | 47.3277% | 47.3307% |
-
-These are representation measurements of deterministic mock knowledge, not
-model-quality, training-time, memory or privacy results.
-
-## Real Qwen Client authoritative acceptance
-
-The accepted environment reported:
-
-```text
-GPU: NVIDIA GeForce RTX 5060 Laptop GPU
-PyTorch: 2.13.0+cu130
-CUDA runtime: 13.0
-CUDA available: true
-BF16 supported: true
-model profile: qwen3-1.7b-lora-v1
-model revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+```bash
+curl -fsS --max-time 2 http://127.0.0.1:8000/health || true
+curl -fsS --max-time 2 http://127.0.0.1:8002/health || true
 ```
 
-The frozen D^P exposed 37 samples longer than 512 Qwen tokens. The largest was
-1,814 tokens, so the accepted signed sequence limit was 2,048 with rejection
-rather than truncation.
+If stale Host/Coordinator processes exist, stop the `run_host_stack.py` parent
+first and re-check the children before using stronger signals.
 
-The full real package reported:
+## Running the remote Host/Coordinator manually
 
-| Measurement | Observed value |
-| --- | ---: |
-| D^P samples | 565 |
-| Stored source tokens | 133,336 |
-| Artifact size | 4,809,632 bytes |
-| Minimum answer-only CE | 1.5879086256027222 |
-| Maximum answer-only CE | 17.829463958740234 |
-| Trainable LoRA parameters | 3,211,264 |
-| Total model parameters | 1,723,786,240 |
-| Optimizer steps | 1 |
-| Frozen-base checksum | verified unchanged |
+From the remote repository root:
 
-The artifact is below the existing 25 MiB logical package limit. Package,
-artifact and checkpoint hashes were produced and validated for each isolated run,
-but they are run-specific rather than frozen protocol constants.
+```bash
+source /scratch/legalfedllm-test/.venv/bin/activate
+set -a
+. ./.env.host
+set +a
+python scripts/run_host_stack.py --env-file .env.host
+```
 
-Peak RAM, peak VRAM and wall-clock timings were not recorded as stable thesis
-measurements for that run and are not claimed here. Comparative model execution
-measurement belongs to the later complete heterogeneous-round experiment.
+Keep that process running while the SSH tunnel and local Client are active.
 
-## Test and verification commands
+Useful health checks:
 
-### Lightweight repository suite
+```bash
+curl -fsS http://127.0.0.1:8002/health
+curl -fsS http://127.0.0.1:8000/health
+```
+
+## Running a split Client manually
+
+The local Client uses `compose.clients.yaml` and a role-specific environment
+file. A typical workflow is:
+
+```bash
+docker compose \
+  -p legalfedllm-split \
+  --env-file .env.remote-client \
+  -f compose.clients.yaml \
+  --profile qwen \
+  up -d --build
+```
+
+Then run the round driver from the repository environment:
+
+```bash
+python scripts/run_remote_round.py
+```
+
+For unattended testing, prefer `scripts/run_split_round_tmux.sh` so startup,
+state observation, GPU monitoring, final evidence, and cleanup are collected
+consistently.
+
+## Tests and verification
+
+### Ordinary repository suite
 
 From the repository root:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-The ordinary suite does not download or load a language model. Pinned Client,
-Host, tokenizer and reverse-training acceptance cases remain explicitly opt-in.
+Some real-model tests are opt-in and require the pinned model/tokenizer artifacts
+plus the expected CUDA/Transformers/PEFT environment. A missing optional ML
+dependency should be distinguished from a source-code regression.
 
-Focused model-free Client tests can be run with:
+### Reliability and safety regressions
 
-```bash
-python -m unittest -v \
-  tests.test_alignment_profiles \
-  tests.test_client_training \
-  tests.test_client_knowledge \
-  tests.test_client_real_package \
-  tests.test_fedmkt_integration \
-  tests.test_fedmkt_validation
-```
-
-### Focused Step 6.2 tests
-
-The Step 6.2 suite covers the exact `0.9/0.1` answer-only objective, strict and
-hash-bound probe loading, natural promotion, independent safety rejection,
-forced rejection, zero-Host-teacher no-op, restart/byte idempotence and stale-
-parent discard, including recovery from an interrupted candidate/result commit.
-It also reruns the complete deterministic round path:
+Focused model-free coverage includes:
 
 ```bash
 python -m unittest -v \
-  tests.test_client_reverse_training \
-  tests.test_reverse_integration \
-  tests.test_protocol \
-  tests.test_reference_dataset \
-  tests.test_round
+  tests.test_package_safety \
+  tests.test_submission_reconciliation \
+  tests.test_split_round_tmux
 ```
 
-Two opt-in tests execute actual Qwen LoRA reverse optimization, candidate
-safetensors save/reload, held-out validation, promotion, forced rejection and
-restart replay. They download the pinned model if needed and require a compatible
-CUDA/BF16 environment:
+These tests cover, among other things:
+
+- lost-after-acceptance acknowledgement reconciliation;
+- exact hash/client/round receipt matching;
+- fail-closed unconfirmed submissions;
+- responsive receipt/status handling while safety validation is still running;
+- no premature accepted receipt during validation;
+- linear-time safety frequency calculations; and
+- terminal evidence collection after runner exit.
+
+Shell syntax should also be checked with:
 
 ```bash
-docker compose -p legalfedllm build client
-docker compose -p legalfedllm run --rm --no-deps -T \
-  -e LEGALFEDLLM_RUN_REAL_CLIENT_REVERSE_TESTS=true \
-  -e LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY=false \
-  client python -m unittest -v tests.test_client_real_reverse
+bash -n scripts/run_split_round_tmux.sh
 ```
 
-These opt-in tests deliberately inject a deterministic benign probe so model
-training and adoption can be tested before independently calibrated classifier
-weights exist. They do not qualify a production probe. The model-free probe test
-separately exercises the strict `probe.json` plus `linear_probe.safetensors`
-contract, PEFT tensor extraction, the exact `< 0.8` boundary and tamper rejection.
+### Real Qwen acceptance
 
-For a production-style `/sync` test, place an independently trained Qwen probe
-at `${CLIENT_SAFEFED_PROBE_DIR}/probe.json` with adjacent
-`linear_probe.safetensors`. The manifest can be created with
-`SafeFedProbeManifest.create(...)`; derive the ordered first-layer LoRA-B keys
-and flattened sizes from a pinned Qwen parent adapter, bind the model/LoRA
-profile hashes and pinned revision, record independent training and validation
-corpus SHA-256 values, and bind the exact weights byte size and SHA-256. Do not
-use a test constant or self-declared benign bias for this production-style run.
+Real Qwen tests are opt-in and require the configured tokenizer/model artifacts
+and CUDA environment. They validate private Client LoRA training, real D^P
+Knowledge Package generation, and package/reverse paths.
 
-### Build and health-check the services
+### Reverse Qwen acceptance
 
-Create an environment file and replace all development tokens:
+The reverse real-model path verifies that a Host-derived sparse training job can
+train a new Qwen PEFT candidate and exercise the independent local adoption
+logic. These tests qualify the implemented Client lifecycle; they do not qualify
+a production malicious-update classifier.
 
-```bash
-cp .env.example .env
-mkdir -p data/client-private
-```
+### Full-D^P heterogeneous alignment validation
 
-For ordinary service startup, provide `data/client-private/train.jsonl` in the
-format documented above, then run:
-
-```bash
-docker compose -p legalfedllm up --build --wait --wait-timeout 180
-docker compose -p legalfedllm ps
-```
-
-Host, Coordinator and Client should all report `healthy`. The Compose Client uses
-the `client-ml` target, the Qwen profile, all available GPUs, 2 GiB shared memory,
-a persistent Hugging Face cache and a read-only private-data mount.
-
-Check the published services:
-
-```bash
-curl -s http://localhost:8000/health
-curl -s http://localhost:8001/health
-```
-
-Reset prototype state only when that destructive cleanup is intended:
-
-```bash
-docker compose -p legalfedllm down -v
-```
-
-### Focused real-model acceptance
-
-This downloads the pinned model if it is not already cached and requires a
-compatible CUDA/BF16 environment:
-
-```bash
-docker compose -p legalfedllm run --rm --no-deps -T \
-  -e LEGALFEDLLM_RUN_REAL_MODEL_TESTS=true \
-  -e LEGALFEDLLM_REAL_MODEL_PROFILE=qwen3-1.7b-lora-v1 \
-  client python -m unittest -v \
-  tests.test_client_real_model.RealClientModelAcceptanceTests.test_one_peft_step_save_reload_and_real_knowledge
-```
-
-The acceptance test creates two temporary private examples, performs one real
-LoRA optimization, validates the checkpoint, creates a two-sample real package,
-reloads it and verifies byte-identical retry behavior.
-
-### Full frozen-D^P real package
-
-The accepted GLD D^P must exist locally at
-`data/derived/gld2012/reference.jsonl`:
-
-```bash
-docker compose -p legalfedllm run --rm --no-deps -T \
-  -v "$PWD/data/derived/gld2012:/datasets:ro" \
-  -e LEGALFEDLLM_RUN_REAL_MODEL_TESTS=true \
-  -e LEGALFEDLLM_REAL_MODEL_PROFILE=qwen3-1.7b-lora-v1 \
-  -e LEGALFEDLLM_REAL_REFERENCE_DATASET_PATH=/datasets/reference.jsonl \
-  -e LEGALFEDLLM_REAL_MAX_SEQUENCE_LENGTH=2048 \
-  client python -m unittest -v \
-  tests.test_client_real_model.RealClientModelAcceptanceTests.test_full_565_sample_reference_dataset
-```
-
-The test refuses the wrong dataset identity/order, rejects overlength input before
-expensive inference and validates the generated signed package and artifact.
-
-### Full-D^P heterogeneous alignment acceptance
-
-The acceptance runner uses the frozen D^P, the exact pinned Qwen and Granite
-tokenizer artifacts and three independently signed deterministic packages:
-
-| Participant | Model role | Trust |
-| --- | --- | ---: |
-| Temporary `host` | Granite 3.3 2B validation Host | not applicable |
-| `client-b` | Qwen 3 1.7B Client | 0.5 |
-| `client-a` | Granite 3.3 2B Client | 1.0 |
-
-The signed Client order is `client-b`, then `client-a`, and quorum is `2`.
-Eligibility requires all hard protocol checks and `trust_score >= 0.5`. Trust is
-not a teacher-selection weight. The deterministic loss schedule produces 283
-Host selections, 141 `client-b` selections and 141 `client-a` selections across
-565 samples; Host ties and signed-order Client ties are therefore exercised.
-
-Run from a fully installed local environment:
+The deterministic alignment runner can be executed with:
 
 ```bash
 python scripts/validate_fedmkt_alignment.py \
@@ -825,276 +829,221 @@ python scripts/validate_fedmkt_alignment.py \
   --top-k 4
 ```
 
-For the authoritative Docker environment, use the LegalFedLLM Client image and
-its persistent Hugging Face cache:
-
-```bash
-mkdir -p artifacts
-docker compose -p legalfedllm build client
-docker compose -p legalfedllm run --rm --no-deps -T \
-  -v "$PWD:/workspace" \
-  -w /workspace \
-  client python scripts/validate_fedmkt_alignment.py \
-    --reference data/derived/gld2012/reference.jsonl \
-    --output artifacts/fedmkt-alignment-validation.json \
-    --mapping-cache artifacts/fedmkt-alignment-cache \
-    --identity-dir artifacts/fedmkt-validation-identities \
-    --hf-cache /models/huggingface \
-    --maximum-sequence-length 4096 \
-    --top-k 4
-```
-
-The complete JSON report and validation-only keys remain under ignored
-`artifacts/`. It records exact model/tokenizer and software revisions, package
-and mapping identities, artifact and cache sizes, selection and fallback counts,
-per-tokenizer observed token counts, two-pass hashes, wall time and peak process
-RAM. The no-truncation ceiling is 4096 because the frozen D^P includes a Granite
-encoding longer than 2048 tokens. The runner still pads only to the observed
-batch maximum; 4096 is a rejection bound, not an allocated tensor width.
-The runner uses top-k 4, matching the accepted full-D^P Qwen package, and
-retains all non-padding positions so each complete logical package remains
-within the existing 25 MiB transport bound. This validation setting does not
-change the protocol's configurable top-k field.
-Mapping, DTW and sparse-target construction run on CPU. VRAM is recorded as not
-applicable because the runner does not load model weights, perform a forward
-pass or allocate CUDA tensors. Ollama and AnythingLLM are not part of this
-acceptance path.
-
-## Offline GLD dataset tooling
-
-Place the pinned source at:
-
-```text
-data/private/greek_law_digest.pdf
-```
-
-Then run:
-
-```bash
-python tools/datasets/inspect_gld_layout.py
-python tools/datasets/gld_pdf_to_jsonl.py
-```
-
-The importer accepts only the pinned source:
-
-```text
-expected PDF pages: 713
-expected SHA-256:
-9673ee7c86b3d582e2c08e1cdd2b84f144981f31a1fe50d4216e82c5b350b77d
-```
-
-Its fixed initial scope begins at printed page 34 and ends before `COVERED BONDS`
-on printed page 306. It imports 44 Q&A-structured sections and explicitly excludes
-two prose-only sections rather than synthesizing questions.
-
-A clean run writes:
-
-```text
-data/derived/gld2012/
-├── all.jsonl
-├── all.json
-├── reference.jsonl
-├── reference.json
-├── validation.jsonl
-├── validation.json
-├── identity.json
-└── review.json
-```
-
-If unresolved candidates or audit failures remain, final corpus files are removed
-and only candidate/review outputs are retained. Generated data must be regenerated
-after importer changes rather than edited manually.
+It records deterministic mapping/alignment identities and selection behavior;
+it is not a model-quality benchmark.
 
 ## Service APIs
 
-### Coordinator — published port 8000
+### Coordinator — port 8000
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Service status |
-| `GET` | `/v1/identity` | Coordinator and Host public identity |
-| `POST` | `/v1/clients/register` | Register a Client profile and public key |
-| `POST` | `/v1/rounds` | Create and sign a round manifest |
-| `GET` | `/v1/rounds/current` | Retrieve the current manifest |
+| `GET` | `/health` | Coordinator status/quorum policy |
+| `GET` | `/v1/identity` | Coordinator + Host public identity |
+| `POST` | `/v1/clients/register` | Register Client profile/public key |
+| `POST` | `/v1/rounds` | Create/sign a round manifest |
+| `GET` | `/v1/rounds/current` | Retrieve current manifest |
 | `GET` | `/v1/rounds/{id}/manifest` | Retrieve one manifest |
-| `GET` | `/v1/rounds/{id}/reference-dataset` | Download selected round D^P |
-| `POST` | `/v1/rounds/{id}/knowledge` | Upload package JSON plus artifact |
-| `GET` | `/v1/rounds/{id}/status` | Poll round state |
-| `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed Host package |
-| `POST` | `/v1/generate` | Proxy direct Host consultation |
+| `GET` | `/v1/rounds/{id}/status` | Retrieve round state |
+| `GET` | `/v1/rounds/{id}/reference-dataset` | Selected-Client D^P download |
+| `POST` | `/v1/rounds/{id}/knowledge` | Upload signed package + artifact |
+| `GET` | `/v1/rounds/{id}/submissions/{client_id}/receipt` | Authenticated exact accepted-submission receipt |
+| `GET` | `/v1/rounds/{id}/safety` | Admin safety reports for the round |
+| `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed post-decision Host package |
+| `POST` | `/v1/generate` | Proxy Host generation |
 
-### Client — loopback-published port 8001
+The receipt lookup requires the registration token and matching `X-Client-Id`.
+The safety-report endpoint is admin-protected.
+
+### Client — loopback port 8001
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Client state and backend status |
-| `POST` | `/v1/register` | Register with the Coordinator |
+| `GET` | `/health` | Client state/backend status |
+| `POST` | `/v1/register` | Register with Coordinator |
 | `POST` | `/v1/local-train` | Local training outside a round |
 | `POST` | `/v1/rounds/{id}/local-train` | Train against one signed round |
 | `POST` | `/v1/participate` | Legacy current-round participation |
-| `POST` | `/v1/rounds/{id}/participate` | Generate and submit the round package |
-| `POST` | `/v1/rounds/{id}/sync` | Verify Host knowledge and complete the local reverse decision |
-| `POST` | `/v1/generate` | Local mock or Ollama inference |
-| `GET` | `/v1/ollama/models` | List installed Ollama models |
-| `POST` | `/v1/ollama/inspect` | Inspect one Ollama model |
+| `POST` | `/v1/rounds/{id}/participate` | Generate and submit exact round package |
+| `POST` | `/v1/rounds/{id}/sync` | Verify Host package and execute reverse decision |
+| `POST` | `/v1/generate` | Local mock/Ollama generation |
+| `GET` | `/v1/ollama/models` | List configured Ollama models |
+| `POST` | `/v1/ollama/inspect` | Inspect an Ollama model |
 
-Client administrative endpoints require `X-Client-Admin-Token`. `/health` and
-`/v1/generate` remain outside that administrative gate.
+Client administrative endpoints require `X-Client-Admin-Token`.
 
-### Host — private port 8002
+### Host — private/loopback port 8002
 
-The Host API is reachable only inside the Compose network and is protected by
-`X-Internal-Token`. It owns dataset verification, current Host adapter metadata,
-mock selection/distillation, validation and rollback, signed Host publication and
-optional Ollama inference.
+The Host internal API is protected by `X-Internal-Token`. It exposes internal
+identity, reference-data loading, reference knowledge, sparse training-job
+intake, candidate training, candidate validation, post-decision knowledge, and
+generation. In the remote topology it is loopback-only and is contacted by the
+colocated Coordinator.
 
-## Persistence and retry behavior
+## Persistence and idempotence
 
-No database is required. Each service owns a local filesystem state tree.
-
-Client state distinguishes:
+LegalFedLLM does not require a database. Each role owns a filesystem state tree.
+Important persisted Client state includes:
 
 ```text
-identity and active state
-round-specific training records
-versioned PEFT adapter checkpoints
+identity and active adapter state
+round-bound training records
+PEFT checkpoints
 verified D^P caches
-pending Knowledge Packages
-accepted Knowledge Packages
-Host package caches
+pending and accepted Knowledge Packages
 submission receipts
-pending and accepted adapter snapshots
-immutable reverse-training jobs and safetensors inputs
-Client candidate, validation, safety and adoption decision records
+adapter snapshots
+Host package cache
+immutable reverse jobs and sparse artifacts
+candidate/validation/safety/adoption records
 ```
 
-For a real package, the adapter version and checkpoint hash come from the signed-
-round training record, not mutable current state. Pending and accepted package
-state is revalidated against the round, model profile, training record, checkpoint,
-package signature and artifact before reuse.
+Important Coordinator state includes:
 
-A retry while pending reuses the exact JSON and artifact bytes. After Coordinator
-acceptance, the local package/artifact/snapshot set is immutable. A second accepted
-submission is rejected rather than processed twice.
+```text
+registered Client identities
+signed manifests
+accepted submissions
+safety reports and trust history
+round state
+Host baseline package
+integration audit
+Host training job/receipt/result/validation decision
+post-decision Host package
+round audit events
+```
 
-## Security included now
+Retries are exact where possible. A pending Client submission is revalidated
+against its round, model profile, training record, checkpoint, and artifact.
+Once accepted, the package/artifact/snapshot set is immutable.
 
-The current implementation includes:
+## Security and privacy boundary
+
+Implemented security controls include:
 
 - Ed25519 identities and signatures;
-- canonical JSON hashing and signing;
-- exact artifact size and SHA-256 binding;
-- registered Client public keys and signed Coordinator manifests;
-- round, manifest, dataset, sample-order, model, tokenizer, adapter and DP-report
-  binding;
-- persistent nonce and package-hash replay protection;
+- canonical JSON hashing/signing;
+- exact artifact byte-size and SHA-256 binding;
+- registered Client public keys;
+- signed Coordinator manifests;
+- model/tokenizer/adapter/reference-dataset/sample-order binding;
+- nonce and package-hash replay protection;
 - selected-Client authorization for D^P download;
-- bounded logical-package and multipart sizes;
-- strict artifact names, dtypes, shapes, offsets and finite-number checks;
+- bounded multipart/package sizes;
+- strict tensor names/dtypes/shapes/offsets/finite-value validation;
+- gold-token/log-normalizer evidence consistency checks;
 - temporary-file cleanup and immutable accepted storage;
-- round-specific training/checkpoint provenance;
-- a minimal deterministic Knowledge Package safety gate; and
-- a strict, local, hash-bound Qwen LoRA-probe artifact boundary for real Client
-  candidate adoption; and
-- append-only JSONL audit events.
+- pre- and post-alignment package safety reports;
+- trust-gated selection;
+- hidden D^V validation and Host rollback;
+- round/checkpoint provenance; and
+- append-only audit records.
 
-Ed25519 proves origin and integrity; it does not encrypt traffic. Compose uses
-plain HTTP on its development network. Registration, administrative and internal
-tokens are development credentials rather than production identities.
+These controls do **not** provide confidentiality by themselves. Ed25519 proves
+origin/integrity; it does not encrypt HTTP traffic or stored artifacts.
 
-The current DP report checks policy and protocol consistency. Real training is
-ordinary LoRA training, not DP-SGD, and no formal privacy accountant is claimed.
+The current DP report enforces protocol/policy consistency only. Real model
+training is ordinary LoRA training, not DP-SGD, and LegalFedLLM makes no formal
+differential-privacy claim.
+
+Knowledge/logit sharing can itself reveal information. The project should not be
+described as formally private merely because raw Client examples and Client LoRA
+weights remain local.
 
 ## Ollama boundary
 
-Ollama remains an optional serving boundary. It is not the real training runtime.
+Ollama is an optional **serving** boundary, not the federated training runtime.
+Real training uses Transformers/PEFT.
 
-```env
-CLIENT_SERVING_BACKEND=ollama
-CLIENT_OLLAMA_MODEL=qwen3:1.7b
-HOST_SERVING_BACKEND=ollama
-HOST_OLLAMA_MODEL=granite3.3:2b
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-```
+The Qwen Client can serve through local Ollama (`qwen3:1.7b`). The Granite
+compatibility profile can use `granite3.3:2b`. The pinned Mistral Nemo Host
+currently supports `mock` serving only in the LegalFedLLM profile.
 
-For Bazzite/Podman with host Ollama, use:
+Promoting a PEFT training adapter does not currently export/import it into an
+Ollama model automatically. Consequently `training_adapter_version` can advance
+while `serving_adapter_version` remains unchanged. That is a known deployment
+boundary and should not be interpreted as evidence that reverse training failed.
 
-```env
-OLLAMA_BASE_URL=http://host.containers.internal:11434
-```
+## FedMKT upstream/adaptation record
 
-LegalFedLLM trains through Transformers/PEFT. Automatic export of a promoted PEFT
-adapter into an Ollama model profile, including the Granite adapter conversion
-and import path, is future work.
-
-## Extracted FedMKT core
-
-Optional ML modules under `shared/fedmkt_core/ml/` were extracted and adapted
-from FATE-LLM commit:
+The optional machine-learning components under `shared/fedmkt_core/ml/` were
+extracted and adapted from `FederatedAI/FATE-LLM`, package
+`fate_llm.algo.fedmkt`, at commit:
 
 ```text
 0c63377e468f0f62a9bdf5fb32424688b9478553
 ```
 
-Included components cover top-k/CE generation, token alignment, vocabulary
-mapping, `DataCollatorForFedMKT`, `FedMKTTrainer` and constants. FATE Context,
-FATE communication roles, FATE-Flow and aggregation wrappers are not included.
-LegalFedLLM supplies the HTTP, security, persistence and round layers.
+LegalFedLLM retains the reviewed DTW/minimum-CE behavior while replacing FATE
+communication/orchestration with its own protocol, HTTP, persistence, and
+security layers. It also uses answer-only supervision, deterministic
+demand-driven vocabulary mapping, and operational sparse targets.
+
+See:
+
+- `shared/fedmkt_core/UPSTREAM.md`
+- `shared/fedmkt_core/PARITY.md`
+- `shared/fedmkt_core/LICENSE`
+- `THIRD_PARTY_NOTICES.md`
+
+The upstream FATE Context, Guest/Host/Arbiter channels, FATE-Flow, and parameter
+aggregation wrappers are not part of LegalFedLLM.
 
 ## Current limitations
 
-LegalFedLLM does not yet provide:
+The current repository does **not** establish:
 
-- a recorded authoritative five-epoch, full D^P/D^V heterogeneous-model round;
-- a trained and independently calibrated Qwen SafeFed-style probe artifact or a
-  recorded full-D^P real reverse-Client acceptance run;
-- DP-SGD or formal differential-privacy accounting;
-- a learned malicious-package detector;
-- HTTPS, production identity bootstrap or encrypted artifact storage;
-- automatic PEFT-to-Ollama adapter publication; or
-- a graphical application.
+- forward Client-to-Host teaching in the verified real experiment: Qwen was
+  selected on `0 / 565` forward samples;
+- a real multi-Client federated round;
+- mixed Qwen + Granite per-Client alignment identities inside one live manifest;
+- a production-calibrated malicious-Knowledge-Package detector;
+- an independently validated production SafeFed-style Qwen LoRA probe;
+- formal DP-SGD or differential-privacy accounting;
+- HTTPS/mTLS, production Client enrollment/certificate provisioning, or encrypted
+  artifact storage;
+- automatic PEFT-adapter publication into Ollama;
+- real Mistral Nemo serving through the current Host profile;
+- stable thesis measurements for end-to-end wall time, peak RAM/VRAM,
+  communication cost, and scaling across multiple real Clients; or
+- a graphical end-user application.
 
-The deterministic mock backend must remain available while these real stages are
-added.
+D^V validation is a strong held-out outcome gate, but it is not a proof against
+all targeted/backdoor behavior outside D^V coverage. Likewise, a low or accepted
+PoC trust score is not a production security certification.
 
-## Next implementation milestones
+## Next experimental work
 
-### Authoritative real Host acceptance
+The main open experimental questions are:
 
-Run the complete pinned Qwen-to-Granite round with the five-epoch Host schedule,
-exercise both promotion and forced candidate rejection, and record wall time,
-peak VRAM/RAM, communication volume, selected teachers, validation metrics and
-adapter sizes.
+1. run a real multi-Client round under the normal majority/minimum-2 quorum;
+2. measure scenarios in which an eligible Client actually wins some forward
+   DualMinCE samples, and report teacher-selection counts explicitly;
+3. independently train/calibrate the Client safety probe and evaluate malicious
+   package/adapter cases rather than relying on protocol fixtures;
+4. collect stable wall-time, RAM/VRAM, communication-volume, and adapter-size
+   measurements for thesis experiments; and
+5. decide whether automatic PEFT → serving-model publication belongs in the PoC
+   scope.
 
-### Authoritative real Client reverse acceptance
-
-Train and independently validate the Qwen-specific SafeFed-style probe, then run
-the complete 90/10 D^P path through natural promotion, forced rejection,
-no-Host-teacher and stale-parent cases. Record wall time, peak VRAM/RAM, selected
-teachers, both validation records, probe identity and adapter sizes.
-
-### Complete heterogeneous-model round
-
-Run multiple real Clients against a heterogeneous Host and measure wall time,
-peak VRAM/RAM, communication volume, selected teaching samples, validation
-behavior, adapter sizes and rollback behavior.
+These are experiment/deployment boundaries. They should not be documented as
+completed until measured in the agreed authoritative environment.
 
 ## Accurate project claim
 
-LegalFedLLM demonstrates a real, pinned Qwen Client that can learn a local LoRA
-adapter from private examples and turn its outputs over the complete frozen
-565-sample D^P into a signed, validated and transportable Knowledge Package. It
-now implements the corresponding pinned Granite Host path through exact
-alignment, selective LoRA candidate training, private D^V validation, atomic
-promotion or rejection, signed post-decision D^P publication and Coordinator
-completion. The reverse path now constructs an immutable Client-owned job,
-trains a Qwen LoRA candidate from the archived round parent, evaluates it on the
-held-out public split, applies independent quality and hash-bound SafeFed-style
-safety gates, and atomically promotes or discards it. Private examples,
-Client-native LoRA tensors, Client validation details and per-sample D^V metrics
-remain local.
+A defensible current summary is:
 
-The repository does **not** yet record an authoritative five-epoch full-round
-acceptance, a calibrated Qwen probe/full-corpus reverse-Client acceptance,
-formal differential privacy, a complete SafeFed-LLM defense or production-ready
-deployment.
+> LegalFedLLM implements a protocol-first heterogeneous federated language-model
+> proof of concept in which model-native LoRA weights and private Client examples
+> remain local while signed behavioral Knowledge Packages are exchanged over a
+> common reference dataset. A fresh real cross-machine Qwen3 1.7B → Mistral Nemo
+> → Qwen run completed package verification, SafeFed-inspired screening, DTW
+> alignment, DualMinCE selection, Host candidate training, hidden D^V promotion,
+> signed Host publication, automatic Client synchronization, and reverse Qwen
+> candidate adoption without manual recovery. In that experiment the Host
+> self-teacher won all 565 forward samples, so the measured Host validation
+> improvement cannot be attributed to Qwen-to-Host knowledge transfer; the
+> reverse path did select the Host on 508 samples.
+
+The repository is beyond a mock protocol demonstration, but it remains a
+research proof of concept rather than a production federated-learning system.
