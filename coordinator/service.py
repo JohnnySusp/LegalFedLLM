@@ -6,6 +6,7 @@ import os
 import secrets
 from datetime import timedelta
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 
 import httpx
@@ -19,7 +20,7 @@ from shared.alignment_profiles import (
     resolve_alignment_profile_id_for_pair,
     validate_alignment_pair,
 )
-from shared.crypto import Ed25519Identity, canonical_json_bytes
+from shared.crypto import Ed25519Identity, canonical_json_bytes, sha256_hex
 from shared.distillation_artifact import (
     load_host_training_artifact,
     write_host_training_artifact,
@@ -36,9 +37,11 @@ from shared.knowledge_artifact import load_package_samples
 from shared.knowledge_transport import receive_knowledge_transfer
 from shared.protocol import (
     ClientRegistrationRequest,
+    ClientRequestAuthentication,
     ClientTrustHistory,
     DistillationJob,
     DistillationResult,
+    EnrollmentTokenIssue,
     KnowledgePackage,
     KnowledgeSample,
     RegistrationRecord,
@@ -297,7 +300,7 @@ class CoordinatorService:
         data_dir: str | Path,
         host_gateway: HostGateway,
         coordinator_id: str = "legalfedllm-coordinator",
-        registration_token: str = "development-registration-token",
+        initial_enrollment_token: str | None = None,
         admin_token: str = "development-admin-token",
         maximum_clock_skew_seconds: int = 900,
         reference_dataset_path: str | Path | None = None,
@@ -311,11 +314,14 @@ class CoordinatorService:
             self.store.path("identity/private_key.pem")
         )
         self.host = host_gateway
-        self.registration_token = registration_token
         self.admin_token = admin_token
         self.maximum_clock_skew_seconds = maximum_clock_skew_seconds
         self.quorum_policy = quorum_policy
         self.now_fn = now_fn
+        self._registration_lock = RLock()
+
+        if initial_enrollment_token:
+            self._seed_enrollment_token(initial_enrollment_token)
 
         if (
             reference_dataset_path is None
@@ -388,13 +394,108 @@ class CoordinatorService:
                 self.store.delete(artifact_path)
             raise
 
-    def require_registration_token(self, value: str | None) -> None:
-        if value is None or not hmac.compare_digest(value, self.registration_token):
-            raise AuthenticationError("invalid registration token")
+    @staticmethod
+    def _enrollment_token_hash(token: str) -> str:
+        return sha256_hex(token.encode("utf-8"))
+
+    @classmethod
+    def _enrollment_token_path(cls, token: str) -> str:
+        return f"enrollment_tokens/{cls._enrollment_token_hash(token)}.json"
+
+    def _seed_enrollment_token(self, token: str) -> None:
+        value = token.strip()
+        if not value:
+            return
+        token_hash = self._enrollment_token_hash(value)
+        path = f"enrollment_tokens/{token_hash}.json"
+        if self.store.exists(path):
+            return
+        try:
+            self.store.write_json_if_absent(
+                path,
+                {
+                    "token_hash": token_hash,
+                    "issued_at": utc_text(self.now_fn()),
+                    "consumed_at": None,
+                    "consumed_by": None,
+                    "source": "environment-seed",
+                },
+            )
+        except FileExistsError:
+            pass
+
+    def issue_enrollment_token(self) -> EnrollmentTokenIssue:
+        while True:
+            token = secrets.token_urlsafe(32)
+            token_hash = self._enrollment_token_hash(token)
+            issued_at = utc_text(self.now_fn())
+            try:
+                self.store.write_json_if_absent(
+                    f"enrollment_tokens/{token_hash}.json",
+                    {
+                        "token_hash": token_hash,
+                        "issued_at": issued_at,
+                        "consumed_at": None,
+                        "consumed_by": None,
+                        "source": "admin-issued",
+                    },
+                )
+            except FileExistsError:
+                continue
+            self._audit(
+                "enrollment_token_issued",
+                {"token_hash": token_hash},
+            )
+            return EnrollmentTokenIssue(token=token, issued_at=issued_at)
 
     def require_admin_token(self, value: str | None) -> None:
         if value is None or not hmac.compare_digest(value, self.admin_token):
             raise AuthenticationError("invalid admin token")
+
+    def authenticate_client_request(
+        self,
+        authentication: ClientRequestAuthentication,
+        *,
+        method: str,
+        path: str,
+        expected_client_id: str | None = None,
+    ) -> RegistrationRecord:
+        if authentication.method != method.upper() or authentication.path != path:
+            raise AuthenticationError("Client request signature is bound to another request")
+        if (
+            expected_client_id is not None
+            and authentication.client_id != expected_client_id
+        ):
+            raise AuthenticationError("Client identity does not match the request")
+        try:
+            registration = self.get_registration(authentication.client_id)
+        except NotFoundError as exc:
+            raise AuthenticationError("Client identity is not registered") from exc
+        if not authentication.verify_signature(registration.public_key):
+            raise AuthenticationError("Client request signature is invalid")
+        created = parse_utc(authentication.timestamp)
+        skew = abs((self.now_fn() - created).total_seconds())
+        if skew > self.maximum_clock_skew_seconds:
+            raise AuthenticationError("Client request timestamp is outside the allowed skew")
+        nonce_hash = sha256_hex(authentication.nonce.encode("utf-8"))
+        nonce_path = (
+            f"client_request_nonces/{authentication.client_id}/{nonce_hash}.json"
+        )
+        try:
+            self.store.write_json_if_absent(
+                nonce_path,
+                {
+                    "client_id": authentication.client_id,
+                    "method": authentication.method,
+                    "path": authentication.path,
+                    "timestamp": authentication.timestamp,
+                    "nonce_hash": nonce_hash,
+                    "accepted_at": utc_text(self.now_fn()),
+                },
+            )
+        except FileExistsError as exc:
+            raise AuthenticationError("replayed Client request nonce") from exc
+        return registration
 
     async def service_identity(self) -> ServiceIdentity:
         host_identity = await self._host_identity()
@@ -414,23 +515,52 @@ class CoordinatorService:
         return identity
 
     def register_client(
-        self, request: ClientRegistrationRequest
+        self,
+        request: ClientRegistrationRequest,
+        enrollment_token: str | None,
     ) -> RegistrationRecord:
-        path = f"clients/{request.client_id}.json"
-        if self.store.exists(path):
-            current = RegistrationRecord.model_validate(self.store.read_json(path))
-            if (
-                current.public_key != request.public_key
-                or current.model_profile != request.model_profile
-            ):
-                raise ConflictError("Client ID is already registered with another profile")
-            return current
-        record = RegistrationRecord(
-            **request.model_dump(mode="json"), registered_at=utc_text(self.now_fn())
-        )
-        self.store.write_json(path, record.model_dump(mode="json"))
-        self._audit("client_registered", {"client_id": request.client_id})
-        return record
+        token = (enrollment_token or "").strip()
+        if not token:
+            raise AuthenticationError("invalid or consumed enrollment token")
+
+        with self._registration_lock:
+            registration_path = f"clients/{request.client_id}.json"
+            if self.store.exists(registration_path):
+                raise ConflictError("Client ID is already registered")
+
+            token_path = self._enrollment_token_path(token)
+            if not self.store.exists(token_path):
+                raise AuthenticationError("invalid or consumed enrollment token")
+            token_record = self.store.read_json(token_path)
+            if token_record.get("consumed_at") is not None:
+                raise AuthenticationError("invalid or consumed enrollment token")
+
+            registered_at = utc_text(self.now_fn())
+            record = RegistrationRecord(
+                **request.model_dump(mode="json"),
+                registered_at=registered_at,
+            )
+            consumed = {
+                **token_record,
+                "consumed_at": registered_at,
+                "consumed_by": request.client_id,
+            }
+            self.store.write_json(token_path, consumed)
+            try:
+                self.store.write_json_if_absent(
+                    registration_path,
+                    record.model_dump(mode="json"),
+                )
+            except FileExistsError as exc:
+                raise ConflictError("Client ID is already registered") from exc
+            self._audit(
+                "client_registered",
+                {
+                    "client_id": request.client_id,
+                    "enrollment_token_hash": token_record["token_hash"],
+                },
+            )
+            return record
 
     def get_registration(self, client_id: str) -> RegistrationRecord:
         path = f"clients/{client_id}.json"

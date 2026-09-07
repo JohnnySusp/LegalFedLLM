@@ -340,13 +340,25 @@ python scripts/bootstrap.py host \
   --runtime-root /scratch/legalfedllm-test
 ```
 
-Client example, using the Host-issued registration token:
+After the Host/Coordinator is running, issue one single-use Client enrollment token:
+
+```bash
+python scripts/issue_enrollment_token.py \
+  --env-file .env.host
+```
+
+Give that token to exactly one new Client, then bootstrap the Client:
 
 ```bash
 python scripts/bootstrap.py client \
   --output .env.remote-client \
-  --registration-token '<host-issued registration token>'
+  --registration-token '<single-use enrollment token>'
 ```
+
+The Client generates its own Ed25519 identity under its private runtime directory.
+Successful enrollment binds that public key to the Client record and consumes the token.
+The token is not used for later rounds. D^P downloads and accepted-submission receipt
+lookups authenticate with signed Client requests using the persisted Ed25519 identity.
 
 For controlled one-Client proof-of-concept testing only, the Host bootstrap
 supports:
@@ -606,10 +618,12 @@ If the POST acknowledgement is lost or ambiguous, the Client can query:
 GET /v1/rounds/{round_id}/submissions/{client_id}/receipt
 ```
 
-The receipt lookup is authenticated and must match the exact round, Client, and
-package hash. The Client commits only when the exact package is confirmed
-accepted. Wrong hash/client/round or an unaccepted submission fails closed and
-leaves the pending package intact.
+The receipt lookup is authenticated with the enrolled Client's Ed25519 identity and
+must match the exact round, Client, and package hash. Each protected request is
+bound to the HTTP method/path and includes a timestamp plus nonce; stale, forged,
+or replayed requests are rejected. The Client commits only when the exact package
+is confirmed accepted. Wrong hash/client/round or an unaccepted submission fails
+closed and leaves the pending package intact.
 
 This recovery path handles lost acknowledgements without turning retries into a
 second logical submission.
@@ -630,8 +644,11 @@ SSH tunnel
 ```
 
 The script uses an SSH ControlMaster so the user enters the remote password once.
-The tunnel is used for Coordinator traffic; the remote Host remains bound to
-loopback.
+After the remote Coordinator becomes healthy, the script asks it to issue one
+single-use enrollment token for the fresh local Client and passes that token only to
+the Client startup/registration path. It no longer requires a persistent shared
+registration secret in the Host environment. The tunnel is used for Coordinator
+traffic; the remote Host remains bound to loopback.
 
 The generated cleanup script stops the tmux session, Client runtime, and SSH
 ControlMaster while preserving run evidence.
@@ -736,6 +753,13 @@ python scripts/run_host_stack.py --env-file .env.host
 
 Keep that process running while the SSH tunnel and local Client are active.
 
+For a new Client, issue a one-time enrollment token from another remote shell:
+
+```bash
+source /scratch/legalfedllm-test/.venv/bin/activate
+python scripts/issue_enrollment_token.py --env-file .env.host
+```
+
 Useful health checks:
 
 ```bash
@@ -746,7 +770,8 @@ curl -fsS http://127.0.0.1:8000/health
 ## Running a split Client manually
 
 The local Client uses `compose.clients.yaml` and a role-specific environment
-file. A typical workflow is:
+file containing the one-time enrollment token for its first registration. A typical
+workflow is:
 
 ```bash
 docker compose \
@@ -787,6 +812,7 @@ Focused model-free coverage includes:
 
 ```bash
 python -m unittest -v \
+  tests.test_enrollment_auth \
   tests.test_package_safety \
   tests.test_submission_reconciliation \
   tests.test_split_round_tmux
@@ -794,6 +820,9 @@ python -m unittest -v \
 
 These tests cover, among other things:
 
+- single-use enrollment-token issuance/consumption and restart persistence;
+- signed Client request authentication, stale/forged/replay rejection;
+- persistent Client identity/enrollment without token reuse;
 - lost-after-acceptance acknowledgement reconciliation;
 - exact hash/client/round receipt matching;
 - fail-closed unconfirmed submissions;
@@ -846,7 +875,8 @@ it is not a model-quality benchmark.
 | --- | --- | --- |
 | `GET` | `/health` | Coordinator status/quorum policy |
 | `GET` | `/v1/identity` | Coordinator + Host public identity |
-| `POST` | `/v1/clients/register` | Register Client profile/public key |
+| `POST` | `/v1/enrollment-tokens` | Admin issue one single-use Client enrollment token |
+| `POST` | `/v1/clients/register` | Consume enrollment token and bind Client profile/public key |
 | `POST` | `/v1/rounds` | Create/sign a round manifest |
 | `GET` | `/v1/rounds/current` | Retrieve current manifest |
 | `GET` | `/v1/rounds/{id}/manifest` | Retrieve one manifest |
@@ -858,8 +888,10 @@ it is not a model-quality benchmark.
 | `GET` | `/v1/rounds/{id}/host-knowledge` | Download signed post-decision Host package |
 | `POST` | `/v1/generate` | Proxy Host generation |
 
-The receipt lookup requires the registration token and matching `X-Client-Id`.
-The safety-report endpoint is admin-protected.
+D^P download and receipt lookup require signed Client request authentication using
+the public key bound at enrollment. The enrollment token is accepted only by the
+registration endpoint and is consumed after successful registration. The
+safety-report and enrollment-token issuance endpoints are admin-protected.
 
 ### Client — loopback port 8001
 
@@ -907,7 +939,9 @@ candidate/validation/safety/adoption records
 Important Coordinator state includes:
 
 ```text
+hashed single-use enrollment-token records
 registered Client identities
+persisted signed-request nonce records
 signed manifests
 accepted submissions
 safety reports and trust history
@@ -927,7 +961,9 @@ Once accepted, the package/artifact/snapshot set is immutable.
 
 Implemented security controls include:
 
-- Ed25519 identities and signatures;
+- one-time admin-issued Client enrollment tokens stored only as hashes;
+- persistent Ed25519 Client identities and signatures after enrollment;
+- method/path/timestamp/nonce-bound signed Client requests with replay rejection;
 - canonical JSON hashing/signing;
 - exact artifact byte-size and SHA-256 binding;
 - registered Client public keys;
@@ -1007,8 +1043,9 @@ The current repository does **not** establish:
 - a production-calibrated malicious-Knowledge-Package detector;
 - an independently validated production SafeFed-style Qwen LoRA probe;
 - formal DP-SGD or differential-privacy accounting;
-- HTTPS/mTLS, production Client enrollment/certificate provisioning, or encrypted
-  artifact storage;
+- HTTPS/mTLS, certificate provisioning, or encrypted artifact storage; the current
+  one-time enrollment-token + Ed25519 identity flow is a PoC authentication layer,
+  not a production PKI;
 - automatic PEFT-adapter publication into Ollama;
 - real Mistral Nemo serving through the current Host profile;
 - stable thesis measurements for end-to-end wall time, peak RAM/VRAM,

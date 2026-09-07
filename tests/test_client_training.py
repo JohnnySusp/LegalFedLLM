@@ -514,7 +514,7 @@ class RoundBoundTrainingApiTests(unittest.IsolatedAsyncioTestCase):
             )
             gateway = CoordinatorGateway(
                 "http://coordinator",
-                stack.registration_token,
+                stack.issue_enrollment_token(),
                 transport=stack.coordinator_transport,
             )
             app = create_client_app(
@@ -583,7 +583,7 @@ class RoundBoundTrainingApiTests(unittest.IsolatedAsyncioTestCase):
             )
             gateway = CoordinatorGateway(
                 "http://coordinator",
-                stack.registration_token,
+                stack.issue_enrollment_token(),
                 transport=stack.coordinator_transport,
             )
             app = create_client_app(

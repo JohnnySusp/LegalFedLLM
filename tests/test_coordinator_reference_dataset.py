@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI
 
 from client.runtime import ClientRuntime, ClientRuntimeError
-from shared.protocol import RoundManifest
+from shared.protocol import ClientRequestAuthentication, RoundManifest
 from shared.reference_dataset import (
     ReferenceSample,
     load_reference_jsonl,
@@ -17,6 +17,29 @@ from shared.reference_dataset import (
     write_reference_jsonl,
 )
 from tests.test_round import Stack
+
+def client_auth_headers(
+    runtime: ClientRuntime,
+    method: str,
+    path: str,
+    *,
+    nonce: str | None = None,
+    timestamp: str | None = None,
+) -> dict[str, str]:
+    authentication = ClientRequestAuthentication.create_signed(
+        identity=runtime.identity,
+        client_id=runtime.client_id,
+        method=method,
+        path=path,
+        nonce=nonce,
+        timestamp=timestamp,
+    )
+    return {
+        "X-Client-ID": authentication.client_id,
+        "X-Client-Timestamp": authentication.timestamp,
+        "X-Client-Nonce": authentication.nonce,
+        "X-Client-Signature": authentication.signature,
+    }
 
 
 def create_dataset_files(
@@ -212,8 +235,8 @@ class CoordinatorReferenceDatasetTests(
                 validation_dataset_path=validation_path,
             )
 
-            await self.register_client(stack, "client-a")
-            await self.register_client(stack, "client-b")
+            runtime_a, _ = await self.register_client(stack, "client-a")
+            runtime_b, _ = await self.register_client(stack, "client-b")
 
             manifest = await self.create_real_round(stack)
             round_id = manifest["round_id"]
@@ -224,12 +247,11 @@ class CoordinatorReferenceDatasetTests(
             downloaded = await stack.coordinator_request(
                 "GET",
                 endpoint,
-                headers={
-                    "X-Client-ID": "client-a",
-                    "X-Registration-Token": (
-                        stack.registration_token
-                    ),
-                },
+                headers=client_auth_headers(
+                    runtime_a,
+                    "GET",
+                    endpoint,
+                ),
             )
 
             self.assertEqual(
@@ -258,12 +280,11 @@ class CoordinatorReferenceDatasetTests(
             unselected = await stack.coordinator_request(
                 "GET",
                 endpoint,
-                headers={
-                    "X-Client-ID": "client-b",
-                    "X-Registration-Token": (
-                        stack.registration_token
-                    ),
-                },
+                headers=client_auth_headers(
+                    runtime_b,
+                    "GET",
+                    endpoint,
+                ),
             )
             self.assertEqual(unselected.status_code, 403)
 

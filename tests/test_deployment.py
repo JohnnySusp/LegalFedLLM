@@ -174,6 +174,18 @@ class DeploymentFileContractTests(unittest.TestCase):
         self.assertIn("ROUND_HOST_PUBLIC_DATA_EPOCHS=5", template)
         self.assertIn("COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE=", template)
 
+    def test_split_round_issues_single_use_enrollment_token(self) -> None:
+        template = Path("config/container.env.example").read_text(encoding="utf-8")
+        runner = Path("scripts/run_split_round_tmux.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("\nREGISTRATION_TOKEN=", "\n" + template)
+        self.assertIn("scripts/issue_enrollment_token.py", runner)
+        self.assertIn("ENROLLMENT_TOKEN", runner)
+        self.assertNotIn(
+            "Host and Client REGISTRATION_TOKEN values do not match",
+            runner,
+        )
+
     def test_role_environment_templates_do_not_contain_secrets(self) -> None:
         for path in (
             Path("config/container.env.example"),

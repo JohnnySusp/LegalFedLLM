@@ -124,7 +124,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         gateway = CoordinatorGateway(
             "http://coordinator",
-            stack.registration_token,
+            stack.issue_enrollment_token(),
             transport=stack.coordinator_transport,
         )
         app = create_client_app(
@@ -140,7 +140,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         gateway_b = CoordinatorGateway(
             "http://coordinator",
-            stack.registration_token,
+            stack.issue_enrollment_token(),
             transport=stack.coordinator_transport,
         )
         app_b = create_client_app(

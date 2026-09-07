@@ -216,6 +216,7 @@ fi
 cleanup_master_on_error=true
 session_created=false
 client_started=false
+ENROLLMENT_TOKEN=""
 cleanup_on_exit() {
   rc=$?
   trap - EXIT
@@ -228,7 +229,7 @@ cleanup_on_exit() {
       if [[ -n "$HF_CACHE_VOLUME" && -f "$COMPOSE_OVERRIDE" ]]; then
         files+=(-f "$COMPOSE_OVERRIDE")
       fi
-      docker compose -p "$COMPOSE_PROJECT" --env-file "$CLIENT_ENV_ABS" "${files[@]}" --profile qwen down >/dev/null 2>&1 || true
+      REGISTRATION_TOKEN="$ENROLLMENT_TOKEN" docker compose -p "$COMPOSE_PROJECT" --env-file "$CLIENT_ENV_ABS" "${files[@]}" --profile qwen down >/dev/null 2>&1 || true
     fi
     if [[ "$cleanup_master_on_error" == true && -S "$CONTROL_SOCKET" ]]; then
       ssh -S "$CONTROL_SOCKET" -p "$SSH_PORT" -O exit "$SSH_TARGET" >/dev/null 2>&1 || true
@@ -297,42 +298,6 @@ ssh -S "$CONTROL_SOCKET" -p "$SSH_PORT" "$SSH_TARGET" \
   "$REMOTE_REPO" "$REMOTE_VENV" "$HOST_ENV" \
   "$REMOTE_HOST_DATA" "$REMOTE_COORDINATOR_DATA" "$REMOTE_STACK_LOG" \
   <<<"$remote_preflight"
-
-local_registration_hash="$($ROOT/.venv/bin/python - "$CLIENT_ENV_ABS" <<'PY'
-import hashlib
-import sys
-from pathlib import Path
-value = ""
-for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = raw.strip()
-    if line.startswith("REGISTRATION_TOKEN="):
-        value = line.split("=", 1)[1].strip()
-        break
-if not value:
-    raise SystemExit("REGISTRATION_TOKEN is missing from Client env")
-print(hashlib.sha256(value.encode()).hexdigest())
-PY
-)"
-
-remote_registration_hash="$(ssh -S "$CONTROL_SOCKET" -p "$SSH_PORT" "$SSH_TARGET" \
-  "$REMOTE_VENV/bin/python" - "$REMOTE_REPO/$HOST_ENV" <<'PY'
-import hashlib
-import sys
-from pathlib import Path
-value = ""
-for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = raw.strip()
-    if line.startswith("REGISTRATION_TOKEN="):
-        value = line.split("=", 1)[1].strip()
-        break
-if not value:
-    raise SystemExit("REGISTRATION_TOKEN is missing from Host env")
-print(hashlib.sha256(value.encode()).hexdigest())
-PY
-)"
-
-[[ "$local_registration_hash" == "$remote_registration_hash" ]] || \
-  fail "Host and Client REGISTRATION_TOKEN values do not match"
 
 mkdir -p "$RUN_DIR"
 ssh -S "$CONTROL_SOCKET" -p "$SSH_PORT" "$SSH_TARGET" \
@@ -461,8 +426,14 @@ wait_remote_health 8000 Coordinator || fail "A40 Coordinator did not become heal
 curl --connect-timeout 2 --max-time 5 -fsS http://127.0.0.1:8000/health >/dev/null || \
   fail "local SSH-forwarded Coordinator health check failed"
 
+echo "Issuing one single-use Client enrollment token on the A40 Coordinator..."
+ENROLLMENT_TOKEN="$(ssh -S "$CONTROL_SOCKET" -p "$SSH_PORT" "$SSH_TARGET" \
+  "$REMOTE_VENV/bin/python" "$REMOTE_REPO/scripts/issue_enrollment_token.py" \
+  --env-file "$REMOTE_REPO/$HOST_ENV" --token-only)"
+[[ -n "$ENROLLMENT_TOKEN" ]] || fail "Coordinator returned an empty enrollment token"
+
 echo "Starting fresh local client-1 project: $COMPOSE_PROJECT"
-docker compose \
+REGISTRATION_TOKEN="$ENROLLMENT_TOKEN" docker compose \
   -p "$COMPOSE_PROJECT" \
   --env-file "$CLIENT_ENV_ABS" \
   "${COMPOSE_FILES[@]}" \

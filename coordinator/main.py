@@ -18,6 +18,8 @@ from shared.knowledge_transport import (
 )
 from shared.protocol import (
     ClientRegistrationRequest,
+    ClientRequestAuthentication,
+    EnrollmentTokenIssue,
     KnowledgePackage,
     RegistrationRecord,
     RoundCreateRequest,
@@ -101,9 +103,8 @@ def service_from_environment() -> CoordinatorService:
             "COORDINATOR_ID",
             "legalfedllm-coordinator",
         ),
-        registration_token=os.getenv(
-            "REGISTRATION_TOKEN",
-            "development-registration-token",
+        initial_enrollment_token=(
+            os.getenv("REGISTRATION_TOKEN", "").strip() or None
         ),
         admin_token=os.getenv(
             "ADMIN_TOKEN",
@@ -177,6 +178,59 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         return await coordinator.service_identity()
 
     @app.post(
+        "/v1/enrollment-tokens",
+        response_model=EnrollmentTokenIssue,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def issue_enrollment_token(
+        x_admin_token: str | None = Header(default=None),
+    ) -> EnrollmentTokenIssue:
+        coordinator.require_admin_token(x_admin_token)
+        return coordinator.issue_enrollment_token()
+
+    def authenticate_client_request(
+        request: Request,
+        *,
+        expected_client_id: str | None,
+        x_client_id: str | None,
+        x_client_timestamp: str | None,
+        x_client_nonce: str | None,
+        x_client_signature: str | None,
+    ) -> RegistrationRecord:
+        if not all(
+            (
+                x_client_id,
+                x_client_timestamp,
+                x_client_nonce,
+                x_client_signature,
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="missing signed Client request authentication",
+            )
+        try:
+            authentication = ClientRequestAuthentication(
+                client_id=x_client_id,
+                method=request.method,
+                path=request.url.path,
+                timestamp=x_client_timestamp,
+                nonce=x_client_nonce,
+                signature=x_client_signature,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid signed Client request authentication",
+            ) from exc
+        return coordinator.authenticate_client_request(
+            authentication,
+            method=request.method,
+            path=request.url.path,
+            expected_client_id=expected_client_id,
+        )
+
+    @app.post(
         "/v1/clients/register",
         response_model=RegistrationRecord,
         status_code=status.HTTP_201_CREATED,
@@ -185,8 +239,7 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         request: ClientRegistrationRequest,
         x_registration_token: str | None = Header(default=None),
     ) -> RegistrationRecord:
-        coordinator.require_registration_token(x_registration_token)
-        return coordinator.register_client(request)
+        return coordinator.register_client(request, x_registration_token)
 
     @app.post(
         "/v1/rounds",
@@ -217,18 +270,22 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         response_model=SubmissionReceipt,
     )
     async def submission_receipt(
+        request: Request,
         round_id: str,
         client_id: str,
         x_client_id: str | None = Header(default=None),
-        x_registration_token: str | None = Header(default=None),
+        x_client_timestamp: str | None = Header(default=None),
+        x_client_nonce: str | None = Header(default=None),
+        x_client_signature: str | None = Header(default=None),
     ) -> SubmissionReceipt:
-        coordinator.require_registration_token(x_registration_token)
-        if x_client_id != client_id:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Client identity does not match the receipt request",
-            )
-        coordinator.get_registration(client_id)
+        authenticate_client_request(
+            request,
+            expected_client_id=client_id,
+            x_client_id=x_client_id,
+            x_client_timestamp=x_client_timestamp,
+            x_client_nonce=x_client_nonce,
+            x_client_signature=x_client_signature,
+        )
         return coordinator.get_submission_receipt(round_id, client_id)
 
     @app.get(
@@ -300,12 +357,20 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         "/v1/rounds/{round_id}/reference-dataset"
     )
     async def reference_dataset(
+        request: Request,
         round_id: str,
         x_client_id: str | None = Header(default=None),
-        x_registration_token: str | None = Header(default=None),
+        x_client_timestamp: str | None = Header(default=None),
+        x_client_nonce: str | None = Header(default=None),
+        x_client_signature: str | None = Header(default=None),
     ) -> Response:
-        coordinator.require_registration_token(
-            x_registration_token
+        authenticate_client_request(
+            request,
+            expected_client_id=x_client_id,
+            x_client_id=x_client_id,
+            x_client_timestamp=x_client_timestamp,
+            x_client_nonce=x_client_nonce,
+            x_client_signature=x_client_signature,
         )
 
         path = coordinator.get_reference_dataset_path(

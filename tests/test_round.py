@@ -42,7 +42,6 @@ class Stack:
     ):
         self.root = Path(root)
         self.internal_token = "test-internal"
-        self.registration_token = "test-registration"
         self.admin_token = "test-admin"
         self.client_admin_token = "test-client-admin"
 
@@ -67,7 +66,6 @@ class Stack:
         self.coordinator_service = CoordinatorService(
             data_dir=self.root / "coordinator",
             host_gateway=self.host_gateway,
-            registration_token=self.registration_token,
             admin_token=self.admin_token,
             reference_dataset_path=reference_dataset_path,
             validation_dataset_path=validation_dataset_path,
@@ -76,6 +74,9 @@ class Stack:
         )
         self.coordinator_app = create_coordinator_app(self.coordinator_service)
         self.coordinator_transport = httpx.ASGITransport(app=self.coordinator_app)
+
+    def issue_enrollment_token(self) -> str:
+        return self.coordinator_service.issue_enrollment_token().token
 
     def client(self, client_id: str):
         with mock.patch.dict(
@@ -94,7 +95,7 @@ class Stack:
         )
         gateway = CoordinatorGateway(
             "http://coordinator",
-            self.registration_token,
+            self.issue_enrollment_token(),
             transport=self.coordinator_transport,
         )
         app = create_client_app(
@@ -568,7 +569,6 @@ class ProtocolFirstRoundTests(unittest.IsolatedAsyncioTestCase):
             restarted = CoordinatorService(
                 data_dir=coordinator_root,
                 host_gateway=stack.host_gateway,
-                registration_token=stack.registration_token,
                 admin_token=stack.admin_token,
             )
             restarted_state = await restarted.round_status(round_id)

@@ -130,7 +130,8 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     client_id="client-a",
                     public_key=client_identity.public_key_b64,
                     model_profile=pinned_client_profile(QWEN_PROFILE_ID),
-                )
+                ),
+                stack.issue_enrollment_token(),
             )
 
             response = await stack.coordinator_request(
@@ -312,7 +313,6 @@ class ProtocolRuntimeTests(unittest.IsolatedAsyncioTestCase):
             restarted = CoordinatorService(
                 data_dir=Path(directory) / "coordinator",
                 host_gateway=stack.host_gateway,
-                registration_token=stack.registration_token,
                 admin_token=stack.admin_token,
                 now_fn=stack.coordinator_service.now_fn,
             )

@@ -12,11 +12,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from client.runtime import ClientRuntime, ClientRuntimeError
-from shared.crypto import canonical_json_bytes
+from shared.crypto import Ed25519Identity, canonical_json_bytes
 from shared.knowledge_transport import receive_knowledge_transfer
 from shared.ollama import OllamaError
 from shared.protocol import (
     ClientRegistrationRequest,
+    ClientRequestAuthentication,
     KnowledgePackage,
     RegistrationRecord,
     RoundManifest,
@@ -54,7 +55,7 @@ class CoordinatorGateway:
     def __init__(
         self,
         base_url: str,
-        registration_token: str,
+        registration_token: str | None,
         *,
         timeout_seconds: float = 60.0,
         reconciliation_timeout_seconds: float = 30.0,
@@ -68,11 +69,37 @@ class CoordinatorGateway:
         if reconciliation_poll_seconds <= 0:
             raise ValueError("Coordinator reconciliation poll interval must be positive")
         self.base_url = base_url.rstrip("/")
-        self.registration_token = registration_token
+        self.registration_token = (registration_token or "").strip() or None
+        self.client_id: str | None = None
+        self.client_identity: Ed25519Identity | None = None
         self.timeout_seconds = timeout_seconds
         self.reconciliation_timeout_seconds = reconciliation_timeout_seconds
         self.reconciliation_poll_seconds = reconciliation_poll_seconds
         self.transport = transport
+
+    def bind_client_identity(
+        self,
+        client_id: str,
+        identity: Ed25519Identity,
+    ) -> None:
+        self.client_id = client_id
+        self.client_identity = identity
+
+    def _client_auth_headers(self, method: str, path: str) -> dict[str, str]:
+        if self.client_id is None or self.client_identity is None:
+            raise RuntimeError("Coordinator gateway is not bound to a Client identity")
+        authentication = ClientRequestAuthentication.create_signed(
+            identity=self.client_identity,
+            client_id=self.client_id,
+            method=method,
+            path=path,
+        )
+        return {
+            "X-Client-ID": authentication.client_id,
+            "X-Client-Timestamp": authentication.timestamp,
+            "X-Client-Nonce": authentication.nonce,
+            "X-Client-Signature": authentication.signature,
+        }
 
     async def _request(
         self,
@@ -99,13 +126,20 @@ class CoordinatorGateway:
         return ServiceIdentity.model_validate(await self._request("GET", "/v1/identity"))
 
     async def register(self, request: ClientRegistrationRequest) -> RegistrationRecord:
+        if self.registration_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Client enrollment token is not configured",
+            )
         payload = await self._request(
             "POST",
             "/v1/clients/register",
             json=request.model_dump(mode="json"),
             headers={"X-Registration-Token": self.registration_token},
         )
-        return RegistrationRecord.model_validate(payload)
+        record = RegistrationRecord.model_validate(payload)
+        self.registration_token = None
+        return record
 
     async def current_manifest(self) -> RoundManifest:
         return RoundManifest.model_validate(
@@ -130,14 +164,12 @@ class CoordinatorGateway:
             timeout=self.timeout_seconds,
             transport=self.transport,
         ) as client:
+            path = f"/v1/rounds/{round_id}/reference-dataset"
+            if self.client_id != client_id:
+                raise RuntimeError("Coordinator gateway is bound to another Client ID")
             response = await client.get(
-                f"/v1/rounds/{round_id}/reference-dataset",
-                headers={
-                    "X-Client-ID": client_id,
-                    "X-Registration-Token": (
-                        self.registration_token
-                    ),
-                },
+                path,
+                headers=self._client_auth_headers("GET", path),
             )
 
         if response.status_code == 204:
@@ -213,15 +245,13 @@ class CoordinatorGateway:
             ),
             transport=self.transport,
         ) as client:
+            path = (
+                f"/v1/rounds/{package.round_id}/submissions/"
+                f"{package.sender_id}/receipt"
+            )
             response = await client.get(
-                (
-                    f"/v1/rounds/{package.round_id}/submissions/"
-                    f"{package.sender_id}/receipt"
-                ),
-                headers={
-                    "X-Client-ID": package.sender_id,
-                    "X-Registration-Token": self.registration_token,
-                },
+                path,
+                headers=self._client_auth_headers("GET", path),
             )
 
         if response.status_code == 404:
@@ -335,7 +365,7 @@ def runtime_from_environment() -> ClientRuntime:
 def gateway_from_environment() -> CoordinatorGateway:
     return CoordinatorGateway(
         os.getenv("COORDINATOR_URL", "http://coordinator:8000"),
-        os.getenv("REGISTRATION_TOKEN", "development-registration-token"),
+        os.getenv("REGISTRATION_TOKEN", "").strip() or None,
         timeout_seconds=float(os.getenv("COORDINATOR_TIMEOUT_SECONDS", "60")),
         reconciliation_timeout_seconds=float(
             os.getenv("COORDINATOR_RECONCILIATION_TIMEOUT_SECONDS", "30")
@@ -362,6 +392,10 @@ def create_app(
     app = FastAPI(title="LegalFedLLM Client Agent", version="0.2.0")
     app.state.runtime = client_runtime
     app.state.gateway = coordinator
+    coordinator.bind_client_identity(
+        client_runtime.client_id,
+        client_runtime.identity,
+    )
     app.state.ml_lock = asyncio.Lock()
     app.state.training_lock = app.state.ml_lock
 
@@ -395,6 +429,7 @@ def create_app(
             "client_id": client_runtime.client_id,
             "training_backend": client_runtime.model_profile.training_backend,
             "serving_backend": client_runtime.model_profile.serving_backend,
+            "enrolled": client_runtime.registration_record() is not None,
             **state,
         }
 
@@ -405,13 +440,18 @@ def create_app(
         dependencies=[Depends(require_client_admin_token)],
     )
     async def register() -> RegistrationRecord:
-        return await coordinator.register(
+        current = client_runtime.registration_record()
+        if current is not None:
+            return current
+        record = await coordinator.register(
             ClientRegistrationRequest(
                 client_id=client_runtime.client_id,
                 public_key=client_runtime.identity.public_key_b64,
                 model_profile=client_runtime.model_profile,
             )
         )
+        client_runtime.commit_registration(record)
+        return record
 
     @app.post(
         "/v1/local-train",

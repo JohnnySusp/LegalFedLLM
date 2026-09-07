@@ -72,7 +72,8 @@ class MixedClientAlignmentContractTests(unittest.IsolatedAsyncioTestCase):
                     client_id=client_id,
                     public_key=identities[client_id].public_key_b64,
                     model_profile=profiles[client_id],
-                )
+                ),
+                stack.issue_enrollment_token(),
             )
         return identities, profiles
 

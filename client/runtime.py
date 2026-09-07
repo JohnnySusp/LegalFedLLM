@@ -50,6 +50,7 @@ from shared.protocol import (
     KnowledgeSample,
     LoraProfile,
     ModelProfile,
+    RegistrationRecord,
     OllamaProfile,
     RoundManifest,
     SubmissionReceipt,
@@ -245,6 +246,43 @@ class ClientRuntime:
                 self.store.write_json("state.json", state)
             return
         self.store.write_json("state.json", defaults)
+
+    @staticmethod
+    def _registration_path() -> str:
+        return "identity/registration.json"
+
+    def registration_record(self) -> RegistrationRecord | None:
+        path = self._registration_path()
+        if not self.store.exists(path):
+            return None
+        record = RegistrationRecord.model_validate(self.store.read_json(path))
+        if (
+            record.client_id != self.client_id
+            or record.public_key != self.identity.public_key_b64
+            or record.model_profile != self.model_profile
+        ):
+            raise ClientRuntimeError(
+                "persisted Client registration does not match the active identity/profile"
+            )
+        return record
+
+    def commit_registration(self, record: RegistrationRecord) -> None:
+        if (
+            record.client_id != self.client_id
+            or record.public_key != self.identity.public_key_b64
+            or record.model_profile != self.model_profile
+        ):
+            raise ClientRuntimeError(
+                "Coordinator registration does not match the active Client identity/profile"
+            )
+        current = self.registration_record()
+        if current is not None and current != record:
+            raise ClientRuntimeError("persisted Client registration is immutable")
+        if current is None:
+            self.store.write_json_if_absent(
+                self._registration_path(),
+                record.model_dump(mode="json"),
+            )
 
     def state(self) -> dict[str, Any]:
         return self.store.read_json("state.json")

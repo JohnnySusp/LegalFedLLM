@@ -16,7 +16,6 @@ class EnvironmentBootstrapTests(unittest.TestCase):
         if role == "host":
             content = """LEGALFEDLLM_BOOTSTRAP_ROLE=host
 ADMIN_TOKEN=
-REGISTRATION_TOKEN=
 INTERNAL_API_TOKEN=
 HOST_DATA_DIR=/tmp/host
 """
@@ -59,7 +58,7 @@ GRANITE_CLIENT_ADMIN_TOKEN=placeholder-granite-client-admin-token
             self.assertTrue(first.created)
             self.assertFalse(second.created)
             self.assertEqual(env_path.read_bytes(), first_bytes)
-            for name in ("ADMIN_TOKEN", "REGISTRATION_TOKEN", "INTERNAL_API_TOKEN"):
+            for name in ("ADMIN_TOKEN", "INTERNAL_API_TOKEN"):
                 self.assertGreaterEqual(len(first.values[name]), 32)
                 self.assertNotIn("placeholder-", first.values[name])
             if os.name == "posix":
@@ -99,7 +98,6 @@ GRANITE_CLIENT_ADMIN_TOKEN=placeholder-granite-client-admin-token
             env_path.write_text(
                 "LEGALFEDLLM_BOOTSTRAP_ROLE=host\n"
                 "ADMIN_TOKEN=host-admin\n"
-                "REGISTRATION_TOKEN=host-registration\n"
                 "INTERNAL_API_TOKEN=host-internal\n",
                 encoding="utf-8",
             )

@@ -56,7 +56,7 @@ def validate_environment() -> dict[str, object]:
     if os.getenv("HOST_SERVING_BACKEND", "").strip() != "mock":
         raise ValueError("the pinned Nemo Host requires mock serving")
 
-    for name in ("ADMIN_TOKEN", "REGISTRATION_TOKEN", "INTERNAL_API_TOKEN"):
+    for name in ("ADMIN_TOKEN", "INTERNAL_API_TOKEN"):
         _required_secret(name)
 
     if os.getenv("COORDINATOR_QUORUM_POLICY", "").strip() != "majority":

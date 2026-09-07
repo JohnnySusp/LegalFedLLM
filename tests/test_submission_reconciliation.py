@@ -186,9 +186,9 @@ class SubmissionReconciliationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mismatch.exception.status_code, 409)
 
             wrong_client = package.model_copy(update={"sender_id": "client-b"})
-            self.assertIsNone(
+            with self.assertRaises(HTTPException) as wrong_identity:
                 await app.state.gateway.accepted_submission_receipt(wrong_client)
-            )
+            self.assertEqual(wrong_identity.exception.status_code, 401)
 
             wrong_round = package.model_copy(update={"round_id": "round-999999"})
             self.assertIsNone(

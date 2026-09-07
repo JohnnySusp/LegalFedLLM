@@ -732,6 +732,61 @@ class KnowledgePackage(ContractModel):
         return cls(**signed_payload, signature=identity.sign_json(signed_payload))
 
 
+class EnrollmentTokenIssue(ContractModel):
+    token: str = Field(min_length=32, max_length=512)
+    issued_at: str
+
+    @field_validator("issued_at")
+    @classmethod
+    def validate_issued_at(cls, value: str) -> str:
+        parse_utc(value)
+        return value
+
+
+class ClientRequestAuthentication(ContractModel):
+    client_id: str = Field(min_length=1, max_length=128)
+    method: str = Field(min_length=1, max_length=16)
+    path: str = Field(min_length=1, max_length=2048)
+    timestamp: str
+    nonce: str = Field(min_length=16, max_length=256)
+    signature: str = Field(pattern=BASE64_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "ClientRequestAuthentication":
+        if self.method != self.method.upper():
+            raise ValueError("authenticated request method must be uppercase")
+        if not self.path.startswith("/"):
+            raise ValueError("authenticated request path must be absolute")
+        parse_utc(self.timestamp)
+        return self
+
+    def signed_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude={"signature"})
+
+    def verify_signature(self, public_key_b64: str) -> bool:
+        return verify_json(public_key_b64, self.signed_payload(), self.signature)
+
+    @classmethod
+    def create_signed(
+        cls,
+        *,
+        identity: Ed25519Identity,
+        client_id: str,
+        method: str,
+        path: str,
+        timestamp: str | None = None,
+        nonce: str | None = None,
+    ) -> "ClientRequestAuthentication":
+        payload = {
+            "client_id": client_id,
+            "method": method.upper(),
+            "path": path,
+            "timestamp": timestamp or utc_text(),
+            "nonce": nonce or secrets.token_urlsafe(24),
+        }
+        return cls(**payload, signature=identity.sign_json(payload))
+
+
 class ClientRegistrationRequest(ContractModel):
     client_id: str = Field(min_length=1, max_length=128)
     public_key: str = Field(pattern=BASE64_PATTERN)

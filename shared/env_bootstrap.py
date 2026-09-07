@@ -24,7 +24,6 @@ _ROLE_GENERATED_SECRETS = {
     ),
     "host": (
         "ADMIN_TOKEN",
-        "REGISTRATION_TOKEN",
         "INTERNAL_API_TOKEN",
     ),
     "client": (

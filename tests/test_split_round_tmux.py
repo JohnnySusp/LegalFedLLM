@@ -95,6 +95,16 @@ class SplitRoundTmuxScriptTests(unittest.TestCase):
         self.assertIn('A40 stack tmux session exited while waiting for $label health.', source)
         self.assertIn("tail -n 120 '$REMOTE_STACK_LOG'", source)
 
+    def test_split_round_uses_coordinator_issued_enrollment_token(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("scripts/issue_enrollment_token.py", source)
+        self.assertIn('ENROLLMENT_TOKEN="$(ssh', source)
+        self.assertIn('REGISTRATION_TOKEN="$ENROLLMENT_TOKEN" docker compose', source)
+        self.assertNotIn(
+            "Host and Client REGISTRATION_TOKEN values do not match",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
