@@ -105,7 +105,7 @@ class ModelProfile(ContractModel):
     tokenizer_class: str = Field(min_length=1, max_length=256)
     vocabulary_size: int | None = Field(default=None, ge=1)
     training_backend: Literal["mock", "transformers"] = "mock"
-    serving_backend: Literal["mock", "ollama"] = "mock"
+    serving_backend: Literal["mock", "ollama", "transformers"] = "mock"
     prompt_template_id: str = Field(
         default="chapter-section-question-v1",
         min_length=1,

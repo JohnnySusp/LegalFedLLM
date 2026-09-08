@@ -38,3 +38,14 @@ Public License v3.0 or an Artifex commercial license.
 
 PyMuPDF is not part of the LegalFedLLM runtime dependency set. It is used
 only by optional, source-specific offline dataset-preparation utilities.
+
+## Optional desktop application and packaging
+
+The desktop Client uses PySide6/Qt for Python. PySide6 is distributed under the
+LGPLv3/GPLv3/commercial Qt licensing options; release builders must preserve the
+applicable Qt/PySide notices and license terms.
+
+PyInstaller is used as a build-time bundler for per-platform portable binaries.
+It is not a cross-compiler, so Windows and Linux release artifacts are produced
+on their respective operating systems. Consult the PyInstaller distribution for
+its GPL-with-exception licensing terms and bundled bootloader notices.

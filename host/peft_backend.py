@@ -16,7 +16,7 @@ from host.training import (
     PinnedHostTrainingContract,
     HostTrainingExecutionProfile,
 )
-from shared.answer_only import AnswerOnlyCollator
+from shared.answer_only import AnswerOnlyCollator, encode_chat_prompt
 from shared.adapter_checkpoint import (
     AdapterCheckpointMetadata,
     AdapterCheckpointStore,
@@ -1212,6 +1212,70 @@ class TransformersPeftHostBackend:
             raise ValueError("promoted Host adapter has no round binding")
         if metadata.execution_profile_hash != self.execution_profile.profile_hash():
             raise ValueError("promoted Host adapter uses another execution profile")
+
+    def generate_text(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+    ) -> str:
+        torch, transformers, peft, _ = self._dependencies()
+        self._validate_device(torch)
+        validated_tokenizer = load_pinned_tokenizer(
+            self.tokenizer_endpoint,
+            cache_dir=os.getenv("HF_HOME"),
+            token=os.getenv("HF_TOKEN") or None,
+        )
+        tokenizer = validated_tokenizer.tokenizer
+        prompt_ids = encode_chat_prompt(
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            messages=messages,
+        )
+        if not prompt_ids:
+            raise RuntimeError("chat template produced an empty prompt")
+
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            current = self.checkpoints.current()
+            if current is None:
+                raise RuntimeError("current Host PEFT adapter checkpoint is missing")
+            _, checkpoint_path = current
+            model = peft.PeftModel.from_pretrained(
+                base_model,
+                checkpoint_path,
+                is_trainable=False,
+            )
+            self._verify_loaded_adapter(model)
+            for parameter in model.parameters():
+                parameter.requires_grad = False
+            model.eval()
+            input_ids = torch.tensor(
+                [prompt_ids],
+                dtype=torch.long,
+                device=self.execution_profile.device,
+            )
+            attention_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            generated = output[0, input_ids.shape[1] :].tolist()
+            return tokenizer.decode(
+                generated,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+        finally:
+            del model, base_model
+            self._release_memory(torch)
 
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any, Any]:

@@ -89,6 +89,37 @@ def encode_answer_only_example(
     )
 
 
+def encode_chat_prompt(
+    *,
+    tokenizer: Any,
+    model_profile: ModelProfile,
+    messages: list[dict[str, str]],
+) -> list[int]:
+    if not messages:
+        raise ValueError("chat generation requires at least one message")
+    normalized: list[dict[str, str]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"system", "user", "assistant"}:
+            raise ValueError(f"unsupported chat role: {role!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("chat message content must not be blank")
+        normalized.append({"role": role, "content": content})
+
+    template_options: dict[str, Any] = {}
+    if model_profile.chat_template_mode == "qwen_non_thinking":
+        template_options["enable_thinking"] = False
+    return _input_ids(
+        tokenizer.apply_chat_template(
+            normalized,
+            tokenize=True,
+            add_generation_prompt=True,
+            **template_options,
+        )
+    )
+
+
 class AnswerOnlyCollator:
     def __init__(self, torch: Any, pad_token_id: int):
         self.torch = torch

@@ -30,13 +30,13 @@ from client.training import (
     load_private_examples,
     private_dataset_semantic_hash,
 )
-from host.model_profiles import pinned_host_profile
+from host.model_profiles import MISTRAL_NEMO_HOST_PROFILE_ID, pinned_host_profile
 from host.runtime import default_host_profile
-from shared.alignment_profiles import POC_DTW_PROFILE_ID
+from shared.alignment_profiles import MISTRAL_NEMO_DTW_PROFILE_ID, POC_DTW_PROFILE_ID
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.prompt import PROMPT_TEMPLATE, PROMPT_TEMPLATE_ID
 from shared.protocol import LoraProfile, ModelProfile, RoundCreateRequest, RoundManifest
-from shared.protocol import utc_now, utc_text
+from shared.protocol import parse_utc, utc_now, utc_text
 from tests.test_round import Stack
 
 
@@ -159,6 +159,233 @@ class ClientModelProfileTests(unittest.TestCase):
         values["model_revision"] = "main"
         with self.assertRaises(ValidationError):
             ModelProfile.model_validate(values)
+
+
+class AlignmentTokenizerPreflightTests(unittest.TestCase):
+    def _manifest(self, directory: str, profile: ModelProfile) -> RoundManifest:
+        identity = Ed25519Identity.load_or_create(Path(directory) / "coordinator.pem")
+        request = RoundCreateRequest(
+            selected_client_ids=["client-a"],
+            trusted_client_quorum=1,
+            reference_dataset_id="reference-v1",
+            reference_dataset_hash=sha256_hex(b"reference-v1"),
+            sample_ids=["sample-1"],
+            prompt_template=PROMPT_TEMPLATE,
+            label_format="chat_sft_answer_only_v1",
+            maximum_sequence_length=512,
+            truncation_policy="reject",
+            top_k=3,
+            training_epochs=1,
+        )
+        host_profile = pinned_host_profile(
+            MISTRAL_NEMO_HOST_PROFILE_ID,
+            serving_backend="transformers",
+        )
+        return RoundManifest.create_signed(
+            identity=identity,
+            round_id="round-tokenizer-preflight",
+            coordinator_id="coordinator",
+            current_host_adapter_version=0,
+            host_model_profile=host_profile,
+            selected_client_profile_hashes={"client-a": profile.profile_hash()},
+            selected_client_alignment_profiles={
+                "client-a": MISTRAL_NEMO_DTW_PROFILE_ID
+            },
+            request=request,
+            submission_deadline=utc_text(utc_now() + timedelta(hours=1)),
+        )
+
+    def test_preflight_uses_cache_first_and_downloads_only_missing_pinned_tokenizer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pinned_client_profile(
+                QWEN_PROFILE_ID,
+                serving_backend="transformers",
+            )
+            runtime = ClientRuntime(
+                data_dir=Path(directory) / "client",
+                client_id="client-a",
+                model_profile=profile,
+                private_data_path=Path(directory) / "private" / "train.jsonl",
+            )
+            manifest = self._manifest(directory, profile)
+            calls: list[tuple[str, bool]] = []
+
+            def fake_load(endpoint, **kwargs):
+                local_only = bool(kwargs["local_files_only"])
+                calls.append((endpoint.tokenizer_id, local_only))
+                if endpoint.role == "host" and local_only:
+                    raise OSError("not cached")
+                return mock.Mock(endpoint=endpoint, tokenizer=mock.Mock())
+
+            with mock.patch("client.runtime.load_pinned_tokenizer", side_effect=fake_load):
+                tokenizers = runtime.ensure_alignment_tokenizers(manifest)
+
+            self.assertIsNotNone(tokenizers)
+            self.assertEqual(
+                calls,
+                [
+                    ("Qwen/Qwen3-1.7B", True),
+                    ("mistralai/Mistral-Nemo-Instruct-2407", True),
+                    ("mistralai/Mistral-Nemo-Instruct-2407", False),
+                ],
+            )
+
+    def test_preflight_fails_explicitly_when_missing_tokenizer_cannot_be_downloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pinned_client_profile(
+                QWEN_PROFILE_ID,
+                serving_backend="transformers",
+            )
+            runtime = ClientRuntime(
+                data_dir=Path(directory) / "client",
+                client_id="client-a",
+                model_profile=profile,
+                private_data_path=Path(directory) / "private" / "train.jsonl",
+            )
+            manifest = self._manifest(directory, profile)
+
+            def fake_load(endpoint, **kwargs):
+                if endpoint.role == "client":
+                    return mock.Mock(endpoint=endpoint, tokenizer=mock.Mock())
+                raise OSError("offline")
+
+            with mock.patch("client.runtime.load_pinned_tokenizer", side_effect=fake_load):
+                with self.assertRaisesRegex(
+                    ClientRuntimeError,
+                    "required pinned alignment tokenizer.*Mistral-Nemo-Instruct-2407",
+                ):
+                    runtime.ensure_alignment_tokenizers(manifest)
+
+
+
+class HostKnowledgeFreshnessTests(unittest.IsolatedAsyncioTestCase):
+    async def _completed_round(self, directory: str):
+        stack = Stack(directory)
+        runtime, app = stack.client("client-a")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://client",
+            headers=stack.client_headers,
+        ) as client:
+            registered = await client.post("/v1/register")
+            self.assertEqual(registered.status_code, 201, registered.text)
+
+            created = await stack.coordinator_request(
+                "POST",
+                "/v1/rounds",
+                headers={"X-Admin-Token": stack.admin_token},
+                json={
+                    "selected_client_ids": ["client-a"],
+                    "trusted_client_quorum": 1,
+                    "reference_dataset_id": "legal-reference-v1",
+                    "reference_dataset_hash": sha256_hex(b"legal-reference-v1"),
+                    "sample_ids": ["contract-001"],
+                    "prompt_template": "Question: {question}\nAnswer: {answer}",
+                },
+            )
+            self.assertEqual(created.status_code, 201, created.text)
+            round_id = created.json()["round_id"]
+
+            participated = await client.post("/v1/participate")
+            self.assertEqual(participated.status_code, 201, participated.text)
+
+        package_path = (
+            Path(directory)
+            / "coordinator"
+            / "rounds"
+            / round_id
+            / "host_knowledge"
+            / "package.json"
+        )
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        created_at = parse_utc(package["created_at"])
+        return stack, runtime, app, round_id, created_at
+
+    async def test_verified_preview_remains_usable_after_freshness_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack, runtime, app, round_id, created_at = await self._completed_round(
+                directory
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                runtime.now_fn = lambda: created_at + timedelta(minutes=14)
+                preview = await client.post(
+                    f"/v1/rounds/{round_id}/host-preview"
+                )
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertTrue(preview.json()["requires_consent"])
+
+                runtime.now_fn = lambda: created_at + timedelta(minutes=16)
+                decision = mock.Mock(
+                    adapter_promoted=False,
+                    candidate_result_hash="0" * 64,
+                    decision_hash="1" * 64,
+                    decision_reason="quality_gate_failed",
+                )
+                with (
+                    mock.patch(
+                        "client.runtime.load_client_reverse_training_artifact"
+                    ),
+                    mock.patch.object(
+                        runtime,
+                        "_complete_reverse_distillation",
+                        return_value=decision,
+                    ),
+                ):
+                    resumed_preview = await client.post(
+                        f"/v1/rounds/{round_id}/host-preview"
+                    )
+                    self.assertEqual(
+                        resumed_preview.status_code,
+                        200,
+                        resumed_preview.text,
+                    )
+                    self.assertEqual(
+                        resumed_preview.json()["reverse_job_hash"],
+                        preview.json()["reverse_job_hash"],
+                    )
+                    consent = await client.post(
+                        f"/v1/rounds/{round_id}/host-consent",
+                        json={"consent": True},
+                    )
+
+            self.assertEqual(consent.status_code, 200, consent.text)
+            self.assertEqual(
+                consent.json()["last_completed_round"],
+                round_id,
+            )
+            self.assertEqual(
+                consent.json()["last_reverse_consent"],
+                "accepted",
+            )
+
+    async def test_first_preview_still_rejects_a_stale_host_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stack, runtime, app, round_id, created_at = await self._completed_round(
+                directory
+            )
+            runtime.now_fn = lambda: created_at + timedelta(minutes=16)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://client",
+                headers=stack.client_headers,
+            ) as client:
+                preview = await client.post(
+                    f"/v1/rounds/{round_id}/host-preview"
+                )
+
+            self.assertEqual(preview.status_code, 409, preview.text)
+            self.assertIn("outside the allowed skew", preview.text)
+            self.assertFalse(
+                runtime.store.exists(runtime._reverse_job_path(round_id))
+            )
+            self.assertFalse(
+                runtime.store.exists(runtime._host_package_path(round_id))
+            )
+
 
 
 class PrivateTrainingContractTests(unittest.TestCase):
@@ -302,6 +529,43 @@ class PrivateTrainingContractTests(unittest.TestCase):
             self.assertIsNone(loaded.training_loss)
 
 
+class FreshLoraInitializationTests(unittest.TestCase):
+    def test_fresh_lora_parent_must_have_zero_effective_b_tensors(self) -> None:
+        import safetensors
+        import torch
+        from safetensors.torch import save_file
+
+        from client.peft_backend import TransformersPeftTrainingBackend
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "adapter"
+            path.mkdir()
+            tensor_path = path / "adapter_model.safetensors"
+            save_file(
+                {
+                    "layer.q_proj.lora_A.default.weight": torch.ones((2, 2)),
+                    "layer.q_proj.lora_B.default.weight": torch.zeros((2, 2)),
+                },
+                tensor_path,
+            )
+            TransformersPeftTrainingBackend._assert_initial_lora_is_noop(
+                torch, safetensors, path
+            )
+
+            save_file(
+                {
+                    "layer.q_proj.lora_A.default.weight": torch.ones((2, 2)),
+                    "layer.q_proj.lora_B.default.weight": torch.ones((2, 2)),
+                },
+                tensor_path,
+            )
+            with self.assertRaisesRegex(RuntimeError, "changes the base model"):
+                TransformersPeftTrainingBackend._assert_initial_lora_is_noop(
+                    torch, safetensors, path
+                )
+
+
 class AdapterCheckpointStoreTests(unittest.TestCase):
     @staticmethod
     def write_adapter(path: Path, payload: bytes) -> None:
@@ -375,6 +639,42 @@ class AdapterCheckpointStoreTests(unittest.TestCase):
             (path / "adapter_model.safetensors").write_bytes(b"tampered")
             with self.assertRaisesRegex(ValueError, "hash"):
                 store.current()
+
+    def test_base_parent_candidate_requires_bound_base_hash_for_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pinned_client_profile(QWEN_PROFILE_ID)
+            store = AdapterCheckpointStore(directory, profile)
+            base_hash = "a" * 64
+            staging = store.staging_path("base-child")
+            self.write_adapter(staging, b"candidate-from-base")
+            metadata = store.seal(
+                staging,
+                version=1,
+                parent=None,
+                base_parent_hash=base_hash,
+                round_id="round-base",
+                manifest_hash="b" * 64,
+                execution_profile_hash="c" * 64,
+            )
+            self.assertEqual(metadata.parent_state_kind, "base")
+            store.store_candidate(staging, metadata)
+
+            with self.assertRaisesRegex(ValueError, "base parent state"):
+                store.promote_candidate(
+                    "round-base",
+                    1,
+                    metadata.checkpoint_hash,
+                )
+
+            promoted, _ = store.promote_candidate(
+                "round-base",
+                1,
+                metadata.checkpoint_hash,
+                expected_base_parent_hash=base_hash,
+            )
+            self.assertEqual(promoted.version, 1)
+            self.assertEqual(promoted.parent_state_kind, "base")
+            self.assertEqual(store.current()[0].checkpoint_hash, metadata.checkpoint_hash)
 
     def test_failed_candidate_is_discarded_without_moving_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -501,6 +801,45 @@ class RoundBoundTrainingTests(unittest.TestCase):
             self.assertEqual(runtime.state(), state_before)
             self.assertFalse(
                 runtime.store.exists(runtime._local_training_record_path("failed-round"))
+            )
+
+    def test_first_real_training_failure_keeps_client_base_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private_path = root / "private.jsonl"
+            private_path.write_text(
+                '{"schema_version":"1.0","example_id":"private-1",'
+                '"prompt":"question","answer":"answer"}\n',
+                encoding="utf-8",
+            )
+            profile = pinned_client_profile(QWEN_PROFILE_ID)
+            runtime = ClientRuntime(
+                data_dir=root / "client",
+                client_id="client-a",
+                model_profile=profile,
+                private_data_path=private_path,
+            )
+            manifest = manifest_for(directory, profile, round_id="first-failure")
+            state_before = runtime.state()
+            expected_base_hash = sha256_hex(state_before)
+
+            with mock.patch(
+                "client.peft_backend.TransformersPeftTrainingBackend.train",
+                side_effect=RuntimeError("injected first-training failure"),
+            ) as train:
+                with self.assertRaisesRegex(RuntimeError, "first-training"):
+                    runtime.local_train_round(manifest)
+
+            self.assertEqual(
+                train.call_args.kwargs["base_parent_hash"],
+                expected_base_hash,
+            )
+            self.assertIsNone(runtime.adapter_store.current())
+            self.assertEqual(runtime.state(), state_before)
+            self.assertFalse(
+                runtime.store.exists(
+                    runtime._local_training_record_path("first-failure")
+                )
             )
 
 

@@ -62,7 +62,7 @@ class HostModelProfileTests(unittest.TestCase):
             pinned_host_profile(serving_backend="ollama").profile_hash(),
         )
 
-    def test_mistral_nemo_profile_is_exact_and_mock_served(self) -> None:
+    def test_mistral_nemo_profile_is_exact_and_supports_transformers_serving(self) -> None:
         profile = pinned_host_profile(MISTRAL_NEMO_HOST_PROFILE_ID)
 
         self.assertEqual(profile.model_id, "mistralai/Mistral-Nemo-Instruct-2407")
@@ -77,7 +77,14 @@ class HostModelProfileTests(unittest.TestCase):
             profile.lora.target_modules,
             ("q_proj", "k_proj", "v_proj", "o_proj"),
         )
-        with self.assertRaisesRegex(ValueError, "mock serving only"):
+        self.assertEqual(
+            pinned_host_profile(
+                MISTRAL_NEMO_HOST_PROFILE_ID,
+                serving_backend="transformers",
+            ).serving_backend,
+            "transformers",
+        )
+        with self.assertRaisesRegex(ValueError, "mock or transformers serving"):
             pinned_host_profile(
                 MISTRAL_NEMO_HOST_PROFILE_ID,
                 serving_backend="ollama",

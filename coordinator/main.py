@@ -8,6 +8,11 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from coordinator.inference_queue import (
+    HostInferenceQueue,
+    HostInferenceQueueFull,
+    HostInferenceQueueTimeout,
+)
 from coordinator.quorum import TrustedClientQuorumPolicy
 from coordinator.service import CoordinatorError, CoordinatorService, HostGateway
 from shared.knowledge_transport import (
@@ -122,6 +127,11 @@ def service_from_environment() -> CoordinatorService:
 def create_app(service: CoordinatorService | None = None) -> FastAPI:
     coordinator = service or service_from_environment()
     monitor_interval = float(os.getenv("ROUND_MONITOR_INTERVAL_SECONDS", "2"))
+    inference_queue = HostInferenceQueue(
+        coordinator.host.generate,
+        maximum_queued=int(os.getenv("HOST_INFERENCE_QUEUE_MAXIMUM", "4")),
+        timeout_seconds=float(os.getenv("HOST_INFERENCE_QUEUE_TIMEOUT_SECONDS", "60")),
+    )
 
     async def monitor_rounds() -> None:
         while True:
@@ -140,6 +150,7 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            await inference_queue.close()
 
     app = FastAPI(
         title="LegalFedLLM Federated Coordinator",
@@ -147,6 +158,7 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.service = coordinator
+    app.state.inference_queue = inference_queue
 
     @app.exception_handler(CoordinatorError)
     async def coordinator_error_handler(
@@ -159,9 +171,12 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         policy = coordinator.quorum_policy
+        queue_status = inference_queue.status()
         return {
             "status": "ok",
             "service": "legalfedllm-coordinator",
+            "host_inference_queued": str(queue_status["queued"]),
+            "host_inference_running": str(queue_status["running"]).lower(),
             "quorum_policy": "majority" if policy is not None else "explicit",
             "minimum_trusted_client_quorum": (
                 str(policy.minimum) if policy is not None else "request"
@@ -350,8 +365,34 @@ def create_app(service: CoordinatorService | None = None) -> FastAPI:
         )
 
     @app.post("/v1/generate")
-    async def generate(request: GenerateRequest) -> dict:
-        return await coordinator.host.generate(request.prompt, request.max_new_tokens)
+    async def generate(
+        body: GenerateRequest,
+        request: Request,
+        x_client_id: str | None = Header(default=None),
+        x_client_timestamp: str | None = Header(default=None),
+        x_client_nonce: str | None = Header(default=None),
+        x_client_signature: str | None = Header(default=None),
+    ) -> dict:
+        authenticate_client_request(
+            request,
+            expected_client_id=x_client_id,
+            x_client_id=x_client_id,
+            x_client_timestamp=x_client_timestamp,
+            x_client_nonce=x_client_nonce,
+            x_client_signature=x_client_signature,
+        )
+        try:
+            return await inference_queue.submit(
+                body.prompt,
+                body.max_new_tokens,
+            )
+        except HostInferenceQueueFull as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        except HostInferenceQueueTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
 
     @app.get(
         "/v1/rounds/{round_id}/reference-dataset"

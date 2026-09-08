@@ -254,8 +254,19 @@ def create_app(
 
     @app.post("/v1/generate", response_model=GenerateResponse)
     async def generate(request: GenerateRequest) -> GenerateResponse:
+        if host_runtime.model_profile.serving_backend == "transformers":
+            text = await run_exclusive_ml(
+                host_runtime.generate_transformers,
+                [{"role": "user", "content": request.prompt}],
+                request.max_new_tokens,
+            )
+        else:
+            text = await host_runtime.generate(
+                request.prompt,
+                request.max_new_tokens,
+            )
         return GenerateResponse(
-            text=await host_runtime.generate(request.prompt, request.max_new_tokens),
+            text=text,
             model=host_runtime.model_profile.model_id,
             adapter_version=host_runtime.adapter_version,
         )

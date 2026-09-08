@@ -29,7 +29,7 @@ class HostStackConfigurationTests(unittest.TestCase):
             "LEGALFEDLLM_RUNTIME_ROOT": str(root),
             "HOST_MODEL_PROFILE": "mistral-nemo-instruct-2407-host-lora-v1",
             "HOST_TRAINING_BACKEND": "transformers",
-            "HOST_SERVING_BACKEND": "mock",
+            "HOST_SERVING_BACKEND": "transformers",
             "ADMIN_TOKEN": "test-secret-admin",
             "REGISTRATION_TOKEN": "test-secret-registration",
             "INTERNAL_API_TOKEN": "test-secret-internal",
@@ -156,6 +156,20 @@ class DeploymentFileContractTests(unittest.TestCase):
         self.assertIn("network_mode: host", compose)
         self.assertIn('"--host", "127.0.0.1"', compose)
         self.assertNotIn("host.docker.internal", compose)
+
+    def test_client_deployment_has_no_reverse_candidate_safety_probe_contract(self) -> None:
+        for path in (
+            Path("compose.yaml"),
+            Path("compose.clients.yaml"),
+            Path(".env.example"),
+            Path("config/clients.env.example"),
+            Path("scripts/bootstrap.py"),
+        ):
+            with self.subTest(path=path):
+                content = path.read_text(encoding="utf-8")
+                self.assertNotIn("CLIENT_SAFEFED_PROBE", content)
+                self.assertNotIn("client-safety-probe", content)
+                self.assertNotIn("/safety-probe", content)
 
     def test_client_deployment_does_not_receive_coordinator_admin_authority(self) -> None:
         template = Path("config/clients.env.example").read_text(encoding="utf-8")

@@ -53,8 +53,10 @@ def validate_environment() -> dict[str, object]:
         raise ValueError("HOST_MODEL_PROFILE must select the pinned Nemo Host")
     if os.getenv("HOST_TRAINING_BACKEND", "").strip() != "transformers":
         raise ValueError("HOST_TRAINING_BACKEND must be transformers")
-    if os.getenv("HOST_SERVING_BACKEND", "").strip() != "mock":
-        raise ValueError("the pinned Nemo Host requires mock serving")
+    if os.getenv("HOST_SERVING_BACKEND", "").strip() != "transformers":
+        raise ValueError(
+            "the pinned Nemo Host requires transformers serving for the desktop/Host inference path"
+        )
 
     for name in ("ADMIN_TOKEN", "INTERNAL_API_TOKEN"):
         _required_secret(name)

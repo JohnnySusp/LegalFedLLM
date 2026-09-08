@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import os
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from client.model_profiles import pinned_client_profile
+from client.learning_queue import LearningQueue
+from client.model_profiles import (
+    ollama_model_for_profile,
+    pinned_client_profile,
+    supported_ollama_models,
+)
 from client.reverse_training import (
     CLIENT_QUALITY_NON_REGRESSION_TOLERANCE,
     ClientReverseCandidateResult,
@@ -13,14 +19,10 @@ from client.reverse_training import (
     ClientValidationRecord,
     ClientValidationSampleMetric,
 )
-from client.safety_probe import (
-    SAFED_PROBE_THRESHOLD,
-    ClientSafetyProbeReport,
-    SafeFedLoraProbe,
-)
 from client.training import (
     BackendTrainingResult,
     LocalTrainingRecord,
+    PrivateTrainingExample,
     TrainingExecutionProfile,
     execution_profile_from_environment,
     load_private_examples,
@@ -66,12 +68,24 @@ from shared.reference_dataset import (
 )
 from shared.reference_knowledge import encode_reference_samples
 from shared.storage import JsonFileStore
-from shared.tokenizer_validation import load_pinned_tokenizer
+from shared.tokenizer_validation import (
+    TokenizerValidationError,
+    load_pinned_tokenizer,
+)
 from shared.vocabulary_mapping import VocabularyMappingCache
 
 
 class ClientRuntimeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _ClientTrainingState:
+    kind: Literal["base", "peft"]
+    version: int
+    state_hash: str
+    checkpoint_hash: str | None
+
 
 def default_client_profile() -> ModelProfile:
     serving_backend = os.getenv("CLIENT_SERVING_BACKEND", "mock").strip().lower()
@@ -137,8 +151,6 @@ class ClientRuntime:
         training_execution_profile: TrainingExecutionProfile | None = None,
         knowledge_batch_size: int | None = None,
         reverse_backend: Any | None = None,
-        safety_probe: Any | None = None,
-        safety_probe_manifest_path: str | Path | None = None,
         force_reverse_validation_failure: bool = False,
         maximum_clock_skew_seconds: int = 900,
         now_fn: Callable[[], Any] = utc_now,
@@ -153,10 +165,17 @@ class ClientRuntime:
         if self.model_profile.role != "client":
             raise ValueError("Client runtime requires a Client model profile")
 
-        self.private_data_path = Path(
-            private_data_path
-            or os.getenv("CLIENT_PRIVATE_DATA_PATH", "/private/train.jsonl")
+        configured_private_path = (
+            str(private_data_path)
+            if private_data_path is not None
+            else os.getenv("CLIENT_PRIVATE_DATA_PATH", "").strip()
         )
+        self.private_data_path = (
+            Path(configured_private_path).resolve()
+            if configured_private_path
+            else self.store.path("private/train.jsonl").resolve()
+        )
+        self.learning_queue = LearningQueue(self.private_data_path)
         self.private_dataset_id = private_dataset_id or os.getenv(
             "CLIENT_PRIVATE_DATASET_ID", "client-private-v1"
         )
@@ -182,16 +201,6 @@ class ClientRuntime:
         if self.knowledge_batch_size < 1:
             raise ValueError("knowledge batch size must be positive")
         self.reverse_backend = reverse_backend
-        self.safety_probe = safety_probe
-        configured_probe_path = safety_probe_manifest_path or os.getenv(
-            "CLIENT_SAFEFED_PROBE_MANIFEST_PATH",
-            "",
-        )
-        self.safety_probe_manifest_path = (
-            Path(configured_probe_path).resolve()
-            if str(configured_probe_path).strip()
-            else None
-        )
         self.force_reverse_validation_failure = (
             force_reverse_validation_failure
         )
@@ -200,10 +209,16 @@ class ClientRuntime:
         self.now_fn = now_fn
 
         self.ollama = ollama_client
-        if self.model_profile.serving_backend == "ollama" and self.ollama is None:
+        if (
+            self.ollama is None
+            and (
+                self.model_profile.training_backend == "transformers"
+                or self.model_profile.serving_backend == "ollama"
+            )
+        ):
             self.ollama = OllamaClient(
-                os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
-                timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60")),
+                os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+                timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "10")),
             )
         self._ensure_state()
         self.adapter_store: AdapterCheckpointStore | None = None
@@ -234,6 +249,8 @@ class ClientRuntime:
             "last_reverse_candidate_result_hash": None,
             "last_reverse_decision_hash": None,
             "last_reverse_decision_reason": None,
+            "last_reverse_consent": None,
+            "last_learning_receipt": None,
         }
         if self.store.exists("state.json"):
             state = self.store.read_json("state.json")
@@ -308,9 +325,14 @@ class ClientRuntime:
     def _local_training_record_path(round_id: str) -> str:
         return f"local_training/rounds/{round_id}.json"
 
-    def local_train_round(self, manifest: RoundManifest) -> dict[str, Any]:
+    def local_train_round(
+        self,
+        manifest: RoundManifest,
+        private_data_path: str | Path | None = None,
+    ) -> dict[str, Any]:
         self._validate_training_manifest(manifest)
-        examples = load_private_examples(self.private_data_path)
+        source_path = Path(private_data_path or self.private_data_path)
+        examples = load_private_examples(source_path)
         dataset_hash = private_dataset_semantic_hash(examples)
         record_path = self._local_training_record_path(manifest.round_id)
         if self.store.exists(record_path):
@@ -361,7 +383,20 @@ class ClientRuntime:
                 model_profile=self.model_profile,
                 execution_profile=self.training_execution_profile,
             )
-            result = backend.train(examples, manifest)
+            current_checkpoint = (
+                self.adapter_store.current()
+                if self.adapter_store is not None
+                else None
+            )
+            result = backend.train(
+                examples,
+                manifest,
+                base_parent_hash=(
+                    sha256_hex(self.state())
+                    if current_checkpoint is None
+                    else None
+                ),
+            )
 
         record = LocalTrainingRecord.create(
             round_id=manifest.round_id,
@@ -398,6 +433,8 @@ class ClientRuntime:
         state["candidate_adapter_version"] = result.result_version
         state["training_adapter_version"] = result.result_version
         state["training_checkpoint_hash"] = result.result_checkpoint_hash
+        if self.model_profile.serving_backend == "transformers":
+            state["serving_adapter_version"] = result.result_version
         state["local_training_runs"] += 1
         state["last_training_round"] = manifest.round_id
         state["last_local_batch"] = {
@@ -406,6 +443,111 @@ class ClientRuntime:
         }
         self.store.write_json("state.json", state)
         return record.model_dump(mode="json")
+
+    def learning_queue_status(self) -> dict[str, Any]:
+        return self.learning_queue.status()
+
+    def add_learning_example(self, prompt: str, answer: str) -> dict[str, Any]:
+        example = self.learning_queue.append(prompt, answer)
+        status = self.learning_queue.status()
+        return {
+            "example_id": example.example_id,
+            **status,
+        }
+
+    def train_queued_learning(
+        self,
+        manifest: RoundManifest,
+    ) -> dict[str, Any] | None:
+        batch = self.learning_queue.begin()
+        if batch is None:
+            return None
+        try:
+            payload = self.local_train_round(manifest, batch.path)
+            record = LocalTrainingRecord.model_validate(payload)
+            if record.private_dataset_semantic_hash != batch.semantic_hash:
+                raise ClientRuntimeError(
+                    "local learning batch hash differs from the training record"
+                )
+            receipt = self.learning_queue.complete(
+                batch,
+                adapter_version=record.result_adapter_version,
+                checkpoint_hash=record.result_checkpoint_hash,
+                round_id=manifest.round_id,
+                training_record_hash=record.record_hash,
+            )
+            state = self.state()
+            state["last_learning_receipt"] = receipt
+            self.store.write_json("state.json", state)
+            return receipt
+        except Exception:
+            self.learning_queue.restore(batch)
+            raise
+
+    def _learning_suggestion_path(self, suggestion_id: str) -> str:
+        if Path(suggestion_id).name != suggestion_id or suggestion_id in {".", ".."}:
+            raise ValueError("learning suggestion ID is not safe")
+        return f"learning_suggestions/{suggestion_id}.json"
+
+    def record_learning_suggestion(
+        self,
+        prompt: str,
+        answer: str,
+    ) -> dict[str, Any]:
+        if not prompt.strip() or not answer.strip():
+            raise ValueError("learning suggestion requires prompt and answer")
+        suggestion_id = f"suggest-{secrets.token_hex(12)}"
+        payload = {
+            "suggestion_id": suggestion_id,
+            "prompt": prompt,
+            "answer": answer,
+            "created_at": utc_text(self.now_fn()),
+        }
+        self.store.write_json_if_absent(
+            self._learning_suggestion_path(suggestion_id),
+            payload,
+        )
+        return payload
+
+    def pending_learning_suggestions(self) -> list[dict[str, Any]]:
+        root = self.store.path("learning_suggestions")
+        if not root.exists():
+            return []
+        values: list[dict[str, Any]] = []
+        for path in root.glob("suggest-*.json"):
+            try:
+                value = self.store.read_json(
+                    str(path.relative_to(self.store.root))
+                )
+            except (OSError, ValueError):
+                continue
+            values.append(value)
+        values.sort(key=lambda value: (value.get("created_at", ""), value["suggestion_id"]))
+        return values
+
+    def resolve_learning_suggestion(
+        self,
+        suggestion_id: str,
+        *,
+        learn: bool,
+    ) -> dict[str, Any]:
+        path = self._learning_suggestion_path(suggestion_id)
+        if not self.store.exists(path):
+            raise ValueError("learning suggestion does not exist")
+        suggestion = self.store.read_json(path)
+        result: dict[str, Any] = {
+            "suggestion_id": suggestion_id,
+            "learned": learn,
+        }
+        if learn:
+            result.update(
+                self.add_learning_example(
+                    str(suggestion["prompt"]),
+                    str(suggestion["answer"]),
+                )
+            )
+        self.store.delete(path)
+        return result
 
     def require_round_training(
         self,
@@ -477,6 +619,52 @@ class ClientRuntime:
             raise ClientRuntimeError(
                 "real DP-SGD is not implemented for Client PEFT training"
             )
+
+    def ensure_alignment_tokenizers(
+        self,
+        manifest: RoundManifest,
+    ) -> tuple[Any, Any] | None:
+        self._validate_training_manifest(manifest)
+        alignment_profile_id = manifest.alignment_profile_id_for(self.client_id)
+        if alignment_profile_id == MOCK_IDENTITY_PROFILE_ID:
+            return None
+
+        profile = resolve_alignment_profile(alignment_profile_id)
+        cache_dir = os.getenv("CLIENT_TOKENIZER_CACHE_DIR") or None
+        token = os.getenv("HF_TOKEN") or None
+
+        loaded = []
+        for endpoint in (profile.client, profile.host):
+            try:
+                validated = load_pinned_tokenizer(
+                    endpoint,
+                    cache_dir=cache_dir,
+                    token=token,
+                    local_files_only=True,
+                )
+            except TokenizerValidationError as exc:
+                raise ClientRuntimeError(
+                    f"cached alignment tokenizer {endpoint.tokenizer_id!r} failed "
+                    f"pinned validation: {exc}"
+                ) from exc
+            except Exception:
+                try:
+                    validated = load_pinned_tokenizer(
+                        endpoint,
+                        cache_dir=cache_dir,
+                        token=token,
+                        local_files_only=False,
+                    )
+                except Exception as exc:
+                    raise ClientRuntimeError(
+                        "required pinned alignment tokenizer "
+                        f"{endpoint.tokenizer_id!r} at revision "
+                        f"{endpoint.tokenizer_revision!r} is not available locally "
+                        "and could not be downloaded and validated"
+                    ) from exc
+            loaded.append(validated)
+
+        return loaded[0], loaded[1]
 
     def _validate_local_training_record(
         self,
@@ -590,10 +778,6 @@ class ClientRuntime:
         return f"reverse_distillation/rounds/{round_id}/validation/candidate.json"
 
     @staticmethod
-    def _reverse_safety_report_path(round_id: str) -> str:
-        return f"reverse_distillation/rounds/{round_id}/safety/report.json"
-
-    @staticmethod
     def _reverse_decision_path(round_id: str) -> str:
         return f"reverse_distillation/rounds/{round_id}/decision.json"
 
@@ -651,12 +835,19 @@ class ClientRuntime:
         training_path = self._local_training_record_path(manifest.round_id)
         if not self.store.exists(training_path):
             if self.model_profile.training_backend == "transformers":
-                raise ClientRuntimeError(
-                    "real Knowledge Package training record is missing"
-                )
+                version, checkpoint_hash = self.current_training_adapter()
+                if package.adapter_version != version:
+                    raise ClientRuntimeError(
+                        "Knowledge Package adapter differs from the active Client adapter"
+                    )
+                if snapshot.get("training_checkpoint_hash") != checkpoint_hash:
+                    raise ClientRuntimeError(
+                        "Knowledge Package active checkpoint binding differs"
+                    )
+                return snapshot
             if (
                 "local_training_record_hash" in snapshot
-                or "training_checkpoint_hash" in snapshot
+                or snapshot.get("training_checkpoint_hash") is not None
             ):
                 raise ClientRuntimeError(
                     "Knowledge Package snapshot names a missing training record"
@@ -917,22 +1108,53 @@ class ClientRuntime:
             return path
         raise ClientRuntimeError("Knowledge Package artifact is missing")
 
+    def current_training_adapter(self) -> tuple[int, str | None]:
+        if self.adapter_store is None:
+            state = self.state()
+            return (
+                int(state["training_adapter_version"]),
+                state.get("training_checkpoint_hash"),
+            )
+        current = self.adapter_store.current()
+        if current is None:
+            return 0, None
+        metadata, _ = current
+        return metadata.version, metadata.checkpoint_hash
+
     def generate_knowledge_samples(
         self,
         manifest: RoundManifest,
+        *,
+        require_round_training: bool = True,
+        expected_adapter_version: int | None = None,
+        expected_checkpoint_hash: str | None = None,
     ) -> list[KnowledgeSample]:
-        record = self.require_round_training(manifest)
+        record: LocalTrainingRecord | None = None
+        if require_round_training:
+            record = self.require_round_training(manifest)
+            expected_adapter_version = record.result_adapter_version
+            expected_checkpoint_hash = record.result_checkpoint_hash
+        elif expected_adapter_version is None:
+            expected_adapter_version, expected_checkpoint_hash = (
+                self.current_training_adapter()
+            )
+
         self.verify_cached_reference_dataset(manifest)
         reference_samples = load_reference_jsonl(
             self.store.path(self._reference_dataset_path(manifest.round_id))
         )
 
         if self.model_profile.training_backend == "mock":
+            adapter_version = (
+                record.result_adapter_version
+                if record is not None
+                else int(expected_adapter_version or 0)
+            )
             return deterministic_knowledge_samples(
                 manifest=manifest,
                 participant_id=self.client_id,
                 role="client",
-                adapter_version=record.result_adapter_version,
+                adapter_version=adapter_version,
             )
 
         from client.peft_backend import TransformersPeftTrainingBackend
@@ -947,8 +1169,8 @@ class ClientRuntime:
             return backend.generate_knowledge(
                 reference_samples,
                 manifest,
-                expected_adapter_version=record.result_adapter_version,
-                expected_checkpoint_hash=record.result_checkpoint_hash,
+                expected_adapter_version=int(expected_adapter_version or 0),
+                expected_checkpoint_hash=expected_checkpoint_hash,
             )
         except (RuntimeError, ValueError) as exc:
             raise ClientRuntimeError(
@@ -964,6 +1186,7 @@ class ClientRuntime:
     def create_knowledge_package(
         self,
         manifest: RoundManifest,
+        require_round_training: bool = True,
     ) -> KnowledgePackage:
         if self.client_id not in manifest.selected_client_ids:
             raise ValueError("Client is not selected for this round")
@@ -1069,10 +1292,22 @@ class ClientRuntime:
 
         state = self.state()
         training_record: LocalTrainingRecord | None = None
+        active_checkpoint_hash: str | None = None
         if self.model_profile.training_backend == "transformers":
-            training_record = self.require_round_training(manifest)
-            adapter_version = training_record.result_adapter_version
-            samples = self.generate_knowledge_samples(manifest)
+            if require_round_training:
+                training_record = self.require_round_training(manifest)
+                adapter_version = training_record.result_adapter_version
+                active_checkpoint_hash = training_record.result_checkpoint_hash
+            else:
+                adapter_version, active_checkpoint_hash = (
+                    self.current_training_adapter()
+                )
+            samples = self.generate_knowledge_samples(
+                manifest,
+                require_round_training=require_round_training,
+                expected_adapter_version=adapter_version,
+                expected_checkpoint_hash=active_checkpoint_hash,
+            )
         else:
             adapter_version = int(state["candidate_adapter_version"])
             samples = deterministic_knowledge_samples(
@@ -1150,6 +1385,8 @@ class ClientRuntime:
             "artifact_sha256": descriptor.sha256,
             "created_at": utc_text(self.now_fn()),
         }
+        if active_checkpoint_hash is not None:
+            snapshot["training_checkpoint_hash"] = active_checkpoint_hash
         if training_record is None:
             training_record_path = self._local_training_record_path(
                 manifest.round_id
@@ -1347,34 +1584,79 @@ class ClientRuntime:
             )
         return self.reverse_backend
 
-    def _safety_probe_instance(self) -> Any:
-        if self.safety_probe is not None:
-            return self.safety_probe
-        if self.safety_probe_manifest_path is None:
+    def _reverse_job_parent_state(
+        self,
+        job: ClientReverseTrainingJob,
+    ) -> _ClientTrainingState:
+        snapshot_path = self._accepted_snapshot_path(job.manifest.round_id)
+        if not self.store.exists(snapshot_path):
+            raise ClientRuntimeError("Client parent snapshot is missing")
+        snapshot = self.store.read_json(snapshot_path)
+        expected = {
+            "round_id": job.manifest.round_id,
+            "manifest_hash": job.manifest.manifest_hash,
+            "client_id": self.client_id,
+            "model_profile_hash": self.model_profile.profile_hash(),
+            "adapter_version": job.parent_adapter_version,
+        }
+        mismatches = [
+            key for key, value in expected.items()
+            if snapshot.get(key) != value
+        ]
+        checkpoint_hash = snapshot.get("training_checkpoint_hash")
+        parent_hash = checkpoint_hash or snapshot.get("state_hash")
+        if mismatches or parent_hash != job.parent_adapter_hash:
             raise ClientRuntimeError(
-                "real Client reverse training requires a Qwen-specific "
-                "CLIENT_SAFEFED_PROBE_MANIFEST_PATH"
+                "Client parent snapshot differs from the reverse job"
             )
-        self.safety_probe = SafeFedLoraProbe(
-            manifest_path=self.safety_probe_manifest_path,
-            model_profile=self.model_profile,
+        if checkpoint_hash is None:
+            if job.parent_adapter_version != 0:
+                raise ClientRuntimeError(
+                    "base-only Client reverse parent must be adapter version 0"
+                )
+            return _ClientTrainingState(
+                kind="base",
+                version=0,
+                state_hash=job.parent_adapter_hash,
+                checkpoint_hash=None,
+            )
+        return _ClientTrainingState(
+            kind="peft",
+            version=job.parent_adapter_version,
+            state_hash=str(checkpoint_hash),
+            checkpoint_hash=str(checkpoint_hash),
         )
-        return self.safety_probe
 
-    def _current_reverse_adapter(self) -> tuple[int, str]:
+    def _current_reverse_state(
+        self,
+        job: ClientReverseTrainingJob,
+    ) -> _ClientTrainingState:
         if self.model_profile.training_backend == "transformers":
             if self.adapter_store is None:
                 raise ClientRuntimeError("Client adapter store is unavailable")
             current = self.adapter_store.current()
-            if current is None:
+            if current is not None:
+                metadata, _ = current
+                return _ClientTrainingState(
+                    kind="peft",
+                    version=metadata.version,
+                    state_hash=metadata.checkpoint_hash,
+                    checkpoint_hash=metadata.checkpoint_hash,
+                )
+            parent_state = self._reverse_job_parent_state(job)
+            if parent_state.kind != "base":
                 raise ClientRuntimeError("current Client PEFT checkpoint is missing")
-            metadata, _ = current
-            return metadata.version, metadata.checkpoint_hash
+            return parent_state
+
         state = self.state()
         checkpoint_hash = state.get("training_checkpoint_hash")
-        if checkpoint_hash is None:
-            checkpoint_hash = sha256_hex(state)
-        return int(state["candidate_adapter_version"]), str(checkpoint_hash)
+        state_hash = str(checkpoint_hash or sha256_hex(state))
+        return _ClientTrainingState(
+            kind="peft",
+            version=int(state["candidate_adapter_version"]),
+            state_hash=state_hash,
+            checkpoint_hash=(str(checkpoint_hash) if checkpoint_hash else None),
+        )
 
     def _validate_reverse_candidate_result(
         self,
@@ -1440,19 +1722,14 @@ class ClientRuntime:
         stale_parent: bool,
         forced_rejection: bool,
         quality_passed: bool,
-        safety_passed: bool,
     ) -> str:
         if stale_parent:
             return "stale_parent"
         if forced_rejection:
             return "forced_validation_rejection"
-        if quality_passed and safety_passed:
+        if quality_passed:
             return "candidate_accepted"
-        if not quality_passed and not safety_passed:
-            return "quality_and_safety_gates_failed"
-        if not quality_passed:
-            return "quality_gate_failed"
-        return "safety_gate_failed"
+        return "quality_gate_failed"
 
     def _mock_reverse_candidate(
         self,
@@ -1573,6 +1850,7 @@ class ClientRuntime:
                     "execution_profile_hash": (
                         self.training_execution_profile.profile_hash()
                     ),
+                    "parent_state_kind": self._reverse_job_parent_state(job).kind,
                 }
                 metadata_payload = metadata.model_dump(mode="json")
                 mismatches = [
@@ -1591,9 +1869,11 @@ class ClientRuntime:
                     candidate_version,
                     metadata.checkpoint_hash,
                 )
+            parent_state = self._reverse_job_parent_state(job)
             result = self._reverse_backend_instance().train_candidate(
                 job,
                 self.store.path(self._reverse_artifact_path(job.manifest.round_id)),
+                parent_state_kind=parent_state.kind,
             )
             self._reverse_backend_instance().validate_candidate(result)
         else:
@@ -1653,59 +1933,6 @@ class ClientRuntime:
         )
         return record
 
-    def _load_or_create_safety_report(
-        self,
-        job: ClientReverseTrainingJob,
-        result: ClientReverseCandidateResult,
-    ) -> ClientSafetyProbeReport | None:
-        if self.model_profile.training_backend != "transformers":
-            return None
-        path = self._reverse_safety_report_path(job.manifest.round_id)
-        probe = self._safety_probe_instance()
-        if self.store.exists(path):
-            report = ClientSafetyProbeReport.model_validate(
-                self.store.read_json(path)
-            )
-        else:
-            if self.adapter_store is None:
-                raise ClientRuntimeError("Client adapter store is unavailable")
-            parent_metadata, parent_path = self.adapter_store.version(
-                result.parent_adapter_version
-            )
-            if parent_metadata.checkpoint_hash != result.parent_adapter_hash:
-                raise ClientRuntimeError("Client safety parent hash differs")
-            candidate_path = self._reverse_backend_instance().validate_candidate(
-                result
-            )
-            report = probe.evaluate(
-                round_id=job.manifest.round_id,
-                manifest_hash=job.manifest.manifest_hash,
-                job_hash=job.job_hash,
-                parent_checkpoint_hash=result.parent_adapter_hash,
-                candidate_checkpoint_hash=result.candidate_adapter_hash,
-                parent_path=parent_path,
-                candidate_path=candidate_path,
-                created_at=utc_text(self.now_fn()),
-            )
-            self.store.write_json_if_absent(path, report.model_dump(mode="json"))
-        expected = {
-            "round_id": job.manifest.round_id,
-            "manifest_hash": job.manifest.manifest_hash,
-            "job_hash": job.job_hash,
-            "model_profile_hash": self.model_profile.profile_hash(),
-            "parent_checkpoint_hash": result.parent_adapter_hash,
-            "candidate_checkpoint_hash": result.candidate_adapter_hash,
-            "probe_artifact_hash": probe.manifest.artifact_hash,
-        }
-        payload = report.model_dump(mode="json")
-        mismatches = [key for key, value in expected.items() if payload[key] != value]
-        if mismatches:
-            raise ClientRuntimeError(
-                "Client safety report differs from its job: "
-                + ", ".join(mismatches)
-            )
-        return report
-
     def _validate_reverse_decision(
         self,
         job: ClientReverseTrainingJob,
@@ -1754,16 +1981,6 @@ class ClientRuntime:
                     raise ClientRuntimeError(
                         "Client reverse decision uses another validation record"
                     )
-            if decision.safety_report_hash is not None:
-                report = ClientSafetyProbeReport.model_validate(
-                    self.store.read_json(
-                        self._reverse_safety_report_path(job.manifest.round_id)
-                    )
-                )
-                if report.report_hash != decision.safety_report_hash:
-                    raise ClientRuntimeError(
-                        "Client reverse decision uses another safety report"
-                    )
 
     def _apply_reverse_decision(
         self,
@@ -1780,20 +1997,21 @@ class ClientRuntime:
         if self.model_profile.training_backend != "transformers":
             return
         backend = self._reverse_backend_instance()
-        current_version, current_hash = self._current_reverse_adapter()
+        current_state = self._current_reverse_state(job)
         if decision.adapter_promoted:
             if (
-                current_version == result.candidate_adapter_version
-                and current_hash == result.candidate_adapter_hash
+                current_state.kind == "peft"
+                and current_state.version == result.candidate_adapter_version
+                and current_state.state_hash == result.candidate_adapter_hash
             ):
                 return
             if (
-                current_version == result.parent_adapter_version
-                and current_hash == result.parent_adapter_hash
+                current_state.version == result.parent_adapter_version
+                and current_state.state_hash == result.parent_adapter_hash
             ):
                 backend.promote_candidate(result)
                 return
-            if current_version > result.candidate_adapter_version:
+            if current_state.version > result.candidate_adapter_version:
                 if self.adapter_store is None:
                     raise ClientRuntimeError("Client adapter store is unavailable")
                 archived, _ = self.adapter_store.version(
@@ -1822,7 +2040,9 @@ class ClientRuntime:
             self._apply_reverse_decision(job, decision)
             return decision
 
-        active_version, active_hash = self._current_reverse_adapter()
+        active_state = self._current_reverse_state(job)
+        active_version = active_state.version
+        active_hash = active_state.state_hash
         stale_parent = (
             active_version != job.parent_adapter_version
             or active_hash != job.parent_adapter_hash
@@ -1844,8 +2064,6 @@ class ClientRuntime:
                 accepted_adapter_hash=active_hash,
                 parent_validation_record_hash=None,
                 candidate_validation_record_hash=None,
-                safety_report_hash=None,
-                probe_artifact_hash=None,
                 parent_macro_mean_answer_token_ce=None,
                 candidate_macro_mean_answer_token_ce=None,
                 observed_ce_regression=None,
@@ -1853,9 +2071,6 @@ class ClientRuntime:
                     CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
                 ),
                 quality_gate_passed=None,
-                maliciousness_probability=None,
-                safety_threshold=None,
-                safety_gate_passed=None,
                 stale_parent=stale_parent,
                 forced_rejection=False,
                 adapter_promoted=False,
@@ -1876,7 +2091,6 @@ class ClientRuntime:
             )
 
         if self.model_profile.training_backend == "transformers":
-            self._safety_probe_instance()
             self.verify_cached_reference_dataset(job.manifest)
             reference_samples = load_reference_jsonl(
                 self.store.path(
@@ -1904,8 +2118,9 @@ class ClientRuntime:
             adapter_role="candidate",
             validation_samples=validation_samples,
         )
-        safety_report = self._load_or_create_safety_report(job, result)
-        active_version, active_hash = self._current_reverse_adapter()
+        active_state = self._current_reverse_state(job)
+        active_version = active_state.version
+        active_hash = active_state.state_hash
         stale_parent = (
             active_version != job.parent_adapter_version
             or active_hash != job.parent_adapter_hash
@@ -1917,20 +2132,9 @@ class ClientRuntime:
         quality_passed = (
             observed_regression <= CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
         )
-        maliciousness_probability = (
-            safety_report.maliciousness_probability
-            if safety_report is not None
-            else 0.0
-        )
-        safety_passed = (
-            safety_report.safety_gate_passed
-            if safety_report is not None
-            else True
-        )
         forced_rejection = self.force_reverse_validation_failure
         promoted = (
             quality_passed
-            and safety_passed
             and not stale_parent
             and not forced_rejection
         )
@@ -1938,7 +2142,6 @@ class ClientRuntime:
             stale_parent=stale_parent,
             forced_rejection=forced_rejection,
             quality_passed=quality_passed,
-            safety_passed=safety_passed,
         )
         decision = ClientReverseDecision.create(
             round_id=job.manifest.round_id,
@@ -1960,14 +2163,6 @@ class ClientRuntime:
             ),
             parent_validation_record_hash=parent_validation.record_hash,
             candidate_validation_record_hash=candidate_validation.record_hash,
-            safety_report_hash=(
-                safety_report.report_hash if safety_report is not None else None
-            ),
-            probe_artifact_hash=(
-                safety_report.probe_artifact_hash
-                if safety_report is not None
-                else None
-            ),
             parent_macro_mean_answer_token_ce=(
                 parent_validation.macro_mean_answer_token_ce
             ),
@@ -1979,9 +2174,6 @@ class ClientRuntime:
                 CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
             ),
             quality_gate_passed=quality_passed,
-            maliciousness_probability=maliciousness_probability,
-            safety_threshold=SAFED_PROBE_THRESHOLD,
-            safety_gate_passed=safety_passed,
             stale_parent=stale_parent,
             forced_rejection=forced_rejection,
             adapter_promoted=promoted,
@@ -1996,6 +2188,46 @@ class ClientRuntime:
         self._apply_reverse_decision(job, decision)
         return decision
 
+    def _require_verified_host_preview_cache(
+        self,
+        *,
+        manifest: RoundManifest,
+        host_package: KnowledgePackage,
+        host_artifact_path: str | Path,
+    ) -> None:
+        round_id = manifest.round_id
+        job_path = self._reverse_job_path(round_id)
+        if not self.store.exists(job_path):
+            raise ClientRuntimeError(
+                "verified Host Knowledge preview is missing"
+            )
+
+        job = ClientReverseTrainingJob.model_validate(
+            self.store.read_json(job_path)
+        )
+        if (
+            job.manifest.manifest_hash != manifest.manifest_hash
+            or job.host_package_hash != host_package.package_hash
+            or job.accepted_host_adapter_version
+            != host_package.adapter_version
+        ):
+            raise ClientRuntimeError(
+                "verified Host Knowledge preview binding differs"
+            )
+
+        cached_package, cached_artifact_path = self.cached_host_knowledge(
+            round_id,
+            maximum_bytes=manifest.maximum_knowledge_package_bytes,
+        )
+        if cached_package.package_hash != host_package.package_hash:
+            raise ClientRuntimeError(
+                "cached Host Knowledge Package differs from the verified preview"
+            )
+        if Path(host_artifact_path).resolve() != cached_artifact_path.resolve():
+            raise ClientRuntimeError(
+                "Host Knowledge consent must use the verified cached artifact"
+            )
+
     def apply_host_knowledge(
         self,
         *,
@@ -2006,6 +2238,8 @@ class ClientRuntime:
         expected_host_id: str,
         accepted_host_adapter_version: int,
         adapter_promoted: bool,
+        complete_reverse: bool = True,
+        require_fresh_host_package: bool = True,
     ) -> dict[str, Any]:
         from shared.fedmkt_core.reverse_integration import (
             ReverseDistillationIntegrationAudit,
@@ -2120,14 +2354,21 @@ class ClientRuntime:
                 "Host package adapter version differs from round state"
             )
 
-        created = parse_utc(host_package.created_at)
-        skew = abs(
-            (self.now_fn() - created).total_seconds()
-        )
+        if require_fresh_host_package:
+            created = parse_utc(host_package.created_at)
+            skew = abs(
+                (self.now_fn() - created).total_seconds()
+            )
 
-        if skew > self.maximum_clock_skew_seconds:
-            raise ValueError(
-                "Host package timestamp is outside the allowed skew"
+            if skew > self.maximum_clock_skew_seconds:
+                raise ValueError(
+                    "Host package timestamp is outside the allowed skew"
+                )
+        else:
+            self._require_verified_host_preview_cache(
+                manifest=manifest,
+                host_package=host_package,
+                host_artifact_path=host_artifact_path,
             )
 
         host_samples = load_package_samples(
@@ -2179,23 +2420,12 @@ class ClientRuntime:
             profile = resolve_alignment_profile(
                 manifest.alignment_profile_id_for(self.client_id)
             )
-            client_cache = os.getenv("CLIENT_TOKENIZER_CACHE_DIR") or None
-            local_only = os.getenv(
-                "LEGALFEDLLM_TOKENIZER_LOCAL_FILES_ONLY", "true"
-            ).strip().lower() not in {"0", "false", "no"}
-            token = os.getenv("HF_TOKEN") or None
-            client_tokenizer = load_pinned_tokenizer(
-                profile.client,
-                cache_dir=client_cache,
-                token=token,
-                local_files_only=local_only,
-            )
-            host_tokenizer = load_pinned_tokenizer(
-                profile.host,
-                cache_dir=client_cache,
-                token=token,
-                local_files_only=local_only,
-            )
+            tokenizers = self.ensure_alignment_tokenizers(manifest)
+            if tokenizers is None:
+                raise ClientRuntimeError(
+                    "real reverse distillation requires real alignment tokenizers"
+                )
+            client_tokenizer, host_tokenizer = tokenizers
             encoded = encode_reference_samples(
                 selected_reference,
                 tokenizer=client_tokenizer.tokenizer,
@@ -2369,15 +2599,25 @@ class ClientRuntime:
                     self.store.delete(host_cache_artifact)
                 raise
 
+        if not complete_reverse:
+            return {
+                "round_id": round_id,
+                "host_adapter_version": host_package.adapter_version,
+                "host_teacher_sample_count": len(batch.audit.host_teacher_sample_ids),
+                "host_teacher_sample_ids": list(batch.audit.host_teacher_sample_ids),
+                "requires_consent": bool(batch.audit.host_teacher_sample_ids),
+                "reverse_job_hash": job.job_hash,
+            }
+
         decision = self._complete_reverse_distillation(job)
         state = self.state()
         if self.model_profile.training_backend == "transformers":
-            current_version, current_hash = self._current_reverse_adapter()
-            state["candidate_adapter_version"] = current_version
-            state["training_adapter_version"] = current_version
-            state["training_checkpoint_hash"] = current_hash
-            if self.model_profile.serving_backend == "mock":
-                state["serving_adapter_version"] = current_version
+            current_state = self._current_reverse_state(job)
+            state["candidate_adapter_version"] = current_state.version
+            state["training_adapter_version"] = current_state.version
+            state["training_checkpoint_hash"] = current_state.checkpoint_hash
+            if self.model_profile.serving_backend in {"mock", "transformers"}:
+                state["serving_adapter_version"] = current_state.version
         elif decision.adapter_promoted:
             if (
                 int(state["candidate_adapter_version"])
@@ -2404,12 +2644,127 @@ class ClientRuntime:
         )
         state["last_reverse_decision_hash"] = decision.decision_hash
         state["last_reverse_decision_reason"] = decision.decision_reason
+        state["last_reverse_consent"] = "accepted"
 
         self.store.write_json("state.json", state)
 
         return state
 
+    def cached_host_knowledge(
+        self,
+        round_id: str,
+        *,
+        maximum_bytes: int,
+    ) -> tuple[KnowledgePackage, Path]:
+        package_path = self._host_package_path(round_id)
+        artifact_path = self._host_artifact_path(round_id)
+        if not self.store.exists(package_path) or not self.store.exists(artifact_path):
+            raise ClientRuntimeError("cached Host Knowledge Package is missing")
+        package = KnowledgePackage.model_validate(self.store.read_json(package_path))
+        path = self.store.path(artifact_path)
+        load_package_samples(path, package, maximum_bytes=maximum_bytes)
+        return package, path
+
+    def decline_host_knowledge(self, round_id: str) -> dict[str, Any]:
+        job_path = self._reverse_job_path(round_id)
+        if not self.store.exists(job_path):
+            raise ClientRuntimeError("reverse Host Knowledge preview is missing")
+        job = ClientReverseTrainingJob.model_validate(self.store.read_json(job_path))
+        state = self.state()
+        state["last_completed_round"] = round_id
+        state["last_host_adapter_version"] = job.accepted_host_adapter_version
+        state["host_distillation_samples"] = list(job.host_teacher_sample_ids)
+        state["last_reverse_training_job_hash"] = job.job_hash
+        state["last_reverse_candidate_result_hash"] = None
+        state["last_reverse_decision_hash"] = None
+        state["last_reverse_decision_reason"] = (
+            "no_host_teacher_samples"
+            if not job.host_teacher_sample_ids
+            else "user_declined"
+        )
+        state["last_reverse_consent"] = (
+            "not_needed" if not job.host_teacher_sample_ids else "declined"
+        )
+        self.store.write_json("state.json", state)
+        return state
+
+    async def ollama_compatibility(self) -> dict[str, Any]:
+        supported = list(supported_ollama_models())
+        if self.model_profile.training_backend != "transformers":
+            return {
+                "required": False,
+                "compatible": True,
+                "selected_model": None,
+                "supported_models": supported,
+                "installed_models": [],
+            }
+        selected = ollama_model_for_profile(self.model_profile.profile_id)
+        if self.ollama is None:
+            return {
+                "required": True,
+                "compatible": False,
+                "selected_model": selected,
+                "supported_models": supported,
+                "installed_models": [],
+                "error": "Ollama is unavailable",
+            }
+        try:
+            values = await self.ollama.list_models()
+        except Exception as exc:
+            return {
+                "required": True,
+                "compatible": False,
+                "selected_model": selected,
+                "supported_models": supported,
+                "installed_models": [],
+                "error": str(exc),
+            }
+        installed: list[str] = []
+        for value in values:
+            for key in ("name", "model"):
+                name = value.get(key)
+                if isinstance(name, str) and name not in installed:
+                    installed.append(name)
+        compatible = selected in installed
+        result: dict[str, Any] = {
+            "required": True,
+            "compatible": compatible,
+            "selected_model": selected,
+            "supported_models": supported,
+            "installed_models": installed,
+        }
+        if not compatible:
+            result["error"] = (
+                "Error: currently used model is not supported or is not installed.\n"
+                "Supported models include:\n- " + "\n- ".join(supported)
+            )
+        return result
+
+    def generate_transformers(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+    ) -> str:
+        if self.model_profile.training_backend != "transformers":
+            raise ClientRuntimeError(
+                "Transformers serving requires a real Client profile"
+            )
+        from client.peft_backend import TransformersPeftTrainingBackend
+
+        backend = TransformersPeftTrainingBackend(
+            data_dir=self.store.root,
+            model_profile=self.model_profile,
+            execution_profile=self.training_execution_profile,
+            knowledge_batch_size=self.knowledge_batch_size,
+        )
+        return backend.generate_text(messages, max_new_tokens)
+
     async def generate(self, prompt: str, max_new_tokens: int) -> str:
+        if self.model_profile.serving_backend == "transformers":
+            return self.generate_transformers(
+                [{"role": "user", "content": prompt}],
+                max_new_tokens,
+            )
         if self.model_profile.serving_backend == "ollama":
             assert self.ollama is not None and self.model_profile.ollama is not None
             return await self.ollama.generate(

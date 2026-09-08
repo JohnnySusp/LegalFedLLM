@@ -44,7 +44,7 @@ automatic Client sync
       ↓
 Host → Qwen reverse alignment / selective distillation
       ↓
-Qwen candidate quality + safety gates
+Qwen candidate held-out quality gate
       ↓
 promote, reject, or discard stale candidate
 ```
@@ -74,9 +74,13 @@ training examples remain on the Client machine.
 | Automatic Host → Qwen reverse distillation | Implemented and real-tested |
 | Exact submission acknowledgement reconciliation | Implemented and regression-tested |
 | Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
+| Portable PySide6 desktop Client source | Implemented and model-free tested; Windows/AppImage packaging and real Windows acceptance pending |
+| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented and model-free tested; real desktop serving acceptance pending |
+| HOST OpenAI-compatible forwarding through bounded Host queue | Implemented and model-free tested; real desktop/Host acceptance pending |
+| User-approved local learning queue | Implemented and model-free tested; real GUI acceptance pending |
 | Real multi-Client round | Not yet demonstrated |
 | Mixed Qwen + Granite per-Client alignment and Host integration | Implemented and model-free tested; real heterogeneous execution still pending |
-| Automatic promoted-PEFT → Ollama publication | Not implemented |
+| Automatic promoted-PEFT → Ollama publication | Not required by the desktop path; active PEFT state is served directly with Transformers |
 | Production-calibrated malicious-package/LoRA classifier | Not complete |
 | Formal DP-SGD/privacy guarantee | Not claimed |
 
@@ -110,7 +114,7 @@ The verified run produced:
 | Client D^P samples | 565 |
 | Client stored token rows | 133,336 |
 | Client Knowledge Artifact | 6,943,336 bytes |
-| Post-alignment Client safety | accepted, trust score `0.33` |
+| Coordinator post-alignment Client-package trust | accepted, trust score `0.33` |
 | Forward Host-teacher selections | 565 / 565 |
 | Forward Qwen-teacher selections | 0 / 565 |
 | Host reference-data epochs | 5 |
@@ -153,8 +157,8 @@ A normal round is:
 ```text
 1. Coordinator signs a round manifest.
 2. Selected Clients verify the manifest and exact D^P identity/order.
-3. Each Client trains its own local LoRA on private examples.
-4. Each Client runs teacher-forced inference over D^P.
+3. The desktop Client optionally consumes user-approved queued local-learning examples and promotes the resulting local LoRA update. If the queue is empty, the current adapter is retained.
+4. Each Client runs teacher-forced inference over D^P using its current model-native adapter.
 5. Each Client signs and uploads a Knowledge Package + safetensors artifact.
 6. Coordinator verifies transport, identity, replay, dataset and safety rules.
 7. Eligible Client outputs are aligned into the Host tokenizer space.
@@ -164,9 +168,10 @@ A normal round is:
 11. Host promotes or rolls back the candidate.
 12. Host publishes a signed post-decision Knowledge Package over D^P.
 13. Clients verify the Host package and execute Client-owned reverse alignment.
-14. A Client trains a local reverse candidate only when Host-teacher samples exist.
-15. Independent Client quality and safety gates decide local adoption.
-16. Client commits the round only after the reverse decision completes.
+14. The desktop Client asks for user consent only when at least one Host-teacher sample exists.
+15. After consent, the Client trains a local reverse candidate; without consent, the round is finalized locally without reverse training.
+16. The held-out Client quality gate, stale-parent check and explicit consent govern local adoption.
+17. Client commits the round only after the reverse decision completes.
 ```
 
 The core architectural rule is:
@@ -204,12 +209,75 @@ The repository currently includes:
 - immutable Client reverse-training jobs;
 - Qwen reverse LoRA candidate training and adoption gates;
 - exact accepted-submission receipt reconciliation;
-- local Client Ollama serving integration; and
+- local Client Ollama installation/profile compatibility checks;
+- direct Transformers + PEFT LOCAL serving for the active Client adapter;
+- authenticated HOST inference forwarding through a bounded Coordinator queue;
+- OpenAI-compatible `legalfedllm-local` and `legalfedllm-host` provider endpoints;
+- portable multi-profile desktop state with per-profile Client identities;
+- user-approved one-use local-learning queues and reverse-learning consent;
+- Agent-owned OpenSSH tunnel supervision;
+- PySide6 desktop source with PyInstaller build tooling and Linux AppImage wrapper support; and
 - split-machine tmux orchestration with preserved run evidence.
 
 The deterministic mock path remains available for protocol and failure-policy
 regression tests. Mock loss/safety values are fixtures; they are not real-model
 measurements.
+
+## Portable desktop Client candidate
+
+The repository now contains a first portable desktop Client candidate under
+`desktop/`. This is source-level implementation work pending authoritative
+Windows/Linux packaging and real-model acceptance; it is not yet claimed as a
+released desktop binary.
+
+The locked PoC behavior is:
+
+- one Client codebase with Qwen and Granite selected through approved model profiles;
+- PySide6 GUI, with PyInstaller as the per-OS executable bundler and an AppImage
+  wrapper on Linux;
+- portable state in a sibling `LegalFedLLM-data/` directory rather than OS-global
+  application state;
+- each saved profile owns an independent Client ID, Ed25519 identity, adapter
+  state and one-time enrollment;
+- the Client Agent is a child process of the GUI and owns the OpenSSH tunnel; on
+  initial connection, OpenSSH asks for the SSH password in the launch terminal
+  before the Agent API and diagnostic terminals start. The password is never
+  handled or stored by LegalFedLLM; after connection, diagnostics are limited to
+  a state terminal (HTTP 200 OK plus Client state) and an NVIDIA/GPU terminal;
+- Ollama models are installed by the user. LegalFedLLM checks that the selected
+  profile's expected Ollama model is installed, but federated training and LOCAL
+  serving use the exact pinned Transformers + PEFT state; on Linux/PyTorch 2.13+
+  environments without Python development headers, the Client disables only the
+  native `bmm` override that would otherwise make Triton JIT require `Python.h`;
+- before a real-model participation is submitted, the Client resolves its signed
+  Client↔Host alignment profile and verifies both exact pinned tokenizers from the
+  local Hugging Face cache. A missing tokenizer may be downloaded from its pinned
+  repository revision and is validated before D^P inference continues; this
+  preflight does not download Host model weights;
+- D^P is downloaded from the Coordinator and verified against the signed round
+  manifest;
+- LOCAL AnythingLLM-style interactions can be offered back to the user with a
+  `Learn from this` decision. Accepted prompt/answer pairs enter a generated
+  per-profile `train.jsonl` queue;
+- queued local examples are consumed once. They are removed only after the
+  resulting adapter is safely promoted; failed training restores the queue;
+- the main GUI action is `Participate in the current federated round`;
+- reverse Host learning requires a verified Host package, at least one selected
+  Host-teacher sample, and explicit user consent; and
+- the OpenAI-compatible provider exposes only `legalfedllm-local` and
+  `legalfedllm-host` in this milestone. Collaborative inference remains future
+  work.
+
+The desktop build helpers are:
+
+```bash
+python scripts/build_desktop.py
+python scripts/build_desktop.py --appimage   # Linux; requires appimagetool
+```
+
+Windows and Linux artifacts must be built on their respective operating systems;
+PyInstaller is not a cross-compiler. `requirements-desktop.txt` contains the
+desktop/build additions on top of the normal runtime requirements.
 
 ## Pinned model profiles
 
@@ -244,8 +312,10 @@ task:             CAUSAL_LM
 
 The pinned Mistral Nemo Host uses `MistralForCausalLM`,
 `PreTrainedTokenizerFast`, vocabulary size 131,072 and the same rank-8 LoRA
-target modules. Its serving backend is deliberately `mock`; its training backend
-is real Transformers/PEFT.
+target modules. Its default test serving backend remains `mock`; the desktop HOST
+inference path may explicitly select `transformers` so it serves the active Host
+PEFT adapter directly. Ollama is not used to pretend a promoted PEFT adapter has
+been published.
 
 `compose.host-ml.yaml` remains the local Granite ML Compose profile. The Mistral
 Nemo Host path runs directly from a Python virtual environment on the remote A40
@@ -281,7 +351,7 @@ accepted Client. Real Qwen + Granite model execution remains pending.
 ```text
 LegalFedLLM/
 ├── client/                     Client API, training, package generation,
-│                               reverse training and local safety probe
+│                               reverse training and adoption validation
 ├── coordinator/                round lifecycle, quorum, package intake,
 │                               safety/trust, Host integration and persistence
 ├── host/                       Host API, pinned profiles, real PEFT training,
@@ -567,10 +637,6 @@ proof. Targeted/backdoor behavior outside D^V coverage can still evade aggregate
 validation metrics, so the safety layers are complementary rather than
 interchangeable.
 
-The Client reverse path also contains local candidate quality/safety gates. Any
-LoRA-delta probe should be described as an experimental LegalFedLLM heuristic,
-not as literal SafeFed-LMM equivalence.
-
 ## Host training and D^V promotion
 
 After package acceptance and alignment, the Coordinator constructs sparse Host
@@ -600,11 +666,35 @@ After Host publication, the Client:
 4. selects Host-teacher samples using the reverse CE rule;
 5. creates an immutable reverse-training job;
 6. trains a model-native Client LoRA candidate when transfer samples exist;
-7. evaluates local quality/safety gates; and
+7. evaluates the candidate against the held-out Client quality gate; and
 8. commits or rejects the candidate before marking the round complete.
 
 Reverse training is Client-owned. The Coordinator/Host never installs a Client
-adapter.
+adapter. Client-side reverse-candidate adoption does not use a LoRA safety probe;
+promotion is governed by the held-out quality gate, stale-parent protection, forced
+validation rejection controls used by tests, and explicit user consent. Coordinator-
+side Knowledge Package safety/trust screening remains separate and unchanged.
+
+A real Transformers Client may legitimately participate before it has ever
+created a PEFT checkpoint. In that base-only state, the accepted round snapshot binds
+the Client package to the frozen base-model state hash with adapter version 0 and no
+checkpoint hash. If reverse learning is later approved, the Client creates a fresh
+transient LoRA on the exact pinned base model, verifies that its initial effective
+LoRA delta is zero, trains the first candidate, validates the plain base model against
+the candidate, and persists a PEFT checkpoint only if the learned candidate is
+promoted. A rejected first candidate leaves the Client base-only.
+
+The same lifecycle applies to the first approved local-learning batch: a fresh
+zero-effect LoRA is only a transient training parent. It is not promoted as a durable
+adapter merely to satisfy PEFT. The first durable Client checkpoint is the learned
+candidate itself; if that training operation fails, the Client remains base-only.
+
+The desktop marks a Host-package preview complete only after a successful preview; an
+interrupted or cache-related preview remains retryable for the same completed round.
+Host-package timestamp freshness is enforced when the package is first received and
+verified. After that successful preview, later user consent may consume only the same
+immutable cached package/reverse job; wall-clock freshness is not re-applied as a
+human decision deadline.
 
 ## Submission acknowledgement and retry semantics
 
@@ -933,7 +1023,7 @@ submission receipts
 adapter snapshots
 Host package cache
 immutable reverse jobs and sparse artifacts
-candidate/validation/safety/adoption records
+candidate/validation/adoption records
 ```
 
 Important Coordinator state includes:
@@ -1041,7 +1131,6 @@ The current repository does **not** establish:
 - a real Qwen + Granite heterogeneous round and reverse synchronization on
   separate physical Clients;
 - a production-calibrated malicious-Knowledge-Package detector;
-- an independently validated production SafeFed-style Qwen LoRA probe;
 - formal DP-SGD or differential-privacy accounting;
 - HTTPS/mTLS, certificate provisioning, or encrypted artifact storage; the current
   one-time enrollment-token + Ed25519 identity flow is a PoC authentication layer,
@@ -1064,8 +1153,9 @@ The main open experimental questions are:
    majority/minimum-2 quorum and capture each Client's reverse synchronization;
 2. measure scenarios in which an eligible Client actually wins some forward
    DualMinCE samples, and report teacher-selection counts explicitly;
-3. independently train/calibrate the Client safety probe and evaluate malicious
-   package/adapter cases rather than relying on protocol fixtures;
+3. independently calibrate the Coordinator-side malicious-Knowledge-Package
+   detector and evaluate adversarial package cases rather than relying on protocol
+   fixtures;
 4. collect stable wall-time, RAM/VRAM, communication-volume, and adapter-size
    measurements for thesis experiments; and
 5. decide whether automatic PEFT → serving-model publication belongs in the PoC
@@ -1082,7 +1172,8 @@ A defensible current summary is:
 > proof of concept in which model-native LoRA weights and private Client examples
 > remain local while signed behavioral Knowledge Packages are exchanged over a
 > common reference dataset. A fresh real cross-machine Qwen3 1.7B → Mistral Nemo
-> → Qwen run completed package verification, SafeFed-inspired screening, DTW
+> → Qwen run completed package verification, Coordinator-side SafeFed-inspired
+> Knowledge Package screening, DTW
 > alignment, DualMinCE selection, Host candidate training, hidden D^V promotion,
 > signed Host publication, automatic Client synchronization, and reverse Qwen
 > candidate adoption without manual recovery. In that experiment the Host

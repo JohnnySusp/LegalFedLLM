@@ -1028,7 +1028,25 @@ class HostRuntime:
     def _candidate_decision_path(round_id: str) -> str:
         return f"rounds/{round_id}/validation/decision.json"
 
+    def generate_transformers(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+    ) -> str:
+        if self.model_profile.training_backend != "transformers":
+            raise HostRuntimeError(
+                "Transformers serving requires a real Host profile"
+            )
+        if self.peft_backend is None:
+            raise HostRuntimeError("Host PEFT backend is unavailable")
+        return self.peft_backend.generate_text(messages, max_new_tokens)
+
     async def generate(self, prompt: str, max_new_tokens: int) -> str:
+        if self.model_profile.serving_backend == "transformers":
+            return self.generate_transformers(
+                [{"role": "user", "content": prompt}],
+                max_new_tokens,
+            )
         if self.model_profile.serving_backend == "ollama":
             assert self.ollama is not None and self.model_profile.ollama is not None
             return await self.ollama.generate(

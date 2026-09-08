@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.crypto import sha256_hex
 from shared.protocol import HASH_PATTERN, ModelProfile, utc_text
@@ -25,12 +25,23 @@ class AdapterCheckpointMetadata(AdapterCheckpointContract):
     version: int = Field(ge=0)
     parent_version: int | None = Field(default=None, ge=0)
     parent_checkpoint_hash: str | None = Field(default=None, pattern=HASH_PATTERN)
+    parent_state_kind: Literal["base", "peft"] | None = None
     round_id: str | None = None
     manifest_hash: str | None = Field(default=None, pattern=HASH_PATTERN)
     execution_profile_hash: str | None = Field(default=None, pattern=HASH_PATTERN)
     checkpoint_hash: str = Field(pattern=HASH_PATTERN)
     file_count: int = Field(ge=2)
     created_at: str
+
+    @model_validator(mode="after")
+    def validate_parent_state(self) -> "AdapterCheckpointMetadata":
+        if self.parent_state_kind == "base":
+            if self.parent_version != 0 or self.parent_checkpoint_hash is None:
+                raise ValueError("base-parent adapter metadata is incomplete")
+        elif self.parent_state_kind == "peft":
+            if self.parent_version is None or self.parent_checkpoint_hash is None:
+                raise ValueError("PEFT-parent adapter metadata is incomplete")
+        return self
 
 
 def write_atomic_json(path: Path, value: Any) -> None:
@@ -123,18 +134,28 @@ class AdapterCheckpointStore:
         round_id: str | None,
         manifest_hash: str | None,
         execution_profile_hash: str | None,
+        base_parent_hash: str | None = None,
     ) -> AdapterCheckpointMetadata:
         expected_parent = self.root / "staging"
         if staging_path.parent.resolve() != expected_parent.resolve():
             raise ValueError("adapter staging directory is outside its store")
+        if parent is not None and base_parent_hash is not None:
+            raise ValueError("adapter checkpoint cannot have two parent states")
+        if base_parent_hash is not None and version != 1:
+            raise ValueError("a base-parent adapter candidate must be version 1")
         checkpoint_hash, file_count = self._tree_hash(staging_path)
         metadata = AdapterCheckpointMetadata(
             profile_id=self.model_profile.profile_id,
             profile_hash=self.model_profile.profile_hash(),
             model_profile=self.model_profile,
             version=version,
-            parent_version=parent.version if parent else None,
-            parent_checkpoint_hash=parent.checkpoint_hash if parent else None,
+            parent_version=(parent.version if parent else (0 if base_parent_hash else None)),
+            parent_checkpoint_hash=(
+                parent.checkpoint_hash if parent else base_parent_hash
+            ),
+            parent_state_kind=(
+                "peft" if parent is not None else ("base" if base_parent_hash else None)
+            ),
             round_id=round_id,
             manifest_hash=manifest_hash,
             execution_profile_hash=execution_profile_hash,
@@ -207,6 +228,8 @@ class AdapterCheckpointStore:
         round_id: str,
         version: int,
         checkpoint_hash: str,
+        *,
+        expected_base_parent_hash: str | None = None,
     ) -> tuple[AdapterCheckpointMetadata, Path]:
         current = self.current()
         if current is not None:
@@ -229,6 +252,7 @@ class AdapterCheckpointStore:
                 version=version,
                 checkpoint_hash=checkpoint_hash,
                 current=current,
+                expected_base_parent_hash=expected_base_parent_hash,
             )
             self._validate_directory(target, metadata)
         else:
@@ -239,6 +263,7 @@ class AdapterCheckpointStore:
                 version=version,
                 checkpoint_hash=checkpoint_hash,
                 current=current,
+                expected_base_parent_hash=expected_base_parent_hash,
             )
             candidate_path.replace(target)
 
@@ -278,6 +303,7 @@ class AdapterCheckpointStore:
         version: int,
         checkpoint_hash: str,
         current: tuple[AdapterCheckpointMetadata, Path] | None,
+        expected_base_parent_hash: str | None,
     ) -> None:
         if (
             metadata.round_id != round_id
@@ -286,9 +312,18 @@ class AdapterCheckpointStore:
         ):
             raise ValueError("promoted candidate identity differs")
         if metadata.parent_version is None or metadata.parent_checkpoint_hash is None:
-            raise ValueError("promoted candidate has no parent checkpoint")
+            raise ValueError("promoted candidate has no parent state")
         if current is None:
-            raise ValueError("active parent checkpoint is missing")
+            if (
+                metadata.parent_state_kind != "base"
+                or metadata.parent_version != 0
+                or expected_base_parent_hash is None
+                or metadata.parent_checkpoint_hash != expected_base_parent_hash
+            ):
+                raise ValueError("active base parent state differs from candidate parent")
+            return
+        if metadata.parent_state_kind == "base":
+            raise ValueError("base-parent candidate cannot replace an active PEFT adapter")
         current_metadata, _ = current
         if (
             current_metadata.version != metadata.parent_version

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import math
 import os
+import re
 import secrets
 import shutil
+import sys
+import sysconfig
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,11 +24,62 @@ from client.training import (
     TrainingExecutionProfile,
     encode_private_examples,
 )
-from shared.answer_only import AnswerOnlyCollator
+from shared.answer_only import AnswerOnlyCollator, encode_chat_prompt
 from shared.adapter_checkpoint import AdapterCheckpointStore
 from shared.crypto import sha256_hex
 from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest
 from shared.reference_dataset import ReferenceSample
+
+
+_TORCH_NATIVE_BMM_COMPAT_CONFIGURED = False
+
+
+def _torch_major_minor(version: str) -> tuple[int, int]:
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if match is None:
+        raise RuntimeError(f"could not parse PyTorch version: {version!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _configure_torch_native_bmm_compat(torch: Any) -> bool:
+    global _TORCH_NATIVE_BMM_COMPAT_CONFIGURED
+
+    if _TORCH_NATIVE_BMM_COMPAT_CONFIGURED:
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    if _torch_major_minor(str(torch.__version__)) < (2, 13):
+        return False
+
+    include_path = sysconfig.get_path("include")
+    if include_path and (Path(include_path) / "Python.h").is_file():
+        return False
+
+    try:
+        registry = importlib.import_module("torch._native.registry")
+    except Exception as exc:
+        raise RuntimeError(
+            "PyTorch >=2.13 CUDA on this Linux environment requires the "
+            "torch._native bmm compatibility path because Python.h is unavailable, "
+            "but torch._native.registry could not be imported"
+        ) from exc
+
+    deregister = getattr(registry, "deregister_op_overrides", None)
+    if not callable(deregister):
+        raise RuntimeError(
+            "PyTorch >=2.13 CUDA on this Linux environment requires the "
+            "torch._native bmm compatibility path because Python.h is unavailable, "
+            "but deregister_op_overrides is unavailable"
+        )
+    try:
+        deregister(disable_op_symbols="bmm")
+    except Exception as exc:
+        raise RuntimeError(
+            "could not disable the PyTorch native bmm override required for "
+            "CUDA execution without Python development headers"
+        ) from exc
+    _TORCH_NATIVE_BMM_COMPAT_CONFIGURED = True
+    return True
 
 
 class TransformersPeftTrainingBackend:
@@ -59,6 +114,8 @@ class TransformersPeftTrainingBackend:
         self,
         examples: list[PrivateTrainingExample],
         manifest: RoundManifest,
+        *,
+        base_parent_hash: str | None = None,
     ) -> BackendTrainingResult:
         torch, transformers, peft, safetensors = self._dependencies()
         self._validate_device(torch)
@@ -68,36 +125,19 @@ class TransformersPeftTrainingBackend:
         current = self.checkpoints.current()
 
         if current is None:
+            if base_parent_hash is None:
+                raise ValueError("base-only Client training requires its state hash")
             model = self._create_adapter(peft, base_model)
             self._assert_trainable_parameters(model)
-            initial_path = self.checkpoints.staging_path(
-                f"initial-{secrets.token_hex(8)}"
-            )
-            try:
-                model.save_pretrained(
-                    initial_path,
-                    safe_serialization=True,
-                    save_embedding_layers=False,
-                )
-                self._validate_adapter_tensors(safetensors, initial_path)
-                initial_metadata = self.checkpoints.seal(
-                    initial_path,
-                    version=self.checkpoints.next_version(0),
-                    parent=None,
-                    round_id=None,
-                    manifest_hash=None,
-                    execution_profile_hash=None,
-                )
-                initial_version_path = self.checkpoints.promote(
-                    initial_path,
-                    initial_metadata,
-                )
-            except Exception:
-                if initial_path.exists():
-                    self.checkpoints.discard_staging(initial_path)
-                raise
-            current = initial_metadata, initial_version_path
+            parent_metadata = None
+            parent_path = None
+            parent_version = 0
+            parent_hash = base_parent_hash
         else:
+            if base_parent_hash is not None:
+                raise ValueError(
+                    "base state hash must not be supplied for an active PEFT Client"
+                )
             metadata, checkpoint_path = current
             model = peft.PeftModel.from_pretrained(
                 base_model,
@@ -105,8 +145,10 @@ class TransformersPeftTrainingBackend:
                 is_trainable=True,
             )
             self._verify_loaded_adapter(model)
-
-        parent_metadata, parent_path = current
+            parent_metadata = metadata
+            parent_path = checkpoint_path
+            parent_version = metadata.version
+            parent_hash = metadata.checkpoint_hash
         self._assert_trainable_parameters(model)
         base_checksum = None
         if self.execution_profile.verify_frozen_base_checksum:
@@ -123,8 +165,26 @@ class TransformersPeftTrainingBackend:
         output_dir = self.data_dir / "training_jobs" / job_id
         output_dir.mkdir(parents=True, exist_ok=False)
         candidate_path: Path | None = None
+        transient_parent_path: Path | None = None
 
         try:
+            if parent_metadata is None:
+                transient_parent_path = output_dir / "base_parent_adapter"
+                model.save_pretrained(
+                    transient_parent_path,
+                    safe_serialization=True,
+                    save_embedding_layers=False,
+                )
+                self._validate_adapter_tensors(
+                    safetensors,
+                    transient_parent_path,
+                )
+                self._assert_initial_lora_is_noop(
+                    torch,
+                    safetensors,
+                    transient_parent_path,
+                )
+
             if self.execution_profile.gradient_checkpointing:
                 model.config.use_cache = False
                 model.enable_input_require_grads()
@@ -195,18 +255,29 @@ class TransformersPeftTrainingBackend:
                 save_embedding_layers=False,
             )
             self._validate_adapter_tensors(safetensors, candidate_path)
+            comparison_parent_path = (
+                transient_parent_path
+                if parent_metadata is None
+                else parent_path
+            )
+            assert comparison_parent_path is not None
             self._assert_lora_tensors_changed(
                 torch,
                 safetensors,
-                parent_path,
+                comparison_parent_path,
                 candidate_path,
             )
             candidate_metadata = self.checkpoints.seal(
                 candidate_path,
-                version=self.checkpoints.next_version(
-                    parent_metadata.version + 1
+                version=(
+                    1
+                    if parent_metadata is None
+                    else self.checkpoints.next_version(parent_metadata.version + 1)
                 ),
                 parent=parent_metadata,
+                base_parent_hash=(
+                    parent_hash if parent_metadata is None else None
+                ),
                 round_id=manifest.round_id,
                 manifest_hash=manifest.manifest_hash,
                 execution_profile_hash=self.execution_profile.profile_hash(),
@@ -250,10 +321,21 @@ class TransformersPeftTrainingBackend:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            self.checkpoints.promote(candidate_path, candidate_metadata)
+            if parent_metadata is None:
+                self.checkpoints.store_candidate(candidate_path, candidate_metadata)
+                candidate_path = None
+                self.checkpoints.promote_candidate(
+                    manifest.round_id,
+                    candidate_metadata.version,
+                    candidate_metadata.checkpoint_hash,
+                    expected_base_parent_hash=parent_hash,
+                )
+            else:
+                self.checkpoints.promote(candidate_path, candidate_metadata)
+                candidate_path = None
             return BackendTrainingResult(
-                parent_version=parent_metadata.version,
-                parent_checkpoint_hash=parent_metadata.checkpoint_hash,
+                parent_version=parent_version,
+                parent_checkpoint_hash=parent_hash,
                 result_version=candidate_metadata.version,
                 result_checkpoint_hash=candidate_metadata.checkpoint_hash,
                 checkpoint_format="peft-safetensors",
@@ -285,7 +367,7 @@ class TransformersPeftTrainingBackend:
         manifest: RoundManifest,
         *,
         expected_adapter_version: int,
-        expected_checkpoint_hash: str,
+        expected_checkpoint_hash: str | None,
     ) -> list[KnowledgeSample]:
         torch, transformers, peft, _ = self._dependencies()
         from shared.fedmkt_core.ml.logit_generation import (
@@ -315,30 +397,31 @@ class TransformersPeftTrainingBackend:
             raise ValueError("manifest top_k exceeds the Client vocabulary size")
 
         current = self.checkpoints.current()
+        checkpoint_path = None
         if current is None:
-            raise RuntimeError("current PEFT adapter checkpoint is missing")
-        metadata, checkpoint_path = current
-        if (
-            metadata.version != expected_adapter_version
-            or metadata.checkpoint_hash != expected_checkpoint_hash
-        ):
-            raise RuntimeError("current PEFT checkpoint differs from the round record")
-        if (
-            metadata.round_id != manifest.round_id
-            or metadata.manifest_hash != manifest.manifest_hash
-        ):
-            raise RuntimeError("current PEFT checkpoint belongs to another round")
+            if expected_adapter_version != 0 or expected_checkpoint_hash is not None:
+                raise RuntimeError("current PEFT adapter checkpoint is missing")
+        else:
+            metadata, checkpoint_path = current
+            if (
+                metadata.version != expected_adapter_version
+                or metadata.checkpoint_hash != expected_checkpoint_hash
+            ):
+                raise RuntimeError("current PEFT checkpoint differs from the selected adapter")
 
         base_model = None
         model = None
         try:
             base_model = self._load_base_model(torch, transformers)
-            model = peft.PeftModel.from_pretrained(
-                base_model,
-                checkpoint_path,
-                is_trainable=False,
-            )
-            self._verify_loaded_adapter(model)
+            if checkpoint_path is None:
+                model = base_model
+            else:
+                model = peft.PeftModel.from_pretrained(
+                    base_model,
+                    checkpoint_path,
+                    is_trainable=False,
+                )
+                self._verify_loaded_adapter(model)
             if any(parameter.requires_grad for parameter in model.parameters()):
                 raise RuntimeError("knowledge generation loaded trainable parameters")
             model.eval()
@@ -401,6 +484,68 @@ class TransformersPeftTrainingBackend:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+    def generate_text(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+    ) -> str:
+        torch, transformers, peft, _ = self._dependencies()
+        self._validate_device(torch)
+        tokenizer = self._load_tokenizer(transformers)
+        prompt_ids = encode_chat_prompt(
+            tokenizer=tokenizer,
+            model_profile=self.model_profile,
+            messages=messages,
+        )
+        if not prompt_ids:
+            raise RuntimeError("chat template produced an empty prompt")
+
+        base_model = None
+        model = None
+        try:
+            base_model = self._load_base_model(torch, transformers)
+            current = self.checkpoints.current()
+            if current is None:
+                model = base_model
+            else:
+                _, checkpoint_path = current
+                model = peft.PeftModel.from_pretrained(
+                    base_model,
+                    checkpoint_path,
+                    is_trainable=False,
+                )
+                self._verify_loaded_adapter(model)
+            for parameter in model.parameters():
+                parameter.requires_grad = False
+            model.eval()
+            input_ids = torch.tensor(
+                [prompt_ids],
+                dtype=torch.long,
+                device=self.execution_profile.device,
+            )
+            attention_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                output = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            generated = output[0, input_ids.shape[1] :].tolist()
+            return tokenizer.decode(
+                generated,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+        finally:
+            del model, base_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any, Any]:
         try:
@@ -422,6 +567,8 @@ class TransformersPeftTrainingBackend:
             raise RuntimeError(
                 "CLIENT_TRAINING_PRECISION=bfloat16 is unsupported by this GPU"
             )
+        if profile.device == "cuda":
+            _configure_torch_native_bmm_compat(torch)
 
     def _load_tokenizer(self, transformers: Any) -> Any:
         profile = self.model_profile
@@ -592,6 +739,28 @@ class TransformersPeftTrainingBackend:
         }
         if found != targets:
             raise RuntimeError("adapter checkpoint is missing configured targets")
+
+    @staticmethod
+    def _assert_initial_lora_is_noop(
+        torch: Any,
+        safetensors: Any,
+        path: Path,
+    ) -> None:
+        tensor_path = path / "adapter_model.safetensors"
+        with safetensors.safe_open(
+            tensor_path,
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            b_keys = [key for key in handle.keys() if ".lora_B." in key]
+            if not b_keys:
+                raise RuntimeError("initial LoRA has no lora_B tensors")
+            for key in b_keys:
+                tensor = handle.get_tensor(key)
+                if torch.count_nonzero(tensor).item() != 0:
+                    raise RuntimeError(
+                        "fresh LoRA initialization changes the base model"
+                    )
 
     @staticmethod
     def _assert_lora_tensors_changed(

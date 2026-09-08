@@ -65,8 +65,8 @@ def pinned_client_profile(
     else:
         raise ValueError(f"unknown pinned Client profile: {profile_id!r}")
 
-    if serving_backend not in {"mock", "ollama"}:
-        raise ValueError("serving_backend must be mock or ollama")
+    if serving_backend not in {"mock", "ollama", "transformers"}:
+        raise ValueError("serving_backend must be mock, ollama, or transformers")
 
     return ModelProfile(
         profile_id=profile_id,
@@ -92,6 +92,18 @@ def pinned_client_profile(
             else None
         ),
     )
+
+
+def ollama_model_for_profile(profile_id: str) -> str:
+    if profile_id == QWEN_PROFILE_ID:
+        return "qwen3:1.7b"
+    if profile_id == GRANITE_3_3_2B_CLIENT_PROFILE_ID:
+        return "granite3.3:2b"
+    raise ValueError(f"unknown pinned Client profile: {profile_id!r}")
+
+
+def supported_ollama_models() -> tuple[str, ...]:
+    return tuple(ollama_model_for_profile(profile_id) for profile_id in supported_profile_ids())
 
 
 def supported_profile_ids() -> tuple[str, ...]:

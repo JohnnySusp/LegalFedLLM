@@ -6,12 +6,10 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.reverse_training import ClientReverseCandidateResult
 from client.runtime import ClientRuntime
-from client.safety_probe import ClientSafetyProbeReport
 from client.training import (
     TrainingExecutionProfile,
     execution_profile_from_environment,
@@ -83,42 +81,6 @@ def _host_fixture_profile() -> ModelProfile:
             modules_to_save=(),
         ),
     )
-
-
-class _AlwaysBenignTestProbe:
-    def __init__(self, model_profile_hash: str):
-        self.model_profile_hash = model_profile_hash
-        self.manifest = SimpleNamespace(
-            artifact_hash=sha256_hex(
-                {
-                    "fixture": "real-client-reverse-benign-probe",
-                    "model_profile_hash": model_profile_hash,
-                }
-            )
-        )
-
-    def evaluate(self, **values):
-        return ClientSafetyProbeReport.create(
-            round_id=values["round_id"],
-            manifest_hash=values["manifest_hash"],
-            job_hash=values["job_hash"],
-            probe_id="real-client-reverse-test-probe",
-            probe_version="v1",
-            probe_artifact_hash=self.manifest.artifact_hash,
-            model_profile_hash=self.model_profile_hash,
-            parent_checkpoint_hash=values["parent_checkpoint_hash"],
-            candidate_checkpoint_hash=values["candidate_checkpoint_hash"],
-            delta_sha256=sha256_hex(
-                {
-                    "parent": values["parent_checkpoint_hash"],
-                    "candidate": values["candidate_checkpoint_hash"],
-                }
-            ),
-            maliciousness_probability=0.01,
-            harmful_threshold=0.8,
-            safety_gate_passed=True,
-            created_at=values["created_at"],
-        )
 
 
 def _reference_samples() -> list[ReferenceSample]:
@@ -240,14 +202,12 @@ class RealClientReverseAcceptanceTests(unittest.TestCase):
             )
             execution_values["verify_frozen_base_checksum"] = True
             execution = TrainingExecutionProfile.model_validate(execution_values)
-            probe = _AlwaysBenignTestProbe(profile.profile_hash())
             runtime = ClientRuntime(
                 data_dir=root / "client",
                 client_id="client-a",
                 model_profile=profile,
                 private_data_path=private_path,
                 training_execution_profile=execution,
-                safety_probe=probe,
                 force_reverse_validation_failure=force_rejection,
             )
             parent_record = runtime.local_train_round(manifest)
@@ -404,7 +364,6 @@ class RealClientReverseAcceptanceTests(unittest.TestCase):
             self.assertTrue(result.frozen_base_unchanged)
             self.assertTrue(result.reload_verified)
             self.assertTrue(decision.quality_gate_passed)
-            self.assertTrue(decision.safety_gate_passed)
             if force_rejection:
                 self.assertFalse(decision.adapter_promoted)
                 self.assertEqual(
@@ -433,8 +392,7 @@ class RealClientReverseAcceptanceTests(unittest.TestCase):
                     training_execution_profile=(
                         runtime.training_execution_profile
                     ),
-                    safety_probe=probe,
-                )
+                    )
                 retry = restarted._complete_reverse_distillation(job)
                 self.assertEqual(retry, decision)
                 self.assertEqual(decision_path.read_bytes(), original_bytes)

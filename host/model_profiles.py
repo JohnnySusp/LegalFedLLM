@@ -31,13 +31,13 @@ def pinned_host_profile(
     *,
     serving_backend: str = "mock",
 ) -> ModelProfile:
-    if serving_backend not in {"mock", "ollama"}:
-        raise ValueError("serving_backend must be mock or ollama")
+    if serving_backend not in {"mock", "ollama", "transformers"}:
+        raise ValueError("serving_backend must be mock, ollama, or transformers")
 
     if profile_id == MISTRAL_NEMO_HOST_PROFILE_ID:
-        if serving_backend != "mock":
+        if serving_backend not in {"mock", "transformers"}:
             raise ValueError(
-                "the pinned Mistral Nemo Host supports mock serving only"
+                "the pinned Mistral Nemo Host supports mock or transformers serving"
             )
         return ModelProfile(
             profile_id=MISTRAL_NEMO_HOST_PROFILE_ID,
@@ -51,7 +51,7 @@ def pinned_host_profile(
             tokenizer_class="PreTrainedTokenizerFast",
             vocabulary_size=131072,
             training_backend="transformers",
-            serving_backend="mock",
+            serving_backend=serving_backend,
             prompt_template_id=PROMPT_TEMPLATE_ID,
             prompt_template_hash=sha256_hex(PROMPT_TEMPLATE.encode("utf-8")),
             tokenizer_chat_template_hash=MISTRAL_NEMO_CHAT_TEMPLATE_HASH,

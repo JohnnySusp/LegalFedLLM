@@ -1,0 +1,1 @@
+"""Portable LegalFedLLM desktop Client."""

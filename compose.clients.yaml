@@ -52,7 +52,6 @@ services:
       CLIENT_OLLAMA_MODEL: ${QWEN_CLIENT_OLLAMA_MODEL:-qwen3:1.7b}
       CLIENT_PRIVATE_DATASET_ID: ${QWEN_CLIENT_PRIVATE_DATASET_ID:-qwen-client-private-v1}
       CLIENT_ADMIN_TOKEN: ${QWEN_CLIENT_ADMIN_TOKEN:-}
-      CLIENT_SAFEFED_PROBE_MANIFEST_PATH: ${QWEN_CLIENT_SAFEFED_PROBE_MANIFEST_PATH:-/safety-probe/probe.json}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${QWEN_CLIENT_PORT:-8001}/health')"]
       interval: 5s
@@ -62,7 +61,6 @@ services:
       - client_1_data:/data/client
       - huggingface_cache:/models/huggingface
       - ${QWEN_CLIENT_PRIVATE_DATA_DIR:-./data/client-private-qwen}:/private:ro
-      - ${QWEN_CLIENT_SAFEFED_PROBE_DIR:-./data/client-safety-probe}:/safety-probe:ro
 
   client-2:
     <<: *client-service

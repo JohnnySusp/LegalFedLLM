@@ -33,3 +33,10 @@ Thumbs.db
 
 # Local repository delivery archives
 /LegalFedLLM*.zip
+
+# Portable desktop Client state and build outputs
+LegalFedLLM-data/
+build/
+dist/
+*.AppImage
+*.AppDir/

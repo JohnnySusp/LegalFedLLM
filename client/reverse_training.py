@@ -245,7 +245,7 @@ class ClientValidationRecord(ReverseTrainingContract):
 
 
 class ClientReverseDecision(ReverseTrainingContract):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["2.0"] = "2.0"
     round_id: str = Field(min_length=1, max_length=128)
     manifest_hash: str = Field(pattern=HASH_PATTERN)
     job_hash: str = Field(pattern=HASH_PATTERN)
@@ -267,8 +267,6 @@ class ClientReverseDecision(ReverseTrainingContract):
         default=None,
         pattern=HASH_PATTERN,
     )
-    safety_report_hash: str | None = Field(default=None, pattern=HASH_PATTERN)
-    probe_artifact_hash: str | None = Field(default=None, pattern=HASH_PATTERN)
     parent_macro_mean_answer_token_ce: float | None = Field(
         default=None,
         ge=0,
@@ -287,14 +285,6 @@ class ClientReverseDecision(ReverseTrainingContract):
         CLIENT_QUALITY_NON_REGRESSION_TOLERANCE
     )
     quality_gate_passed: bool | None = None
-    maliciousness_probability: float | None = Field(
-        default=None,
-        ge=0,
-        le=1,
-        allow_inf_nan=False,
-    )
-    safety_threshold: Literal[0.8] | None = None
-    safety_gate_passed: bool | None = None
     stale_parent: bool
     forced_rejection: bool
     adapter_promoted: bool
@@ -302,8 +292,6 @@ class ClientReverseDecision(ReverseTrainingContract):
         "candidate_accepted",
         "no_host_teacher_samples",
         "quality_gate_failed",
-        "safety_gate_failed",
-        "quality_and_safety_gates_failed",
         "forced_validation_rejection",
         "stale_parent",
     ]
@@ -324,8 +312,6 @@ class ClientReverseDecision(ReverseTrainingContract):
             self.parent_macro_mean_answer_token_ce,
             self.candidate_macro_mean_answer_token_ce,
             self.observed_ce_regression,
-            self.maliciousness_probability,
-            self.safety_gate_passed,
         )
         if self.decision_reason == "no_host_teacher_samples":
             if self.host_teacher_sample_count != 0 or any(
@@ -350,10 +336,7 @@ class ClientReverseDecision(ReverseTrainingContract):
             assert self.parent_macro_mean_answer_token_ce is not None
             assert self.candidate_macro_mean_answer_token_ce is not None
             assert self.observed_ce_regression is not None
-            assert self.maliciousness_probability is not None
-            assert self.safety_threshold is not None
             assert self.quality_gate_passed is not None
-            assert self.safety_gate_passed is not None
             if self.candidate_adapter_version != self.parent_adapter_version + 1:
                 raise ValueError("Client decision candidate does not follow parent")
             observed = (
@@ -371,13 +354,8 @@ class ClientReverseDecision(ReverseTrainingContract):
                 observed <= self.quality_non_regression_tolerance
             ):
                 raise ValueError("Client quality gate differs from its CE metrics")
-            if self.safety_gate_passed != (
-                self.maliciousness_probability < self.safety_threshold
-            ):
-                raise ValueError("Client safety gate differs from its probability")
             expected_promotion = (
                 self.quality_gate_passed
-                and self.safety_gate_passed
                 and not self.stale_parent
                 and not self.forced_rejection
             )
@@ -387,14 +365,10 @@ class ClientReverseDecision(ReverseTrainingContract):
                 expected_reason = "stale_parent"
             elif self.forced_rejection:
                 expected_reason = "forced_validation_rejection"
-            elif self.quality_gate_passed and self.safety_gate_passed:
+            elif self.quality_gate_passed:
                 expected_reason = "candidate_accepted"
-            elif not self.quality_gate_passed and not self.safety_gate_passed:
-                expected_reason = "quality_and_safety_gates_failed"
-            elif not self.quality_gate_passed:
-                expected_reason = "quality_gate_failed"
             else:
-                expected_reason = "safety_gate_failed"
+                expected_reason = "quality_gate_failed"
             if self.decision_reason != expected_reason:
                 raise ValueError("Client decision reason differs from its gates")
             if self.adapter_promoted:
@@ -422,6 +396,7 @@ class ClientReverseDecision(ReverseTrainingContract):
         if self.decision_hash != expected:
             raise ValueError("Client reverse decision hash differs")
         return self
+
 
     @classmethod
     def create(cls, **values: Any) -> "ClientReverseDecision":
@@ -653,6 +628,8 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         self,
         job: ClientReverseTrainingJob,
         artifact_path: str | Path,
+        *,
+        parent_state_kind: Literal["base", "peft"] = "peft",
     ) -> ClientReverseCandidateResult:
         torch, transformers, peft, safetensors = self._dependencies()
         self._validate_device(torch)
@@ -667,11 +644,17 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         ):
             raise ValueError("Client reverse job uses another loss contract")
 
-        parent_metadata, parent_path = self.checkpoints.version(
-            job.parent_adapter_version
-        )
-        if parent_metadata.checkpoint_hash != job.parent_adapter_hash:
-            raise ValueError("Client reverse parent checkpoint hash differs")
+        if parent_state_kind == "base":
+            if job.parent_adapter_version != 0:
+                raise ValueError("base-only Client reverse parent must be version 0")
+            parent_metadata = None
+            parent_path = None
+        else:
+            parent_metadata, parent_path = self.checkpoints.version(
+                job.parent_adapter_version
+            )
+            if parent_metadata.checkpoint_hash != job.parent_adapter_hash:
+                raise ValueError("Client reverse parent checkpoint hash differs")
         arrays = load_client_reverse_training_artifact(
             artifact_path,
             job.artifact,
@@ -696,14 +679,29 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         output_dir.mkdir(parents=True, exist_ok=False)
         candidate_path: Path | None = None
         base_model = model = trainer = reloaded_base = reloaded = None
+        transient_parent_path: Path | None = None
         try:
             base_model = self._load_base_model(torch, transformers)
-            model = peft.PeftModel.from_pretrained(
-                base_model,
-                parent_path,
-                is_trainable=True,
-            )
-            self._verify_loaded_adapter(model)
+            if parent_state_kind == "base":
+                model = self._create_adapter(peft, base_model)
+                transient_parent_path = output_dir / "base_parent_adapter"
+                model.save_pretrained(
+                    transient_parent_path,
+                    safe_serialization=True,
+                    save_embedding_layers=False,
+                )
+                self._validate_adapter_tensors(safetensors, transient_parent_path)
+                self._assert_initial_lora_is_noop(
+                    torch, safetensors, transient_parent_path
+                )
+            else:
+                assert parent_path is not None
+                model = peft.PeftModel.from_pretrained(
+                    base_model,
+                    parent_path,
+                    is_trainable=True,
+                )
+                self._verify_loaded_adapter(model)
             trainable_count, total_count = self._assert_trainable_parameters(model)
             frozen_checksum = self._frozen_parameter_checksum(torch, model)
             if self.execution_profile.gradient_checkpointing:
@@ -780,16 +778,23 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 save_embedding_layers=False,
             )
             self._validate_adapter_tensors(safetensors, candidate_path)
+            comparison_parent_path = (
+                transient_parent_path if parent_state_kind == "base" else parent_path
+            )
+            assert comparison_parent_path is not None
             self._assert_lora_tensors_changed(
                 torch,
                 safetensors,
-                parent_path,
+                comparison_parent_path,
                 candidate_path,
             )
             metadata = self.checkpoints.seal(
                 candidate_path,
-                version=parent_metadata.version + 1,
+                version=(1 if parent_state_kind == "base" else job.parent_adapter_version + 1),
                 parent=parent_metadata,
+                base_parent_hash=(
+                    job.parent_adapter_hash if parent_state_kind == "base" else None
+                ),
                 round_id=job.manifest.round_id,
                 manifest_hash=job.manifest.manifest_hash,
                 execution_profile_hash=profile.profile_hash(),
@@ -818,8 +823,8 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 round_id=job.manifest.round_id,
                 manifest_hash=job.manifest.manifest_hash,
                 job_hash=job.job_hash,
-                parent_adapter_version=parent_metadata.version,
-                parent_adapter_hash=parent_metadata.checkpoint_hash,
+                parent_adapter_version=job.parent_adapter_version,
+                parent_adapter_hash=job.parent_adapter_hash,
                 candidate_adapter_version=metadata.version,
                 candidate_adapter_hash=metadata.checkpoint_hash,
                 client_model_profile_hash=self.model_profile.profile_hash(),
@@ -878,23 +883,35 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         validation_samples: Sequence[ReferenceSample],
         adapter_role: Literal["parent", "candidate"],
     ) -> ClientValidationRecord:
+        candidate_metadata, _ = self.checkpoints.candidate(
+            result.round_id,
+            result.candidate_adapter_version,
+        )
         if adapter_role == "parent":
-            metadata, checkpoint_path = self.checkpoints.version(
-                result.parent_adapter_version
-            )
-            if metadata.checkpoint_hash != result.parent_adapter_hash:
-                raise ValueError("Client validation parent hash differs")
+            if candidate_metadata.parent_state_kind == "base":
+                if result.parent_adapter_version != 0:
+                    raise ValueError("Client validation base parent version differs")
+                checkpoint_path = None
+                adapter_version = result.parent_adapter_version
+                checkpoint_hash = result.parent_adapter_hash
+            else:
+                metadata, checkpoint_path = self.checkpoints.version(
+                    result.parent_adapter_version
+                )
+                if metadata.checkpoint_hash != result.parent_adapter_hash:
+                    raise ValueError("Client validation parent hash differs")
+                adapter_version = metadata.version
+                checkpoint_hash = metadata.checkpoint_hash
         else:
             checkpoint_path = self.validate_candidate(result)
-            metadata, _ = self.checkpoints.candidate(
-                result.round_id,
-                result.candidate_adapter_version,
-            )
+            adapter_version = candidate_metadata.version
+            checkpoint_hash = candidate_metadata.checkpoint_hash
         return self._evaluate_adapter(
             job=job,
             validation_samples=validation_samples,
             adapter_role=adapter_role,
-            metadata=metadata,
+            adapter_version=adapter_version,
+            checkpoint_hash=checkpoint_hash,
             checkpoint_path=checkpoint_path,
         )
 
@@ -902,10 +919,28 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         self,
         result: ClientReverseCandidateResult,
     ) -> tuple[AdapterCheckpointMetadata, Path]:
+        candidate_path = self.checkpoints.candidate_path(
+            result.round_id,
+            result.candidate_adapter_version,
+        )
+        if candidate_path.exists():
+            metadata, _ = self.checkpoints.candidate(
+                result.round_id,
+                result.candidate_adapter_version,
+            )
+        else:
+            metadata, _ = self.checkpoints.version(
+                result.candidate_adapter_version
+            )
         return self.checkpoints.promote_candidate(
             result.round_id,
             result.candidate_adapter_version,
             result.candidate_adapter_hash,
+            expected_base_parent_hash=(
+                result.parent_adapter_hash
+                if metadata.parent_state_kind == "base"
+                else None
+            ),
         )
 
     def discard_candidate(self, result: ClientReverseCandidateResult) -> None:
@@ -921,8 +956,9 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         job: ClientReverseTrainingJob,
         validation_samples: Sequence[ReferenceSample],
         adapter_role: Literal["parent", "candidate"],
-        metadata: AdapterCheckpointMetadata,
-        checkpoint_path: Path,
+        adapter_version: int,
+        checkpoint_hash: str,
+        checkpoint_path: Path | None,
     ) -> ClientValidationRecord:
         torch, transformers, peft, _ = self._dependencies()
         self._validate_device(torch)
@@ -959,12 +995,15 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
         base_model = model = None
         try:
             base_model = self._load_base_model(torch, transformers)
-            model = peft.PeftModel.from_pretrained(
-                base_model,
-                checkpoint_path,
-                is_trainable=False,
-            )
-            self._verify_loaded_adapter(model)
+            if checkpoint_path is None:
+                model = base_model
+            else:
+                model = peft.PeftModel.from_pretrained(
+                    base_model,
+                    checkpoint_path,
+                    is_trainable=False,
+                )
+                self._verify_loaded_adapter(model)
             if any(parameter.requires_grad for parameter in model.parameters()):
                 raise RuntimeError("Client validation loaded trainable parameters")
             model.eval()
@@ -1049,8 +1088,8 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 partition_hash=job.public_data_partition.partition_hash,
                 client_model_profile_hash=self.model_profile.profile_hash(),
                 adapter_role=adapter_role,
-                adapter_version=metadata.version,
-                checkpoint_hash=metadata.checkpoint_hash,
+                adapter_version=adapter_version,
+                checkpoint_hash=checkpoint_hash,
                 samples=metrics,
             )
         finally:

@@ -1,30 +1,24 @@
 from __future__ import annotations
 
 import json
-import math
 import tempfile
 import unittest
+
+from pydantic import ValidationError
 from unittest import mock
 from pathlib import Path
-from types import SimpleNamespace
 
-import numpy as np
-from safetensors.numpy import save_file
 
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.reverse_training import (
     ClientReverseCandidateResult,
+    ClientReverseDecision,
     ClientValidationRecord,
     ClientValidationSampleMetric,
     collate_client_reverse_training_rows,
     selective_client_loss,
 )
 from client.runtime import ClientRuntime
-from client.safety_probe import (
-    ClientSafetyProbeReport,
-    SafeFedLoraProbe,
-    SafeFedProbeManifest,
-)
 from client.training import TrainingExecutionProfile
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.protocol import (
@@ -65,9 +59,9 @@ def reverse_fixture(
     *,
     host_teachers: bool = True,
     force_rejection: bool = False,
-    maliciousness_probability: float = 0.1,
     advance_on_candidate_validation: bool = False,
     sample_count: int = 2,
+    base_parent: bool = False,
 ):
     profile = pinned_client_profile(QWEN_PROFILE_ID)
     execution = TrainingExecutionProfile(
@@ -126,37 +120,75 @@ def reverse_fixture(
         execution=execution,
         advance_on_candidate_validation=advance_on_candidate_validation,
     )
-    probe = FakeSafetyProbe(profile, maliciousness_probability)
     runtime = ClientRuntime(
         data_dir=root / "client",
         client_id="client-a",
         model_profile=profile,
         training_execution_profile=execution,
         reverse_backend=backend,
-        safety_probe=probe,
         force_reverse_validation_failure=force_rejection,
     )
     backend.runtime = runtime
-    staging = runtime.adapter_store.staging_path("parent")
-    FakeReverseBackend.write_adapter(staging, b"parent")
-    parent = runtime.adapter_store.seal(
-        staging,
-        version=1,
-        parent=None,
-        round_id=manifest.round_id,
-        manifest_hash=manifest.manifest_hash,
-        execution_profile_hash=execution.profile_hash(),
-    )
-    runtime.adapter_store.promote(staging, parent)
-    state = runtime.state()
-    state.update(
-        {
-            "candidate_adapter_version": parent.version,
-            "training_adapter_version": parent.version,
-            "training_checkpoint_hash": parent.checkpoint_hash,
-        }
-    )
-    runtime.store.write_json("state.json", state)
+    if base_parent:
+        state = runtime.state()
+        parent_version = 0
+        parent_hash = sha256_hex(state)
+        runtime.store.write_json(
+            runtime._accepted_snapshot_path(manifest.round_id),
+            {
+                "round_id": manifest.round_id,
+                "manifest_hash": manifest.manifest_hash,
+                "client_id": "client-a",
+                "model_profile_id": profile.profile_id,
+                "model_profile_hash": profile.profile_hash(),
+                "adapter_version": 0,
+                "local_training_runs": 0,
+                "state_hash": parent_hash,
+                "package_hash": "9" * 64,
+                "artifact_sha256": "8" * 64,
+                "created_at": utc_text(),
+            },
+        )
+    else:
+        staging = runtime.adapter_store.staging_path("parent")
+        FakeReverseBackend.write_adapter(staging, b"parent")
+        parent = runtime.adapter_store.seal(
+            staging,
+            version=1,
+            parent=None,
+            round_id=manifest.round_id,
+            manifest_hash=manifest.manifest_hash,
+            execution_profile_hash=execution.profile_hash(),
+        )
+        runtime.adapter_store.promote(staging, parent)
+        state = runtime.state()
+        state.update(
+            {
+                "candidate_adapter_version": parent.version,
+                "training_adapter_version": parent.version,
+                "training_checkpoint_hash": parent.checkpoint_hash,
+            }
+        )
+        runtime.store.write_json("state.json", state)
+        parent_version = parent.version
+        parent_hash = parent.checkpoint_hash
+        runtime.store.write_json(
+            runtime._accepted_snapshot_path(manifest.round_id),
+            {
+                "round_id": manifest.round_id,
+                "manifest_hash": manifest.manifest_hash,
+                "client_id": "client-a",
+                "model_profile_id": profile.profile_id,
+                "model_profile_hash": profile.profile_hash(),
+                "adapter_version": parent.version,
+                "local_training_runs": 0,
+                "state_hash": sha256_hex(state),
+                "training_checkpoint_hash": parent.checkpoint_hash,
+                "package_hash": "9" * 64,
+                "artifact_sha256": "8" * 64,
+                "created_at": utc_text(),
+            },
+        )
     reference_path = root / "reference.jsonl"
     write_reference_jsonl(reference_path, samples)
     runtime.cache_reference_dataset(
@@ -177,8 +209,8 @@ def reverse_fixture(
         manifest=manifest,
         client_id="client-a",
         client_model_profile_hash=profile.profile_hash(),
-        parent_adapter_version=parent.version,
-        parent_adapter_hash=parent.checkpoint_hash,
+        parent_adapter_version=parent_version,
+        parent_adapter_hash=parent_hash,
         accepted_host_adapter_version=1,
         host_package_hash="c" * 64,
         host_adapter_promoted=False,
@@ -192,37 +224,7 @@ def reverse_fixture(
         artifact=artifact,
         created_at=utc_text(),
     )
-    return runtime, backend, probe, job
-
-
-class FakeSafetyProbe:
-    def __init__(self, profile: ModelProfile, probability: float):
-        self.probability = probability
-        self.manifest = SimpleNamespace(
-            artifact_hash=sha256_hex(
-                {"probe": "test", "profile": profile.profile_hash()}
-            )
-        )
-
-    def evaluate(self, **values):
-        return ClientSafetyProbeReport.create(
-            round_id=values["round_id"],
-            manifest_hash=values["manifest_hash"],
-            job_hash=values["job_hash"],
-            probe_id="test-qwen-probe",
-            probe_version="v1",
-            probe_artifact_hash=self.manifest.artifact_hash,
-            model_profile_hash=pinned_client_profile(
-                QWEN_PROFILE_ID
-            ).profile_hash(),
-            parent_checkpoint_hash=values["parent_checkpoint_hash"],
-            candidate_checkpoint_hash=values["candidate_checkpoint_hash"],
-            delta_sha256="e" * 64,
-            maliciousness_probability=self.probability,
-            harmful_threshold=0.8,
-            safety_gate_passed=self.probability < 0.8,
-            created_at=values["created_at"],
-        )
+    return runtime, backend, job
 
 
 class FakeReverseBackend:
@@ -251,27 +253,47 @@ class FakeReverseBackend:
         )
         (path / "adapter_model.safetensors").write_bytes(marker)
 
-    def train_candidate(self, job, artifact_path):
+    def train_candidate(
+        self,
+        job,
+        artifact_path,
+        *,
+        parent_state_kind="peft",
+    ):
         del artifact_path
         self.train_calls += 1
         staging = self.runtime.adapter_store.staging_path("reverse-candidate")
         self.write_adapter(staging, b"candidate")
-        parent, _ = self.runtime.adapter_store.version(job.parent_adapter_version)
-        candidate = self.runtime.adapter_store.seal(
-            staging,
-            version=parent.version + 1,
-            parent=parent,
-            round_id=job.manifest.round_id,
-            manifest_hash=job.manifest.manifest_hash,
-            execution_profile_hash=self.execution.profile_hash(),
-        )
+        if parent_state_kind == "base":
+            parent = None
+            candidate = self.runtime.adapter_store.seal(
+                staging,
+                version=1,
+                parent=None,
+                base_parent_hash=job.parent_adapter_hash,
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                execution_profile_hash=self.execution.profile_hash(),
+            )
+        else:
+            parent, _ = self.runtime.adapter_store.version(
+                job.parent_adapter_version
+            )
+            candidate = self.runtime.adapter_store.seal(
+                staging,
+                version=parent.version + 1,
+                parent=parent,
+                round_id=job.manifest.round_id,
+                manifest_hash=job.manifest.manifest_hash,
+                execution_profile_hash=self.execution.profile_hash(),
+            )
         self.runtime.adapter_store.store_candidate(staging, candidate)
         return ClientReverseCandidateResult.create(
             round_id=job.manifest.round_id,
             manifest_hash=job.manifest.manifest_hash,
             job_hash=job.job_hash,
-            parent_adapter_version=parent.version,
-            parent_adapter_hash=parent.checkpoint_hash,
+            parent_adapter_version=job.parent_adapter_version,
+            parent_adapter_hash=job.parent_adapter_hash,
             candidate_adapter_version=candidate.version,
             candidate_adapter_hash=candidate.checkpoint_hash,
             client_model_profile_hash=self.profile.profile_hash(),
@@ -354,10 +376,19 @@ class FakeReverseBackend:
 
     def promote_candidate(self, result):
         self.promote_calls += 1
+        metadata, _ = self.runtime.adapter_store.candidate(
+            result.round_id,
+            result.candidate_adapter_version,
+        )
         return self.runtime.adapter_store.promote_candidate(
             result.round_id,
             result.candidate_adapter_version,
             result.candidate_adapter_hash,
+            expected_base_parent_hash=(
+                result.parent_adapter_hash
+                if metadata.parent_state_kind == "base"
+                else None
+            ),
         )
 
     def discard_candidate(self, result):
@@ -564,97 +595,28 @@ class ClientReverseLossTests(unittest.TestCase):
         self.assertLessEqual(max(sequence_widths), 3)
 
 
-class SafeFedProbeTests(unittest.TestCase):
-    def test_qwen_probe_is_hash_bound_and_uses_strict_point_eight_gate(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            profile = pinned_client_profile(QWEN_PROFILE_ID)
-            keys = [
-                "base_model.model.model.layers.0.self_attn."
-                f"{target}.lora_B.weight"
-                for target in ("q_proj", "k_proj", "v_proj", "o_proj")
-            ]
-            parent = root / "parent"
-            candidate = root / "candidate"
-            parent.mkdir()
-            candidate.mkdir()
-            save_file(
-                {
-                    key: np.zeros((2, 2), dtype=np.float32)
-                    for key in keys
-                },
-                parent / "adapter_model.safetensors",
-                metadata={"format": "pt"},
-            )
-            save_file(
-                {
-                    key: np.ones((2, 2), dtype=np.float32)
-                    for key in keys
-                },
-                candidate / "adapter_model.safetensors",
-                metadata={"format": "pt"},
-            )
-            weights_path = root / "linear_probe.safetensors"
-            save_file(
-                {
-                    "linear_weight": np.zeros(16, dtype=np.float32),
-                    "linear_bias": np.array([math.log(0.8 / 0.2)], dtype=np.float32),
-                },
-                weights_path,
-            )
-            content = weights_path.read_bytes()
-            manifest = SafeFedProbeManifest.create(
-                probe_id="qwen-safe-probe",
-                probe_version="v1",
-                model_profile_hash=profile.profile_hash(),
-                model_revision=profile.model_revision,
-                lora_profile_hash=sha256_hex(profile.lora.model_dump(mode="json")),
-                ordered_parameter_keys=keys,
-                parameter_sizes={key: 4 for key in keys},
-                input_dimension=16,
-                weights_file=weights_path.name,
-                weights_byte_size=len(content),
-                weights_sha256=sha256_hex(content),
-                training_corpus_hash="1" * 64,
-                validation_corpus_hash="2" * 64,
-                created_at=utc_text(),
-            )
-            manifest_path = root / "probe.json"
-            manifest_path.write_text(manifest.model_dump_json(), encoding="utf-8")
-            probe = SafeFedLoraProbe(
-                manifest_path=manifest_path,
-                model_profile=profile,
-            )
-            report = probe.evaluate(
-                round_id="round-1",
-                manifest_hash="3" * 64,
-                job_hash="4" * 64,
-                parent_checkpoint_hash="5" * 64,
-                candidate_checkpoint_hash="6" * 64,
-                parent_path=parent,
-                candidate_path=candidate,
-            )
-            self.assertAlmostEqual(report.maliciousness_probability, 0.8, places=6)
-            self.assertFalse(report.safety_gate_passed)
-            tampered = bytearray(content)
-            tampered[-1] ^= 1
-            weights_path.write_bytes(tampered)
-            with self.assertRaisesRegex(ValueError, "SHA-256"):
-                SafeFedLoraProbe(
-                    manifest_path=manifest_path,
-                    model_profile=profile,
-                )
-
-
 class ClientReverseRuntimeTests(unittest.TestCase):
     def test_natural_promotion_is_restart_and_byte_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runtime, backend, _, job = reverse_fixture(root)
+            runtime, backend, job = reverse_fixture(root)
             decision = runtime._complete_reverse_distillation(job)
             self.assertTrue(decision.adapter_promoted)
             self.assertTrue(decision.quality_gate_passed)
-            self.assertTrue(decision.safety_gate_passed)
+            self.assertEqual(decision.schema_version, "2.0")
+            decision_payload = decision.model_dump(mode="json")
+            for removed_field in (
+                "safety_report_hash",
+                "probe_artifact_hash",
+                "maliciousness_probability",
+                "safety_threshold",
+                "safety_gate_passed",
+            ):
+                self.assertNotIn(removed_field, decision_payload)
+            legacy_payload = dict(decision_payload)
+            legacy_payload["safety_gate_passed"] = True
+            with self.assertRaises(ValidationError):
+                ClientReverseDecision.model_validate(legacy_payload)
             self.assertEqual(runtime.adapter_store.current()[0].version, 2)
             self.assertEqual(backend.train_calls, 1)
             self.assertEqual(backend.promote_calls, 1)
@@ -676,7 +638,7 @@ class ClientReverseRuntimeTests(unittest.TestCase):
 
     def test_restart_recovers_candidate_without_a_result_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runtime, backend, _, job = reverse_fixture(Path(directory))
+            runtime, backend, job = reverse_fixture(Path(directory))
             parent, _ = runtime.adapter_store.current()
             staging = runtime.adapter_store.staging_path("interrupted-candidate")
             FakeReverseBackend.write_adapter(staging, b"interrupted")
@@ -701,7 +663,7 @@ class ClientReverseRuntimeTests(unittest.TestCase):
 
     def test_forced_rejection_discards_candidate_and_retains_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runtime, backend, _, job = reverse_fixture(
+            runtime, backend, job = reverse_fixture(
                 Path(directory),
                 force_rejection=True,
             )
@@ -729,21 +691,9 @@ class ClientReverseRuntimeTests(unittest.TestCase):
             self.assertEqual(decision_path.read_bytes(), before)
             self.assertEqual(restarted.adapter_store.current()[0].version, 1)
 
-    def test_safety_rejection_is_independent_of_quality(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            runtime, _, _, job = reverse_fixture(
-                Path(directory),
-                maliciousness_probability=0.9,
-            )
-            decision = runtime._complete_reverse_distillation(job)
-            self.assertTrue(decision.quality_gate_passed)
-            self.assertFalse(decision.safety_gate_passed)
-            self.assertEqual(decision.decision_reason, "safety_gate_failed")
-            self.assertFalse(decision.adapter_promoted)
-
     def test_no_host_teacher_is_a_successful_no_op(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runtime, backend, _, job = reverse_fixture(
+            runtime, backend, job = reverse_fixture(
                 Path(directory),
                 host_teachers=False,
             )
@@ -754,9 +704,68 @@ class ClientReverseRuntimeTests(unittest.TestCase):
             self.assertEqual(backend.train_calls, 0)
             self.assertEqual(runtime.adapter_store.current()[0].version, 1)
 
+    def test_base_only_parent_can_promote_first_peft_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, backend, job = reverse_fixture(
+                root,
+                base_parent=True,
+            )
+            self.assertIsNone(runtime.adapter_store.current())
+
+            decision = runtime._complete_reverse_distillation(job)
+
+            self.assertTrue(decision.adapter_promoted)
+            self.assertEqual(decision.parent_adapter_version, 0)
+            self.assertEqual(decision.parent_adapter_hash, job.parent_adapter_hash)
+            current, _ = runtime.adapter_store.current()
+            self.assertEqual(current.version, 1)
+            self.assertEqual(current.parent_state_kind, "base")
+            self.assertEqual(current.parent_version, 0)
+            self.assertEqual(
+                current.parent_checkpoint_hash,
+                job.parent_adapter_hash,
+            )
+            self.assertEqual(backend.train_calls, 1)
+            self.assertEqual(backend.promote_calls, 1)
+
+            restarted = ClientRuntime(
+                data_dir=root / "client",
+                client_id="client-a",
+                model_profile=runtime.model_profile,
+                training_execution_profile=runtime.training_execution_profile,
+            )
+            retry = restarted._complete_reverse_distillation(job)
+            self.assertEqual(retry, decision)
+            self.assertEqual(restarted.adapter_store.current()[0].version, 1)
+
+    def test_base_only_rejection_keeps_client_without_peft_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, backend, job = reverse_fixture(
+                Path(directory),
+                base_parent=True,
+                force_rejection=True,
+            )
+
+            decision = runtime._complete_reverse_distillation(job)
+
+            self.assertFalse(decision.adapter_promoted)
+            self.assertEqual(
+                decision.decision_reason,
+                "forced_validation_rejection",
+            )
+            self.assertTrue(decision.rejected_candidate_discarded)
+            self.assertEqual(decision.accepted_adapter_version, 0)
+            self.assertEqual(
+                decision.accepted_adapter_hash,
+                job.parent_adapter_hash,
+            )
+            self.assertIsNone(runtime.adapter_store.current())
+            self.assertEqual(backend.discard_calls, 1)
+
     def test_candidate_adoption_requires_a_held_out_sample(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runtime, backend, _, job = reverse_fixture(
+            runtime, backend, job = reverse_fixture(
                 Path(directory),
                 sample_count=1,
             )
@@ -772,7 +781,7 @@ class ClientReverseRuntimeTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            runtime, backend, _, job = reverse_fixture(
+            runtime, backend, job = reverse_fixture(
                 Path(directory),
                 advance_on_candidate_validation=True,
             )

@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import time
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from client.runtime import ClientRuntime, ClientRuntimeError
+from client.tunnel import SshTunnelConfig, SshTunnelManager
 from shared.crypto import Ed25519Identity, canonical_json_bytes
 from shared.knowledge_transport import receive_knowledge_transfer
 from shared.ollama import OllamaError
@@ -49,6 +52,28 @@ class GenerateRequest(ApiModel):
 
 class OllamaInspectRequest(ApiModel):
     model: str = Field(min_length=1, max_length=256)
+
+
+class LearningSuggestionAction(ApiModel):
+    learn: bool
+
+
+class HostLearningConsent(ApiModel):
+    consent: bool
+
+
+class OpenAIChatMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1, max_length=100_000)
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    model: str
+    messages: list[OpenAIChatMessage] = Field(min_length=1, max_length=512)
+    max_tokens: int = Field(default=256, ge=1, le=4096)
+    stream: bool = False
 
 
 class CoordinatorGateway:
@@ -346,6 +371,20 @@ class CoordinatorGateway:
                 )
         return KnowledgePackage.model_validate(received.metadata)
 
+    async def generate_host(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+    ) -> dict[str, Any]:
+        path = "/v1/generate"
+        return await self._request(
+            "POST",
+            path,
+            json={"prompt": prompt, "max_new_tokens": max_new_tokens},
+            headers=self._client_auth_headers("POST", path),
+        )
+
+
 
 def runtime_from_environment() -> ClientRuntime:
     return ClientRuntime(
@@ -380,6 +419,7 @@ def create_app(
     runtime: ClientRuntime | None = None,
     gateway: CoordinatorGateway | None = None,
     admin_token_override: str | None = None,
+    tunnel_manager: SshTunnelManager | None = None,
 ) -> FastAPI:
     client_runtime = runtime or runtime_from_environment()
     coordinator = gateway or gateway_from_environment()
@@ -388,10 +428,26 @@ def create_app(
         "CLIENT_ADMIN_TOKEN",
         "development-client-admin-token",
     )
+    tunnel = tunnel_manager or SshTunnelManager(
+        SshTunnelConfig.from_environment()
+    )
 
-    app = FastAPI(title="LegalFedLLM Client Agent", version="0.2.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        tunnel.start()
+        try:
+            yield
+        finally:
+            tunnel.stop()
+
+    app = FastAPI(
+        title="LegalFedLLM Client Agent",
+        version="0.3.0",
+        lifespan=lifespan,
+    )
     app.state.runtime = client_runtime
     app.state.gateway = coordinator
+    app.state.tunnel = tunnel
     coordinator.bind_client_identity(
         client_runtime.client_id,
         client_runtime.identity,
@@ -420,6 +476,20 @@ def create_app(
                 detail="invalid Client admin token",
             )
 
+    def require_openai_bearer(
+        authorization: str | None = Header(default=None),
+    ) -> None:
+        prefix = "Bearer "
+        if (
+            authorization is None
+            or not authorization.startswith(prefix)
+            or not hmac.compare_digest(authorization[len(prefix):], admin_token)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid local provider bearer token",
+            )
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         state = client_runtime.state()
@@ -430,6 +500,8 @@ def create_app(
             "training_backend": client_runtime.model_profile.training_backend,
             "serving_backend": client_runtime.model_profile.serving_backend,
             "enrolled": client_runtime.registration_record() is not None,
+            "learning_queue": client_runtime.learning_queue_status(),
+            "tunnel": tunnel.status(),
             **state,
         }
 
@@ -452,6 +524,50 @@ def create_app(
         )
         client_runtime.commit_registration(record)
         return record
+
+    @app.get(
+        "/v1/tunnel",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def tunnel_status() -> dict[str, Any]:
+        return tunnel.status()
+
+    @app.get(
+        "/v1/model-compatibility",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def model_compatibility() -> dict[str, Any]:
+        return await client_runtime.ollama_compatibility()
+
+    @app.get(
+        "/v1/learning",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def learning_status() -> dict[str, Any]:
+        return client_runtime.learning_queue_status()
+
+    @app.get(
+        "/v1/learning/suggestions",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def learning_suggestions() -> list[dict[str, Any]]:
+        return client_runtime.pending_learning_suggestions()
+
+    @app.post(
+        "/v1/learning/suggestions/{suggestion_id}",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def learning_suggestion_action(
+        suggestion_id: str,
+        request: LearningSuggestionAction,
+    ) -> dict[str, Any]:
+        try:
+            return client_runtime.resolve_learning_suggestion(
+                suggestion_id,
+                learn=request.learn,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post(
         "/v1/local-train",
@@ -494,8 +610,26 @@ def create_app(
         manifest: RoundManifest,
         *,
         require_round_training: bool,
+        train_queued_learning: bool = False,
     ) -> SubmissionReceipt:
-        if (
+        if client_runtime.model_profile.training_backend == "transformers":
+            try:
+                await run_exclusive_ml(
+                    client_runtime.ensure_alignment_tokenizers,
+                    manifest,
+                )
+            except (ClientRuntimeError, RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if train_queued_learning:
+            try:
+                await run_exclusive_ml(
+                    client_runtime.train_queued_learning,
+                    manifest,
+                )
+            except (ClientRuntimeError, RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        elif (
             require_round_training
             and client_runtime.model_profile.training_backend != "transformers"
         ):
@@ -512,12 +646,24 @@ def create_app(
             )
 
         if client_runtime.model_profile.training_backend == "transformers":
-            package = await run_exclusive_ml(
-                client_runtime.create_knowledge_package,
-                manifest,
-            )
+            if require_round_training:
+                package = await run_exclusive_ml(
+                    client_runtime.create_knowledge_package,
+                    manifest,
+                )
+            else:
+                package = await run_exclusive_ml(
+                    partial(
+                        client_runtime.create_knowledge_package,
+                        manifest,
+                        require_round_training=False,
+                    )
+                )
         else:
-            package = client_runtime.create_knowledge_package(manifest)
+            package = client_runtime.create_knowledge_package(
+                manifest,
+                require_round_training=require_round_training,
+            )
         try:
             receipt = await coordinator.submit(
                 package,
@@ -557,10 +703,17 @@ def create_app(
                 detail="round manifest signature is invalid",
             )
 
+        compatibility = await client_runtime.ollama_compatibility()
+        if compatibility.get("required") and not compatibility.get("compatible"):
+            message = str(compatibility.get("error") or "Client model is incompatible")
+            print(message, flush=True)
+            raise HTTPException(status_code=409, detail=message)
+
         try:
             return await submit_participation(
                 manifest,
                 require_round_training=False,
+                train_queued_learning=True,
             )
         except ClientRuntimeError as exc:
             raise HTTPException(
@@ -580,9 +733,181 @@ def create_app(
             return await submit_participation(
                 manifest,
                 require_round_training=True,
+                train_queued_learning=False,
             )
         except (ClientRuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def completed_host_context(
+        round_id: str,
+    ) -> tuple[ServiceIdentity, RoundManifest, RoundState]:
+        identity = await coordinator.identity()
+        manifest = await coordinator.manifest(round_id)
+        if not manifest.verify_signature(identity.public_key):
+            raise HTTPException(status_code=401, detail="round manifest signature is invalid")
+        status_record = await coordinator.status(round_id)
+        if status_record.state != "COMPLETED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"round is not completed: {status_record.state}",
+            )
+        if (
+            identity.host_public_key is None
+            or identity.host_service_id is None
+            or status_record.host_adapter_after is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Host identity or accepted adapter version is missing",
+            )
+        return identity, manifest, status_record
+
+    @app.post(
+        "/v1/rounds/{round_id}/host-preview",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def host_preview(round_id: str) -> dict[str, Any]:
+        identity, manifest, status_record = await completed_host_context(round_id)
+
+        try:
+            cached_package, cached_artifact = client_runtime.cached_host_knowledge(
+                round_id,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+        except ClientRuntimeError:
+            cached_package = None
+            cached_artifact = None
+
+        if cached_package is not None and cached_artifact is not None:
+            try:
+                preview = await run_exclusive_ml(
+                    partial(
+                        client_runtime.apply_host_knowledge,
+                        manifest=manifest,
+                        host_package=cached_package,
+                        host_artifact_path=cached_artifact,
+                        host_public_key=identity.host_public_key,
+                        expected_host_id=identity.host_service_id,
+                        accepted_host_adapter_version=status_record.host_adapter_after,
+                        adapter_promoted=bool(status_record.adapter_promoted),
+                        complete_reverse=False,
+                        require_fresh_host_package=False,
+                    )
+                )
+                if not preview["requires_consent"]:
+                    state = client_runtime.decline_host_knowledge(round_id)
+                    preview["completed_without_reverse"] = True
+                    preview["last_completed_round"] = state["last_completed_round"]
+                return preview
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        incoming_artifact = client_runtime.incoming_host_artifact_path(round_id)
+        try:
+            package = await coordinator.host_knowledge(
+                round_id,
+                incoming_artifact,
+                manifest.maximum_knowledge_package_bytes,
+            )
+            preview = await run_exclusive_ml(
+                partial(
+                    client_runtime.apply_host_knowledge,
+                    manifest=manifest,
+                    host_package=package,
+                    host_artifact_path=incoming_artifact,
+                    host_public_key=identity.host_public_key,
+                    expected_host_id=identity.host_service_id,
+                    accepted_host_adapter_version=status_record.host_adapter_after,
+                    adapter_promoted=bool(status_record.adapter_promoted),
+                    complete_reverse=False,
+                )
+            )
+            if not preview["requires_consent"]:
+                state = client_runtime.decline_host_knowledge(round_id)
+                preview["completed_without_reverse"] = True
+                preview["last_completed_round"] = state["last_completed_round"]
+            return preview
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            incoming_artifact.unlink(missing_ok=True)
+
+    @app.post(
+        "/v1/rounds/{round_id}/host-consent",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def host_consent(
+        round_id: str,
+        request: HostLearningConsent,
+    ) -> dict[str, Any]:
+        identity, manifest, status_record = await completed_host_context(round_id)
+        if not request.consent:
+            try:
+                return client_runtime.decline_host_knowledge(round_id)
+            except (ClientRuntimeError, ValueError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            package, artifact_path = client_runtime.cached_host_knowledge(
+                round_id,
+                maximum_bytes=manifest.maximum_knowledge_package_bytes,
+            )
+            return await run_exclusive_ml(
+                partial(
+                    client_runtime.apply_host_knowledge,
+                    manifest=manifest,
+                    host_package=package,
+                    host_artifact_path=artifact_path,
+                    host_public_key=identity.host_public_key,
+                    expected_host_id=identity.host_service_id,
+                    accepted_host_adapter_version=status_record.host_adapter_after,
+                    adapter_promoted=bool(status_record.adapter_promoted),
+                    complete_reverse=True,
+                    require_fresh_host_package=False,
+                )
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/ui/status",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def ui_status() -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "client_id": client_runtime.client_id,
+            "model_profile_id": client_runtime.model_profile.profile_id,
+            "model_id": client_runtime.model_profile.model_id,
+            "enrolled": client_runtime.registration_record() is not None,
+            "learning_queue": client_runtime.learning_queue_status(),
+            "tunnel": tunnel.status(),
+            "client_state": client_runtime.state(),
+            "coordinator_connected": False,
+            "round": None,
+        }
+        try:
+            identity = await coordinator.identity()
+            payload["coordinator_connected"] = True
+            try:
+                manifest = await coordinator.current_manifest()
+            except HTTPException as exc:
+                if exc.status_code == status.HTTP_404_NOT_FOUND:
+                    return payload
+                raise
+            if not manifest.verify_signature(identity.public_key):
+                raise RuntimeError("round manifest signature is invalid")
+            round_state = await coordinator.status(manifest.round_id)
+            payload["round"] = {
+                "round_id": manifest.round_id,
+                "state": round_state.state,
+                "accepted_count": len(round_state.accepted_client_ids),
+                "quorum": manifest.trusted_client_quorum,
+                "selected": client_runtime.client_id in manifest.selected_client_ids,
+                "participated": client_runtime.client_id in round_state.accepted_client_ids,
+            }
+        except Exception as exc:
+            payload["coordinator_connected"] = False
+            payload["coordinator_error"] = str(exc)
+        return payload
 
     @app.post(
         "/v1/rounds/{round_id}/sync",
@@ -650,15 +975,102 @@ def create_app(
         finally:
             incoming_artifact.unlink(missing_ok=True)
 
+    async def generate_local_messages(
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+    ) -> str:
+        if client_runtime.model_profile.serving_backend == "transformers":
+            return await run_exclusive_ml(
+                client_runtime.generate_transformers,
+                messages,
+                max_new_tokens,
+            )
+        prompt = messages[-1]["content"]
+        return await client_runtime.generate(prompt, max_new_tokens)
+
     @app.post("/v1/generate")
     async def generate(request: GenerateRequest) -> dict[str, Any]:
+        text = await generate_local_messages(
+            [{"role": "user", "content": request.prompt}],
+            request.max_new_tokens,
+        )
         return {
-            "text": await client_runtime.generate(
-                request.prompt, request.max_new_tokens
-            ),
+            "text": text,
             "model": client_runtime.model_profile.model_id,
             "adapter_version": client_runtime.state()["serving_adapter_version"],
         }
+
+    @app.post(
+        "/v1/generate/host",
+        dependencies=[Depends(require_client_admin_token)],
+    )
+    async def generate_host(request: GenerateRequest) -> dict[str, Any]:
+        return await coordinator.generate_host(
+            request.prompt,
+            request.max_new_tokens,
+        )
+
+    @app.get(
+        "/v1/models",
+        dependencies=[Depends(require_openai_bearer)],
+    )
+    async def openai_models() -> dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [
+                {"id": "legalfedllm-local", "object": "model", "owned_by": "legalfedllm"},
+                {"id": "legalfedllm-host", "object": "model", "owned_by": "legalfedllm"},
+            ],
+        }
+
+    @app.post(
+        "/v1/chat/completions",
+        dependencies=[Depends(require_openai_bearer)],
+    )
+    async def openai_chat_completion(
+        request: OpenAIChatCompletionRequest,
+    ) -> dict[str, Any]:
+        if request.stream:
+            raise HTTPException(status_code=400, detail="streaming is not implemented")
+        if request.model not in {"legalfedllm-local", "legalfedllm-host"}:
+            raise HTTPException(status_code=404, detail="unknown LegalFedLLM model")
+        messages = [item.model_dump(mode="json") for item in request.messages]
+        if request.model == "legalfedllm-local":
+            text = await generate_local_messages(messages, request.max_tokens)
+            last_user = next(
+                (item["content"] for item in reversed(messages) if item["role"] == "user"),
+                None,
+            )
+            suggestion = (
+                client_runtime.record_learning_suggestion(last_user, text)
+                if last_user and text.strip()
+                else None
+            )
+        else:
+            prompt = "\n\n".join(
+                f"{item['role'].upper()}: {item['content']}"
+                for item in messages
+            )
+            result = await coordinator.generate_host(prompt, request.max_tokens)
+            text = str(result.get("text", ""))
+            suggestion = None
+        response: dict[str, Any] = {
+            "id": f"chatcmpl-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+        if suggestion is not None:
+            response["legalfedllm_learning_suggestion_id"] = suggestion["suggestion_id"]
+        return response
 
     @app.get(
         "/v1/ollama/models",

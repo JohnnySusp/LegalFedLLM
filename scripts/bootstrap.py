@@ -72,7 +72,6 @@ def _create_client_directories(values: dict[str, str]) -> None:
     for name in (
         "QWEN_CLIENT_PRIVATE_DATA_DIR",
         "GRANITE_CLIENT_PRIVATE_DATA_DIR",
-        "QWEN_CLIENT_SAFEFED_PROBE_DIR",
     ):
         value = values.get(name, "").strip()
         if value:
@@ -152,7 +151,7 @@ def main() -> int:
     if result.role == "host":
         print("Host runtime directories are ready; copy D^P and D^V into the configured dataset paths")
     elif result.role == "client":
-        print("Client data directories are ready; supply private train.jsonl and any required safety-probe artifact")
+        print("Client data directories are ready; supply private train.jsonl when needed")
     return 0
 
 
