@@ -245,6 +245,14 @@ The locked PoC behavior is:
   LegalFedLLM. The global `Debug Mode` option is off by default, leaving only the
   launch/SSH/HTTP terminal; when enabled it additionally opens the state terminal
   (HTTP 200 OK plus Client state) and NVIDIA/GPU terminal;
+- the global `Low VRAM Mode` option is off by default. Changing it asks for
+  Yes/No confirmation and, when confirmed, automatically restarts LegalFedLLM so
+  the Client Agent starts with the new CUDA-memory policy. When enabled it sets
+  `CLIENT_GRADIENT_CHECKPOINTING=true` and
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce peak CUDA-memory
+  pressure during Client training and reverse distillation. Gradient checkpointing
+  trades memory for extra computation, so training may take longer and keep the GPU
+  busy for longer;
 - Ollama models are installed by the user. LegalFedLLM checks that the selected
   profile's expected Ollama model is installed, but federated training and LOCAL
   serving use the exact pinned Transformers + PEFT state; on Linux/PyTorch 2.13+
@@ -1206,4 +1214,4 @@ research proof of concept rather than a production federated-learning system.
 
 ### Desktop settings refinements
 
-The Options menu also provides **Reset Defaults**, which restores Constant Learning to on and Debug Mode to off. The exit Docker prompt is shown only when the managed Ollama or AnythingLLM service is actually running; if both are already stopped, the desktop closes normally without asking.
+The Options menu also provides **Reset Defaults**, which restores Constant Learning to on, Debug Mode to off and Low VRAM Mode to off. Direct Low VRAM Mode changes ask for Yes/No confirmation and automatically restart LegalFedLLM when confirmed; Reset Defaults still reports if a restart is needed because it changes the setting without opening that confirmation. The exit Docker prompt is shown only when the managed Ollama or AnythingLLM service is actually running; if both are already stopped, the desktop closes normally without asking.

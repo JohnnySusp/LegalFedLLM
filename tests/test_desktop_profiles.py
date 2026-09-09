@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
 from desktop.app import (
     _browser_launch_ready,
+    _desktop_restart_command,
     _diagnostics_ready,
     _local_ai_start_ready,
     open_default_browser,
@@ -75,17 +78,18 @@ class PortableDesktopProfileTests(unittest.TestCase):
 
             self.assertEqual(
                 manager.desktop_settings(),
-                {"constant_learning": True, "debug_mode": False},
+                {"constant_learning": True, "debug_mode": False, "low_vram_mode": False},
             )
             manager.set_desktop_setting("constant_learning", False)
             manager.set_desktop_setting("debug_mode", True)
+            manager.set_desktop_setting("low_vram_mode", True)
             manager.set_active(first.profile_id)
             manager.set_active(second.profile_id)
 
             restarted = PortableProfileManager(directory)
             self.assertEqual(
                 restarted.desktop_settings(),
-                {"constant_learning": False, "debug_mode": True},
+                {"constant_learning": False, "debug_mode": True, "low_vram_mode": True},
             )
             self.assertEqual(restarted.active_profile_id(), second.profile_id)
 
@@ -95,15 +99,49 @@ class PortableDesktopProfileTests(unittest.TestCase):
             profile = self._create(manager, "First")
             manager.set_desktop_setting("constant_learning", False)
             manager.set_desktop_setting("debug_mode", True)
+            manager.set_desktop_setting("low_vram_mode", True)
 
             settings = manager.reset_desktop_settings()
 
             self.assertEqual(
                 settings,
-                {"constant_learning": True, "debug_mode": False},
+                {"constant_learning": True, "debug_mode": False, "low_vram_mode": False},
             )
             self.assertEqual(manager.desktop_settings(), settings)
             self.assertEqual(manager.active_profile_id(), profile.profile_id)
+
+    def test_desktop_restart_command_preserves_data_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory).resolve()
+            with mock.patch.dict(os.environ, {"APPIMAGE": ""}, clear=False), mock.patch.object(
+                __import__("desktop.app", fromlist=["sys"]).sys, "frozen", False, create=True
+            ):
+                command = _desktop_restart_command(data_root)
+            self.assertEqual(command[:3], [os.sys.executable, "-m", "desktop.app"])
+            self.assertEqual(command[3:], ["--data-root", str(data_root)])
+
+    def test_low_vram_mode_controls_agent_cuda_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "First")
+
+            inherited = {
+                "CLIENT_GRADIENT_CHECKPOINTING": "true",
+                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
+            }
+            with mock.patch.dict(os.environ, inherited, clear=False):
+                normal_env = manager.agent_environment(profile)
+            self.assertEqual(normal_env["CLIENT_GRADIENT_CHECKPOINTING"], "false")
+            self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", normal_env)
+
+            manager.set_desktop_setting("low_vram_mode", True)
+            with mock.patch.dict(os.environ, inherited, clear=False):
+                low_vram_env = manager.agent_environment(profile)
+            self.assertEqual(low_vram_env["CLIENT_GRADIENT_CHECKPOINTING"], "true")
+            self.assertEqual(
+                low_vram_env["PYTORCH_CUDA_ALLOC_CONF"],
+                "expandable_segments:True",
+            )
 
     def test_unknown_desktop_setting_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

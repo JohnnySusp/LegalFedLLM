@@ -340,6 +340,16 @@ def _linux_relaunch_in_terminal(argv: list[str]) -> bool:
     return False
 
 
+def _desktop_restart_command(data_root: Path) -> list[str]:
+    executable = os.getenv("APPIMAGE", "").strip()
+    if executable:
+        command = [executable]
+    elif getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        command = [sys.executable, "-m", "desktop.app"]
+    return [*command, "--data-root", str(Path(data_root).resolve())]
+
 def _diagnostic_command(mode: str, profile_id: str, data_root: Path) -> list[str]:
     if getattr(sys, "frozen", False):
         return [
@@ -736,6 +746,15 @@ def run_gui(data_root: Path | None = None) -> int:
             self.debug_mode_action.toggled.connect(self._set_debug_mode)
             menu.addAction(self.debug_mode_action)
 
+            self.low_vram_mode_action = QAction("Low VRAM Mode", menu)
+            self.low_vram_mode_action.setCheckable(True)
+            self.low_vram_mode_action.setChecked(settings["low_vram_mode"])
+            self.low_vram_mode_action.setToolTip(
+                "Reduce peak CUDA memory pressure during Client training and reverse distillation."
+            )
+            self.low_vram_mode_action.toggled.connect(self._set_low_vram_mode)
+            menu.addAction(self.low_vram_mode_action)
+
             menu.addSeparator()
             self.reset_defaults_action = QAction("Reset Defaults", menu)
             self.reset_defaults_action.triggered.connect(self._reset_settings_defaults)
@@ -762,11 +781,59 @@ def run_gui(data_root: Path | None = None) -> int:
                 self.diagnostics_launched = False
                 self.message.setText("Debug Mode disabled. Extra diagnostic terminals are closed when possible.")
 
+        def _set_low_vram_mode(self, enabled: bool) -> None:
+            previous = self.manager.desktop_settings()["low_vram_mode"]
+
+            if enabled:
+                answer = QMessageBox.warning(
+                    self,
+                    "Low VRAM Mode",
+                    "This setting reduces peak GPU-memory pressure during Client training "
+                    "and reverse distillation by enabling gradient checkpointing and PyTorch "
+                    "expandable CUDA memory segments.\n\n"
+                    "Gradient checkpointing trades memory usage for additional computation. "
+                    "Training may take longer and keep the GPU under sustained load for longer, "
+                    "which can increase GPU temperatures, power usage, and fan noise. "
+                    "Enable this mode when you encounter CUDA out-of-memory errors.\n\n"
+                    "This will automatically restart the application. Are you sure you want to proceed?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "Low VRAM Mode",
+                    "This will automatically restart the application. Are you sure you want to proceed?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                self.low_vram_mode_action.blockSignals(True)
+                self.low_vram_mode_action.setChecked(previous)
+                self.low_vram_mode_action.blockSignals(False)
+                return
+
+            self.manager.set_desktop_setting("low_vram_mode", enabled)
+            self.message.setText(
+                f"Low VRAM Mode {'enabled' if enabled else 'disabled'}. Restarting LegalFedLLM…"
+            )
+            QTimer.singleShot(0, self._restart_application)
+
+        def _restart_application(self) -> None:
+            self.timer.stop()
+            stop_diagnostics(self.diagnostic_processes)
+            self.diagnostics_launched = False
+            self.controller.stop()
+            command = _desktop_restart_command(self.manager.data_root)
+            os.execvpe(command[0], command, dict(os.environ))
+
         def _reset_settings_defaults(self) -> None:
             settings = self.manager.reset_desktop_settings()
             for action, key in (
                 (self.constant_learning_action, "constant_learning"),
                 (self.debug_mode_action, "debug_mode"),
+                (self.low_vram_mode_action, "low_vram_mode"),
             ):
                 action.blockSignals(True)
                 action.setChecked(settings[key])
@@ -774,7 +841,8 @@ def run_gui(data_root: Path | None = None) -> int:
             stop_diagnostics(self.diagnostic_processes)
             self.diagnostics_launched = False
             self.message.setText(
-                "Settings reset to defaults: Constant Learning on, Debug Mode off."
+                "Settings reset to defaults: Constant Learning on, Debug Mode off, Low VRAM Mode off. "
+                "Restart the Client Agent/LegalFedLLM if Low VRAM Mode changed."
             )
 
         def _create_profile(self) -> None:

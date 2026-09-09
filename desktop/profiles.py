@@ -20,6 +20,7 @@ from shared.protocol import utc_text
 DEFAULT_DESKTOP_SETTINGS = {
     "constant_learning": True,
     "debug_mode": False,
+    "low_vram_mode": False,
 }
 
 
@@ -257,6 +258,12 @@ class PortableProfileManager:
                 "CLIENT_AGENT_PORT": str(profile.agent_port),
             }
         )
+        if self.desktop_settings()["low_vram_mode"]:
+            env["CLIENT_GRADIENT_CHECKPOINTING"] = "true"
+            env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        else:
+            env["CLIENT_GRADIENT_CHECKPOINTING"] = "false"
+            env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         if enrollment_token:
             env["REGISTRATION_TOKEN"] = enrollment_token
         else:
