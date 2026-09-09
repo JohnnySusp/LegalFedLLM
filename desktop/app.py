@@ -465,7 +465,7 @@ def run_gui(data_root: Path | None = None) -> int:
             self.setWindowTitle("Create LegalFedLLM profile")
             form = QFormLayout(self)
             self.name = QLineEdit()
-            self.name.setPlaceholderText("My Qwen client")
+            self.name.setPlaceholderText("My LegalFedLLM client")
             self.model = QComboBox()
             for profile_id in (QWEN_PROFILE_ID, GRANITE_3_3_2B_CLIENT_PROFILE_ID):
                 self.model.addItem(
