@@ -58,6 +58,142 @@ training examples remain on the Client machine.
 > formal differential privacy, production-calibrated poisoning detection,
 > production identity management, or encrypted transport/storage.
 
+## Using LegalFedLLM
+
+The desktop Client can currently be run directly from a source checkout. The
+source-launch path expects its Python environment to be prepared in advance;
+starting `desktop.app` does **not** install missing Python packages automatically.
+Docker is used separately for the managed Ollama and AnythingLLM services.
+
+### First installation from source
+
+Before starting, make sure the machine has:
+
+- Python with `venv` support;
+- Docker Engine and Docker Compose, with Docker running;
+- OpenSSH (`ssh`);
+- an NVIDIA/CUDA-capable environment for the real Qwen or Granite Client path; and
+- the Host SSH address/port plus a fresh one-time enrollment token supplied by
+  the Host/Coordinator operator.
+
+Clone the repository, create a virtual environment, and install the desktop
+requirements from the repository root:
+
+```bash
+git clone https://github.com/JohnnySusp/LegalFedLLM.git
+cd LegalFedLLM
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-desktop.txt
+```
+
+`requirements-desktop.txt` includes the normal LegalFedLLM runtime requirements
+as well as PySide6 and PyInstaller. The initial installation can therefore be
+large because the source-run Client uses the local Transformers/PEFT/PyTorch
+environment directly.
+
+Check that Docker is available:
+
+```bash
+docker --version
+docker compose version
+```
+
+Then launch the desktop Client from the repository root while the virtual
+environment is active:
+
+```bash
+python -m desktop.app
+```
+
+Keep that launch terminal open. LegalFedLLM deliberately leaves SSH password
+entry to OpenSSH, so when a profile connects to the remote Host the password
+prompt appears in this terminal. The SSH password is not stored by LegalFedLLM.
+
+On the first launch, create a Client profile in the GUI and provide:
+
+- a profile name;
+- the Qwen or Granite Client model profile;
+- the Host SSH target, such as `user@host.example`;
+- the Host SSH port;
+- the local Coordinator-forward port and Client Agent port; and
+- the fresh one-time enrollment token issued for that Client.
+
+The enrollment token is consumed by successful registration. Later launches use
+the Client identity stored in the profile and do not require that token again.
+When running from source, portable desktop state is created under:
+
+```text
+LegalFedLLM/LegalFedLLM-data/
+```
+
+Each profile has its own Client identity, local training state, adapter state,
+private-learning queue and logs. Downloaded Hugging Face model/tokenizer data is
+kept under the shared `LegalFedLLM-data/models/huggingface/` cache.
+
+### Ollama and AnythingLLM on first use
+
+After the Client Agent establishes the SSH tunnel and becomes healthy, the
+desktop manages the Docker Ollama and AnythingLLM stack and opens AnythingLLM in
+the default browser when the local AI stack is ready. Docker may pull the
+required service images when they are not already present.
+
+LegalFedLLM does **not** silently pull the selected Ollama compatibility model.
+If the GUI reports that the profile's Ollama model is missing after the managed
+Ollama container has started, install the model explicitly:
+
+```bash
+# Qwen Client profile
+docker exec legalfed-ai-ollama ollama pull qwen3:1.7b
+
+# Granite Client profile
+docker exec legalfed-ai-ollama ollama pull granite3.3:2b
+```
+
+Only the model required by the active Client profile needs to be installed.
+Federated training and LOCAL LegalFedLLM inference use the exact pinned
+Transformers + PEFT Client state; Ollama remains a compatibility/local-AI
+serving component.
+
+### Normal use after installation
+
+For later source launches:
+
+```bash
+cd LegalFedLLM
+source .venv/bin/activate
+python -m desktop.app
+```
+
+Select or create the required profile from the GUI. After the SSH tunnel, Client
+Agent and local AI services are ready, AnythingLLM opens automatically. The
+OpenAI-compatible Client endpoint exposes the LOCAL and HOST LegalFedLLM model
+routes used by the desktop integration.
+
+The main federation action is **Participate in the current federated round**. It
+is enabled only when the active Client is connected, compatible, selected for a
+collecting round and has not already participated. Queued LOCAL learning is
+applied before participation when present.
+
+The global desktop settings are available from the Options menu:
+
+- **Constant Learning** is enabled by default. LOCAL interactions are added to
+  the one-use local-learning queue automatically. Disable it to restore the
+  explicit **Learn from this** / **Dismiss** decision.
+- **Low VRAM Mode** is disabled by default. Enable it when Client training or
+  reverse distillation encounters CUDA out-of-memory pressure; it trades memory
+  usage for additional computation and restarts LegalFedLLM after confirmation.
+- **Debug Mode** is disabled by default. Enable it to open the additional Client
+  state and NVIDIA/GPU diagnostic terminals.
+
+When a completed round contains useful Host-to-Client teaching samples,
+LegalFedLLM asks before applying reverse learning. On application exit, if the
+managed Ollama or AnythingLLM services are still running, the GUI asks whether
+to stop them or leave them running. Stopping the services preserves their Docker
+volumes.
+
 ## Status at a glance
 
 | Capability | Current status |
