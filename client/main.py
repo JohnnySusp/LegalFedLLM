@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from client.runtime import ClientRuntime, ClientRuntimeError
@@ -1029,6 +1029,7 @@ def create_app(
     )
     async def openai_chat_completion(
         request: OpenAIChatCompletionRequest,
+        http_request: Request,
     ) -> dict[str, Any]:
         if request.stream:
             raise HTTPException(status_code=400, detail="streaming is not implemented")
@@ -1043,7 +1044,11 @@ def create_app(
             )
             suggestion = (
                 client_runtime.record_learning_suggestion(last_user, text)
-                if last_user and text.strip()
+                if (
+                    last_user
+                    and text.strip()
+                    and not await http_request.is_disconnected()
+                )
                 else None
             )
         else:

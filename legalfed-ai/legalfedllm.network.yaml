@@ -1,0 +1,19 @@
+services:
+  host:
+    networks:
+      - default
+      - legalfed-ai-net
+
+  client:
+    networks:
+      - default
+      - legalfed-ai-net
+
+networks:
+  default:
+    external: true
+    name: legalfedllm_net
+
+  legalfed-ai-net:
+    external: true
+    name: legalfed-ai-net

@@ -7,7 +7,10 @@ from pathlib import Path
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
 from desktop.app import (
+    _browser_launch_ready,
     _diagnostics_ready,
+    _local_ai_start_ready,
+    open_default_browser,
     _enrollment_ready,
     _host_preview_finished,
     _host_preview_should_start,
@@ -63,6 +66,50 @@ class PortableDesktopProfileTests(unittest.TestCase):
                 first_runtime.identity.public_key_b64,
                 second_runtime.identity.public_key_b64,
             )
+
+    def test_desktop_settings_default_and_persist_globally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            first = self._create(manager, "First")
+            second = self._create(manager, "Second")
+
+            self.assertEqual(
+                manager.desktop_settings(),
+                {"constant_learning": True, "debug_mode": False},
+            )
+            manager.set_desktop_setting("constant_learning", False)
+            manager.set_desktop_setting("debug_mode", True)
+            manager.set_active(first.profile_id)
+            manager.set_active(second.profile_id)
+
+            restarted = PortableProfileManager(directory)
+            self.assertEqual(
+                restarted.desktop_settings(),
+                {"constant_learning": False, "debug_mode": True},
+            )
+            self.assertEqual(restarted.active_profile_id(), second.profile_id)
+
+    def test_reset_desktop_settings_restores_defaults_without_changing_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "First")
+            manager.set_desktop_setting("constant_learning", False)
+            manager.set_desktop_setting("debug_mode", True)
+
+            settings = manager.reset_desktop_settings()
+
+            self.assertEqual(
+                settings,
+                {"constant_learning": True, "debug_mode": False},
+            )
+            self.assertEqual(manager.desktop_settings(), settings)
+            self.assertEqual(manager.active_profile_id(), profile.profile_id)
+
+    def test_unknown_desktop_setting_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            with self.assertRaisesRegex(ValueError, "unsupported desktop setting"):
+                manager.set_desktop_setting("unknown", True)
 
     def test_last_used_profile_is_persisted_in_portable_data_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -131,6 +178,67 @@ class PortableDesktopProfileTests(unittest.TestCase):
         )
         self.assertFalse(_host_preview_should_start(round_id, previewed, inflight))
         self.assertIn(round_id, previewed)
+
+    def test_anythingllm_browser_launch_waits_for_agent_and_local_stack(self) -> None:
+        self.assertFalse(
+            _browser_launch_ready(
+                agent_healthy=False,
+                local_ai_ready=True,
+                already_attempted=False,
+            )
+        )
+        self.assertFalse(
+            _browser_launch_ready(
+                agent_healthy=True,
+                local_ai_ready=False,
+                already_attempted=False,
+            )
+        )
+        self.assertTrue(
+            _browser_launch_ready(
+                agent_healthy=True,
+                local_ai_ready=True,
+                already_attempted=False,
+            )
+        )
+        self.assertFalse(
+            _browser_launch_ready(
+                agent_healthy=True,
+                local_ai_ready=True,
+                already_attempted=True,
+            )
+        )
+
+    def test_local_ai_waits_for_agent_health_and_starts_only_once(self) -> None:
+        self.assertFalse(
+            _local_ai_start_ready(
+                agent_healthy=False,
+                already_attempted=False,
+            )
+        )
+        self.assertTrue(
+            _local_ai_start_ready(
+                agent_healthy=True,
+                already_attempted=False,
+            )
+        )
+        self.assertFalse(
+            _local_ai_start_ready(
+                agent_healthy=True,
+                already_attempted=True,
+            )
+        )
+
+    def test_default_browser_helper_uses_system_webbrowser(self) -> None:
+        from unittest import mock
+
+        with mock.patch("desktop.app.webbrowser.open", return_value=True) as opened:
+            self.assertTrue(open_default_browser("http://127.0.0.1:3001/"))
+        opened.assert_called_once_with(
+            "http://127.0.0.1:3001/",
+            new=2,
+            autoraise=True,
+        )
 
     def test_diagnostics_wait_for_initial_ssh_forward(self) -> None:
         self.assertFalse(

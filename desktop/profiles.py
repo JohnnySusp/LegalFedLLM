@@ -17,6 +17,11 @@ from client.model_profiles import (
 )
 from shared.protocol import utc_text
 
+DEFAULT_DESKTOP_SETTINGS = {
+    "constant_learning": True,
+    "debug_mode": False,
+}
+
 
 class DesktopProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
@@ -153,15 +158,43 @@ class PortableProfileManager:
         self.set_active(profile.profile_id)
         return profile
 
-    def active_profile_id(self) -> str | None:
+    def _read_state(self) -> dict[str, Any]:
         if not self.state_path.is_file():
-            return None
+            return {}
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return None
-        value = payload.get("active_profile_id")
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def active_profile_id(self) -> str | None:
+        value = self._read_state().get("active_profile_id")
         return value if isinstance(value, str) else None
+
+    def desktop_settings(self) -> dict[str, bool]:
+        payload = self._read_state().get("settings")
+        stored = payload if isinstance(payload, dict) else {}
+        settings: dict[str, bool] = {}
+        for key, default in DEFAULT_DESKTOP_SETTINGS.items():
+            value = stored.get(key, default)
+            settings[key] = value if isinstance(value, bool) else default
+        return settings
+
+    def set_desktop_setting(self, key: str, value: bool) -> None:
+        if key not in DEFAULT_DESKTOP_SETTINGS:
+            raise ValueError(f"unsupported desktop setting: {key}")
+        state = self._read_state()
+        settings = self.desktop_settings()
+        settings[key] = bool(value)
+        state.update({"schema_version": "1.0", "settings": settings})
+        self._write_json(self.state_path, state)
+
+    def reset_desktop_settings(self) -> dict[str, bool]:
+        state = self._read_state()
+        settings = dict(DEFAULT_DESKTOP_SETTINGS)
+        state.update({"schema_version": "1.0", "settings": settings})
+        self._write_json(self.state_path, state)
+        return settings
 
     def active_profile(self) -> DesktopProfile | None:
         profile_id = self.active_profile_id()
@@ -174,10 +207,15 @@ class PortableProfileManager:
 
     def set_active(self, profile_id: str) -> None:
         self.load(profile_id)
-        self._write_json(
-            self.state_path,
-            {"schema_version": "1.0", "active_profile_id": profile_id},
+        state = self._read_state()
+        state.update(
+            {
+                "schema_version": "1.0",
+                "active_profile_id": profile_id,
+                "settings": self.desktop_settings(),
+            }
         )
+        self._write_json(self.state_path, state)
 
     def admin_token(self, profile_id: str) -> str:
         values = self._read_env(self.profile_paths(profile_id).env_file)

@@ -74,10 +74,10 @@ training examples remain on the Client machine.
 | Automatic Host → Qwen reverse distillation | Implemented and real-tested |
 | Exact submission acknowledgement reconciliation | Implemented and regression-tested |
 | Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
-| Portable PySide6 desktop Client source | Implemented and model-free tested; Windows/AppImage packaging and real Windows acceptance pending |
-| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented and model-free tested; real desktop serving acceptance pending |
+| Portable PySide6 desktop Client source | Implemented and model-free tested; Linux/Bazzite source GUI accepted, AppImage packaging and Windows acceptance pending |
+| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented; real Bazzite AnythingLLM chat/RAG path accepted through active Qwen PEFT state |
 | HOST OpenAI-compatible forwarding through bounded Host queue | Implemented and model-free tested; real desktop/Host acceptance pending |
-| User-approved local learning queue | Implemented and model-free tested; real GUI acceptance pending |
+| Configurable local learning queue | Implemented; Constant Learning is on by default, with Learn/Dismiss consent available when disabled; real Bazzite AnythingLLM queue behavior accepted |
 | Real multi-Client round | Not yet demonstrated |
 | Mixed Qwen + Granite per-Client alignment and Host integration | Implemented and model-free tested; real heterogeneous execution still pending |
 | Automatic promoted-PEFT → Ollama publication | Not required by the desktop path; active PEFT state is served directly with Transformers |
@@ -241,9 +241,10 @@ The locked PoC behavior is:
   state and one-time enrollment;
 - the Client Agent is a child process of the GUI and owns the OpenSSH tunnel; on
   initial connection, OpenSSH asks for the SSH password in the launch terminal
-  before the Agent API and diagnostic terminals start. The password is never
-  handled or stored by LegalFedLLM; after connection, diagnostics are limited to
-  a state terminal (HTTP 200 OK plus Client state) and an NVIDIA/GPU terminal;
+  before the Agent API starts. The password is never handled or stored by
+  LegalFedLLM. The global `Debug Mode` option is off by default, leaving only the
+  launch/SSH/HTTP terminal; when enabled it additionally opens the state terminal
+  (HTTP 200 OK plus Client state) and NVIDIA/GPU terminal;
 - Ollama models are installed by the user. LegalFedLLM checks that the selected
   profile's expected Ollama model is installed, but federated training and LOCAL
   serving use the exact pinned Transformers + PEFT state; on Linux/PyTorch 2.13+
@@ -256,9 +257,10 @@ The locked PoC behavior is:
   preflight does not download Host model weights;
 - D^P is downloaded from the Coordinator and verified against the signed round
   manifest;
-- LOCAL AnythingLLM-style interactions can be offered back to the user with a
-  `Learn from this` decision. Accepted prompt/answer pairs enter a generated
-  per-profile `train.jsonl` queue;
+- LOCAL AnythingLLM-style interactions enter the generated per-profile
+  `train.jsonl` queue automatically while the global `Constant Learning` option is
+  enabled (the default). Turning it off restores the explicit `Learn from this` /
+  `Dismiss` decision for each LOCAL interaction;
 - queued local examples are consumed once. They are removed only after the
   resulting adapter is safely promoted; failed training restores the queue;
 - the main GUI action is `Participate in the current federated round`;
@@ -266,7 +268,24 @@ The locked PoC behavior is:
   Host-teacher sample, and explicit user consent; and
 - the OpenAI-compatible provider exposes only `legalfedllm-local` and
   `legalfedllm-host` in this milestone. Collaborative inference remains future
-  work.
+  work;
+- the repository carries a four-file `legalfed-ai/` bundle for Docker Ollama and
+  AnythingLLM. On profile activation, the desktop seeds a writable copy under
+  `LegalFedLLM-data/legalfed-ai/`, preserves an existing AnythingLLM JWT/RAG
+  configuration when migrating from `~/legalfed-ai` and rewrites the Generic OpenAI
+  provider to the active profile's loopback Client Agent. The GUI does not start
+  Docker while OpenSSH is still waiting for authentication. After the Client Agent
+  answers its first successful health poll, the desktop creates the external Docker
+  network if needed, starts Docker Ollama, verifies the profile's required Ollama
+  compatibility model without pulling it, and recreates AnythingLLM. After the
+  Client Agent and local AI stack are both ready, the desktop asks the OS
+  default browser to open `http://127.0.0.1:3001/`. On GUI exit, the user chooses
+  whether to stop Ollama/AnythingLLM or leave them running; stopping uses Compose
+  `stop` and preserves persistent volumes. The existing `legalfed-ai-*` container
+  and volume names are intentionally preserved for 1.0 compatibility;
+- AnythingLLM native Generic OpenAI tool calling is disabled for the 1.0 path.
+  Ordinary chat and RAG are supported; Agent/tool calling is not yet part of the
+  LegalFedLLM OpenAI-compatibility contract.
 
 The desktop build helpers are:
 
@@ -1183,3 +1202,8 @@ A defensible current summary is:
 
 The repository is beyond a mock protocol demonstration, but it remains a
 research proof of concept rather than a production federated-learning system.
+
+
+### Desktop settings refinements
+
+The Options menu also provides **Reset Defaults**, which restores Constant Learning to on and Debug Mode to off. The exit Docker prompt is shown only when the managed Ollama or AnythingLLM service is actually running; if both are already stopped, the desktop closes normally without asking.

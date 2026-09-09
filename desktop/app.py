@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +19,7 @@ from client.model_profiles import (
     QWEN_PROFILE_ID,
     ollama_model_for_profile,
 )
+from desktop.local_ai import LocalAiStack
 from desktop.profiles import DesktopProfile, PortableProfileManager
 
 
@@ -217,7 +219,7 @@ def _poll_failure_state(
         return (
             "Waiting for SSH authentication",
             "Enter the Host SSH password in the launch terminal. "
-            "LegalFedLLM will start the Client Agent API and diagnostics after the tunnel is established.",
+            "LegalFedLLM will start the Client Agent API after the tunnel is established.",
         )
     if controller_running:
         return (
@@ -264,6 +266,30 @@ def _diagnostics_ready(health: dict[str, Any]) -> bool:
     if not tunnel.get("enabled"):
         return True
     return bool(tunnel.get("forward_reachable"))
+
+
+def _browser_launch_ready(
+    *,
+    agent_healthy: bool,
+    local_ai_ready: bool,
+    already_attempted: bool,
+) -> bool:
+    return agent_healthy and local_ai_ready and not already_attempted
+
+
+def _local_ai_start_ready(
+    *,
+    agent_healthy: bool,
+    already_attempted: bool,
+) -> bool:
+    return agent_healthy and not already_attempted
+
+
+def open_default_browser(url: str) -> bool:
+    try:
+        return bool(webbrowser.open(url, new=2, autoraise=True))
+    except Exception:
+        return False
 
 
 def _registration_exists(manager: PortableProfileManager, profile: DesktopProfile) -> bool:
@@ -338,10 +364,14 @@ def _diagnostic_command(mode: str, profile_id: str, data_root: Path) -> list[str
     ]
 
 
-def launch_diagnostics(manager: PortableProfileManager, profile: DesktopProfile) -> None:
+def launch_diagnostics(
+    manager: PortableProfileManager,
+    profile: DesktopProfile,
+) -> list[subprocess.Popen[Any]]:
     if os.getenv("LEGALFEDLLM_DISABLE_DIAGNOSTICS", "").lower() in {"1", "true", "yes"}:
-        return
+        return []
     modes = DIAGNOSTIC_MODES
+    processes: list[subprocess.Popen[Any]] = []
     if sys.platform.startswith("linux"):
         tmux = shutil.which("tmux")
         if tmux and os.getenv("TMUX"):
@@ -357,23 +387,38 @@ def launch_diagnostics(manager: PortableProfileManager, profile: DesktopProfile)
                     ],
                     check=False,
                 )
-            return
+            return processes
         terminal = shutil.which("x-terminal-emulator") or shutil.which("konsole") or shutil.which("gnome-terminal")
         if terminal:
             for mode in modes:
                 command = _diagnostic_command(mode, profile.profile_id, manager.data_root)
                 if Path(terminal).name == "gnome-terminal":
-                    subprocess.Popen([terminal, "--", *command])
+                    processes.append(subprocess.Popen([terminal, "--", *command]))
                 else:
-                    subprocess.Popen([terminal, "-e", *command])
-            return
+                    processes.append(subprocess.Popen([terminal, "-e", *command]))
+            return processes
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         for mode in modes:
-            subprocess.Popen(
-                _diagnostic_command(mode, profile.profile_id, manager.data_root),
-                creationflags=creationflags,
+            processes.append(
+                subprocess.Popen(
+                    _diagnostic_command(mode, profile.profile_id, manager.data_root),
+                    creationflags=creationflags,
+                )
             )
+    return processes
+
+
+def stop_diagnostics(processes: list[subprocess.Popen[Any]]) -> None:
+    while processes:
+        process = processes.pop()
+        if process.poll() is not None:
+            continue
+        try:
+            process.terminate()
+        except OSError:
+            continue
+
 
 
 def run_gui(data_root: Path | None = None) -> int:
@@ -557,21 +602,29 @@ def run_gui(data_root: Path | None = None) -> int:
             super().__init__()
             self.manager = PortableProfileManager(data_root)
             self.controller = AgentProcessController(self.manager)
+            self.local_ai = LocalAiStack(self.manager.data_root)
             self.profile: DesktopProfile | None = None
             self.api: AgentApi | None = None
             self.pending_enrollment_token: str | None = None
             self.enrollment_attempted = False
             self.agent_has_been_healthy = False
             self.diagnostics_launched = False
+            self.diagnostic_processes: list[subprocess.Popen[Any]] = []
             self.compatible = False
+            self.last_health: dict[str, Any] = {}
             self.last_status: dict[str, Any] = {}
+            self.local_ai_payload: dict[str, Any] | None = None
+            self.local_ai_start_attempted = False
+            self.anythingllm_browser_attempted = False
             self.workers: set[Worker] = set()
             self.poll_worker: Worker | None = None
             self.suggestion_dialog_open = False
+            self.suggestion_resolution_inflight: set[str] = set()
             self.previewed_rounds: set[str] = set()
             self.host_preview_inflight: set[str] = set()
             self._build_ui()
             self._profile_menu()
+            self._settings_menu()
             self._resize_for_screen()
             QTimer.singleShot(0, self._bootstrap_profile)
             self.timer = QTimer(self)
@@ -587,10 +640,18 @@ def run_gui(data_root: Path | None = None) -> int:
             title.setStyleSheet("font-size: 20px; font-weight: 600;")
             top.addWidget(title)
             top.addStretch(1)
+            self.settings_button = QToolButton()
+            self.settings_button.setText("⚙")
+            self.settings_button.setToolTip("Options")
+            self.settings_button.setFixedSize(50, 50)
+            self.settings_button.setStyleSheet("font-size: 18px;")
+            self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            top.addWidget(self.settings_button)
             self.profile_button = QToolButton()
             self.profile_button.setText("☰")
             self.profile_button.setToolTip("Profiles")
             self.profile_button.setFixedSize(50, 50)
+            self.profile_button.setStyleSheet("font-size: 18px;")
             self.profile_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             top.addWidget(self.profile_button)
             layout.addLayout(top)
@@ -618,7 +679,7 @@ def run_gui(data_root: Path | None = None) -> int:
             layout.addWidget(self.message)
             layout.addStretch(1)
 
-            self.provider_button = QPushButton("AnythingLLM provider details")
+            self.provider_button = QPushButton("AnythingLLM integration details")
             self.provider_button.clicked.connect(self._show_provider_details)
             layout.addWidget(self.provider_button)
 
@@ -660,6 +721,62 @@ def run_gui(data_root: Path | None = None) -> int:
             menu.addAction(create)
             self.profile_button.setMenu(menu)
 
+        def _settings_menu(self) -> None:
+            settings = self.manager.desktop_settings()
+            menu = QMenu(self)
+            self.constant_learning_action = QAction("Constant Learning", menu)
+            self.constant_learning_action.setCheckable(True)
+            self.constant_learning_action.setChecked(settings["constant_learning"])
+            self.constant_learning_action.toggled.connect(self._set_constant_learning)
+            menu.addAction(self.constant_learning_action)
+
+            self.debug_mode_action = QAction("Debug Mode", menu)
+            self.debug_mode_action.setCheckable(True)
+            self.debug_mode_action.setChecked(settings["debug_mode"])
+            self.debug_mode_action.toggled.connect(self._set_debug_mode)
+            menu.addAction(self.debug_mode_action)
+
+            menu.addSeparator()
+            self.reset_defaults_action = QAction("Reset Defaults", menu)
+            self.reset_defaults_action.triggered.connect(self._reset_settings_defaults)
+            menu.addAction(self.reset_defaults_action)
+            self.settings_button.setMenu(menu)
+
+        def _set_constant_learning(self, enabled: bool) -> None:
+            self.manager.set_desktop_setting("constant_learning", enabled)
+            self.message.setText(
+                "Constant Learning enabled: new LOCAL interactions will be queued automatically."
+                if enabled
+                else "Constant Learning disabled: new LOCAL interactions will ask for Learn/Dismiss consent."
+            )
+
+        def _set_debug_mode(self, enabled: bool) -> None:
+            self.manager.set_desktop_setting("debug_mode", enabled)
+            if enabled:
+                self.diagnostics_launched = False
+                if self.last_health:
+                    self._ensure_diagnostics(self.last_health)
+                self.message.setText("Debug Mode enabled.")
+            else:
+                stop_diagnostics(self.diagnostic_processes)
+                self.diagnostics_launched = False
+                self.message.setText("Debug Mode disabled. Extra diagnostic terminals are closed when possible.")
+
+        def _reset_settings_defaults(self) -> None:
+            settings = self.manager.reset_desktop_settings()
+            for action, key in (
+                (self.constant_learning_action, "constant_learning"),
+                (self.debug_mode_action, "debug_mode"),
+            ):
+                action.blockSignals(True)
+                action.setChecked(settings[key])
+                action.blockSignals(False)
+            stop_diagnostics(self.diagnostic_processes)
+            self.diagnostics_launched = False
+            self.message.setText(
+                "Settings reset to defaults: Constant Learning on, Debug Mode off."
+            )
+
         def _create_profile(self) -> None:
             dialog = CreateProfileDialog(self)
             if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -695,8 +812,14 @@ def run_gui(data_root: Path | None = None) -> int:
             self.pending_enrollment_token = enrollment_token
             self.enrollment_attempted = False
             self.agent_has_been_healthy = False
+            stop_diagnostics(self.diagnostic_processes)
             self.diagnostics_launched = False
             self.compatible = False
+            self.last_health = {}
+            self.local_ai_payload = None
+            self.local_ai_start_attempted = False
+            self.anythingllm_browser_attempted = False
+            self.suggestion_resolution_inflight.clear()
             self.previewed_rounds.clear()
             self.host_preview_inflight.clear()
             self.profile_label.setText(profile.display_name)
@@ -709,13 +832,60 @@ def run_gui(data_root: Path | None = None) -> int:
             self.my_state_label.setText("Not connected")
             self.message.setText(
                 "Connecting to the Host. Enter the SSH password in the launch terminal. "
-                "The Client Agent API and diagnostics will start only after the SSH tunnel is established."
+                "The Client Agent API will start after the SSH tunnel is established."
             )
             try:
                 self.controller.start(profile, enrollment_token=enrollment_token)
             except Exception as exc:
                 QMessageBox.critical(self, APP_TITLE, f"Could not start Client Agent: {exc}")
             self._profile_menu()
+
+        def _ensure_local_ai(self) -> None:
+            if self.profile is None:
+                return
+            if not _local_ai_start_ready(
+                agent_healthy=self.agent_has_been_healthy,
+                already_attempted=self.local_ai_start_attempted,
+            ):
+                return
+            self.local_ai_start_attempted = True
+            profile = self.profile
+            admin_token = self.manager.admin_token(profile.profile_id)
+            self.message.setText(
+                "SSH connected. Starting local Ollama and AnythingLLM…"
+            )
+            self._run_worker(
+                lambda: self.local_ai.prepare(profile, admin_token),
+                self._local_ai_ready,
+                self._local_ai_failed,
+            )
+
+        def _local_ai_ready(self, payload: Any) -> None:
+            self.local_ai_payload = dict(payload) if isinstance(payload, dict) else {}
+            self._maybe_open_anythingllm()
+            if self.agent_has_been_healthy:
+                self.message.setText(
+                    f"Ready. AnythingLLM is available at {self.local_ai_payload.get('anythingllm_url', 'http://127.0.0.1:3001')}."
+                )
+
+        def _maybe_open_anythingllm(self) -> None:
+            if not _browser_launch_ready(
+                agent_healthy=self.agent_has_been_healthy,
+                local_ai_ready=self.local_ai_payload is not None,
+                already_attempted=self.anythingllm_browser_attempted,
+            ):
+                return
+            self.anythingllm_browser_attempted = True
+            url = str((self.local_ai_payload or {}).get("anythingllm_url") or "http://127.0.0.1:3001")
+            open_default_browser(url.rstrip("/") + "/")
+
+        def _local_ai_failed(self, error: str) -> None:
+            self.message.setText(f"Local AnythingLLM/Ollama stack unavailable: {error}")
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "LegalFedLLM could not prepare the local Ollama/AnythingLLM stack.\n\n" + error,
+            )
 
         def _run_worker(
             self,
@@ -781,16 +951,21 @@ def run_gui(data_root: Path | None = None) -> int:
         def _ensure_diagnostics(self, health: dict[str, Any]) -> None:
             if self.profile is None or self.diagnostics_launched:
                 return
+            if not self.manager.desktop_settings()["debug_mode"]:
+                return
             if not _diagnostics_ready(health):
                 return
-            launch_diagnostics(self.manager, self.profile)
+            self.diagnostic_processes = launch_diagnostics(self.manager, self.profile)
             self.diagnostics_launched = True
 
         def _poll_success(self, payload: dict[str, Any]) -> None:
             self.agent_has_been_healthy = True
+            self._ensure_local_ai()
+            self.last_health = payload["health"]
             status = payload["status"]
             compatibility = payload["compatibility"]
-            self._ensure_diagnostics(payload["health"])
+            self._ensure_diagnostics(self.last_health)
+            self._maybe_open_anythingllm()
             self.last_status = status
             self.compatible = bool(compatibility.get("compatible"))
             if not status.get("enrolled"):
@@ -799,7 +974,7 @@ def run_gui(data_root: Path | None = None) -> int:
                     self.connection_label.setText("Waiting for SSH authentication")
                     self.message.setText(
                         "Enter the Host SSH password in the launch terminal. "
-                        "Enrollment and diagnostics begin only after the SSH tunnel is connected."
+                        "Enrollment begins only after the SSH tunnel is connected."
                     )
                     return
                 self.connection_label.setText("SSH connected / enrollment pending")
@@ -894,23 +1069,50 @@ def run_gui(data_root: Path | None = None) -> int:
         def _maybe_prompt_learning(self, suggestions: list[dict[str, Any]]) -> None:
             if self.suggestion_dialog_open or not suggestions or self.api is None:
                 return
-            suggestion = suggestions[0]
-            suggestion_id = str(suggestion.get("suggestion_id", ""))
-            if not suggestion_id:
+            suggestion = next(
+                (
+                    item
+                    for item in suggestions
+                    if str(item.get("suggestion_id", ""))
+                    and str(item.get("suggestion_id", "")) not in self.suggestion_resolution_inflight
+                ),
+                None,
+            )
+            if suggestion is None:
                 return
+            suggestion_id = str(suggestion.get("suggestion_id", ""))
+            if self.manager.desktop_settings()["constant_learning"]:
+                self.suggestion_resolution_inflight.add(suggestion_id)
+                self._run_worker(
+                    lambda: self.api.resolve_suggestion(suggestion_id, True),
+                    lambda _, sid=suggestion_id: self._suggestion_resolved(sid, True),
+                    lambda error, sid=suggestion_id: self._suggestion_failed(sid, error),
+                )
+                return
+
             self.suggestion_dialog_open = True
             dialog = LearningDialog(suggestion, self)
             dialog.exec()
             choice = bool(dialog.choice)
             self.suggestion_dialog_open = False
+            self.suggestion_resolution_inflight.add(suggestion_id)
             self._run_worker(
                 lambda: self.api.resolve_suggestion(suggestion_id, choice),
-                lambda _: self.message.setText(
-                    "Interaction added to the local learning queue."
-                    if choice
-                    else "Interaction dismissed; nothing was added to local learning."
-                ),
+                lambda _, sid=suggestion_id, learn=choice: self._suggestion_resolved(sid, learn),
+                lambda error, sid=suggestion_id: self._suggestion_failed(sid, error),
             )
+
+        def _suggestion_resolved(self, suggestion_id: str, learn: bool) -> None:
+            self.suggestion_resolution_inflight.discard(suggestion_id)
+            self.message.setText(
+                "Interaction added to the local learning queue."
+                if learn
+                else "Interaction dismissed; nothing was added to local learning."
+            )
+
+        def _suggestion_failed(self, suggestion_id: str, error: str) -> None:
+            self.suggestion_resolution_inflight.discard(suggestion_id)
+            self._show_error(error)
 
         def _maybe_preview_host(
             self,
@@ -978,21 +1180,62 @@ def run_gui(data_root: Path | None = None) -> int:
         def _show_provider_details(self) -> None:
             if self.profile is None:
                 return
-            token = self.manager.admin_token(self.profile.profile_id)
             text = (
+                "AnythingLLM is configured automatically when this profile is activated.\n\n"
+                f"AnythingLLM UI:\nhttp://127.0.0.1:3001\n\n"
                 f"OpenAI-compatible base URL:\nhttp://127.0.0.1:{self.profile.agent_port}/v1\n\n"
-                f"API key:\n{token}\n\n"
                 f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
-                "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue."
+                f"Runtime files:\n{self.local_ai.runtime_root}\n\n"
+                "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue. "
+                "AnythingLLM native Generic OpenAI tool calling is disabled for the current 1.0 scope."
             )
-            QMessageBox.information(self, "AnythingLLM provider details", text)
+            QMessageBox.information(self, "AnythingLLM integration details", text)
 
         def _show_error(self, error: str) -> None:
             self.message.setText(error)
             QMessageBox.warning(self, APP_TITLE, error)
 
         def closeEvent(self, event) -> None:  # type: ignore[override]
+            if self.local_ai.is_running():
+                prompt = QMessageBox(self)
+                prompt.setWindowTitle(APP_TITLE)
+                prompt.setIcon(QMessageBox.Icon.Question)
+                prompt.setText("Stop Ollama and AnythingLLM too?")
+                prompt.setInformativeText(
+                    "Closing LegalFedLLM can also stop its local Docker services. "
+                    "Persistent AnythingLLM workspaces and Ollama models will be kept."
+                )
+                stop_button = prompt.addButton(
+                    "Stop Docker and Close",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                leave_button = prompt.addButton(
+                    "Leave Docker Running",
+                    QMessageBox.ButtonRole.DestructiveRole,
+                )
+                cancel_button = prompt.addButton(QMessageBox.StandardButton.Cancel)
+                prompt.setDefaultButton(cancel_button)
+                prompt.exec()
+                clicked = prompt.clickedButton()
+                if clicked is cancel_button or clicked is None:
+                    event.ignore()
+                    return
+                if clicked is stop_button:
+                    try:
+                        self.local_ai.stop()
+                    except Exception as exc:
+                        QMessageBox.warning(
+                            self,
+                            APP_TITLE,
+                            "Could not stop Ollama/AnythingLLM. LegalFedLLM will remain open.\n\n" + str(exc),
+                        )
+                        event.ignore()
+                        return
+                elif clicked is not leave_button:
+                    event.ignore()
+                    return
             self.timer.stop()
+            stop_diagnostics(self.diagnostic_processes)
             self.controller.stop()
             event.accept()
 

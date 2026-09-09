@@ -221,6 +221,35 @@ class DeploymentFileContractTests(unittest.TestCase):
                     if matching:
                         self.assertEqual(matching, [prefix])
 
+
+    def test_embedded_legalfed_ai_bundle_has_exactly_four_runtime_files(self) -> None:
+        root = Path("legalfed-ai")
+        self.assertEqual(
+            sorted(path.name for path in root.iterdir() if path.is_file()),
+            [
+                "anythingllm.docker.env",
+                "anythingllm.env",
+                "compose.yaml",
+                "legalfedllm.network.yaml",
+            ],
+        )
+        compose = (root / "compose.yaml").read_text(encoding="utf-8")
+        docker_env = (root / "anythingllm.docker.env").read_text(encoding="utf-8")
+        self.assertIn("network_mode: host", compose)
+        self.assertIn("name: legalfed-ai-ollama-data", compose)
+        self.assertIn("name: legalfed-ai-anythingllm-data", compose)
+        self.assertIn("LLM_PROVIDER=generic-openai", docker_env)
+        self.assertIn("GENERIC_OPEN_AI_MODEL_PREF=legalfedllm-local", docker_env)
+        self.assertIn("PROVIDER_DISABLE_NATIVE_TOOL_CALLING=generic-openai", docker_env)
+        self.assertIn("ANYTHINGLLM_FETCH_TIMEOUT=1800000", docker_env)
+        self.assertIn("ANYTHINGLLM_MAX_RETRIES=0", docker_env)
+        self.assertNotIn("PASTE_RANDOM_SECRET_HERE", docker_env)
+
+    def test_desktop_build_bundles_legalfed_ai_directory(self) -> None:
+        build_script = Path("scripts/build_desktop.py").read_text(encoding="utf-8")
+        self.assertIn("--add-data", build_script)
+        self.assertIn("ROOT / 'legalfed-ai'", build_script)
+
     def test_docker_context_excludes_local_state(self) -> None:
         ignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
         for required in (

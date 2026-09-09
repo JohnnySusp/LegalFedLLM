@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -61,14 +62,18 @@ class DesktopClientApiTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertNotIn("collaborative", models.text.lower())
 
-                completion = await client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "legalfedllm-local",
-                        "messages": [{"role": "user", "content": "Explain this locally."}],
-                        "temperature": 0.2,
-                    },
-                )
+                with mock.patch(
+                    "starlette.requests.Request.is_disconnected",
+                    new=mock.AsyncMock(return_value=False),
+                ):
+                    completion = await client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "legalfedllm-local",
+                            "messages": [{"role": "user", "content": "Explain this locally."}],
+                            "temperature": 0.2,
+                        },
+                    )
                 self.assertEqual(completion.status_code, 200, completion.text)
                 body = completion.json()
                 self.assertIn("legalfedllm_learning_suggestion_id", body)
@@ -90,6 +95,50 @@ class DesktopClientApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(accepted.status_code, 200, accepted.text)
                 self.assertEqual(accepted.json()["queued_example_count"], 1)
                 self.assertEqual(runtime.learning_queue_status()["queued_example_count"], 1)
+
+    async def test_disconnected_local_request_does_not_create_learning_suggestion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            private_data_path = Path(directory) / "private" / "train.jsonl"
+            runtime = ClientRuntime(
+                data_dir=Path(directory) / "client",
+                client_id="client-desktop",
+                model_profile=mock_profile(),
+                private_data_path=private_data_path,
+            )
+            app = create_client_app(
+                runtime,
+                CoordinatorGateway("http://unused", None),
+                admin_token_override="local-provider-secret",
+                tunnel_manager=SshTunnelManager(SshTunnelConfig(enabled=False, target="")),
+            )
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://client",
+                headers={"Authorization": "Bearer local-provider-secret"},
+            ) as client:
+                with mock.patch(
+                    "starlette.requests.Request.is_disconnected",
+                    new=mock.AsyncMock(return_value=True),
+                ):
+                    completion = await client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "legalfedllm-local",
+                            "messages": [
+                                {"role": "user", "content": "This request was abandoned."}
+                            ],
+                        },
+                    )
+
+            self.assertEqual(completion.status_code, 200, completion.text)
+            self.assertNotIn(
+                "legalfedllm_learning_suggestion_id",
+                completion.json(),
+            )
+            self.assertEqual(runtime.pending_learning_suggestions(), [])
+            self.assertEqual(runtime.learning_queue_status()["queued_example_count"], 0)
+            self.assertFalse(private_data_path.exists())
 
     async def test_host_inference_is_forwarded_with_registered_client_signature(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

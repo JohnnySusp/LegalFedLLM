@@ -1,0 +1,54 @@
+name: legalfed-ai
+
+services:
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: legalfed-ai-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: "5m"
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    networks:
+      legalfed-ai-net:
+        aliases:
+          - ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  anythingllm:
+    image: docker.io/mintplexlabs/anythingllm:latest
+    container_name: legalfed-ai-anythingllm
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    env_file:
+      - anythingllm.docker.env
+    network_mode: host
+    volumes:
+      - anythingllm-data:/app/server/storage
+
+networks:
+  legalfed-ai-net:
+    external: true
+    name: legalfed-ai-net
+
+volumes:
+  ollama-data:
+    name: legalfed-ai-ollama-data
+  anythingllm-data:
+    name: legalfed-ai-anythingllm-data

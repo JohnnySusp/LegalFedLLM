@@ -38,6 +38,8 @@ def build_pyinstaller(*, clean: bool) -> Path:
         "shared",
         "--collect-submodules",
         "desktop",
+        "--add-data",
+        f"{ROOT / 'legalfed-ai'}{os.pathsep}legalfed-ai",
         "desktop/app.py",
     ]
     if clean:
