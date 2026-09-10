@@ -40,3 +40,6 @@ build/
 dist/
 *.AppImage
 *.AppDir/
+
+# PyInstaller generated file
+LegalFedLLM.spec

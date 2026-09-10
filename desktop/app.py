@@ -285,7 +285,36 @@ def _local_ai_start_ready(
     return agent_healthy and not already_attempted
 
 
+def _appimage_host_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    original_library_path = environment.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original_library_path:
+        environment["LD_LIBRARY_PATH"] = original_library_path
+    else:
+        environment.pop("LD_LIBRARY_PATH", None)
+    for name in (
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QML2_IMPORT_PATH",
+        "QML_IMPORT_PATH",
+    ):
+        environment.pop(name, None)
+    return environment
+
+
 def open_default_browser(url: str) -> bool:
+    if sys.platform.startswith("linux") and os.getenv("APPIMAGE"):
+        opener = shutil.which("xdg-open")
+        if opener is None:
+            return False
+        try:
+            subprocess.Popen(
+                [opener, url],
+                env=_appimage_host_environment(),
+            )
+            return True
+        except OSError:
+            return False
     try:
         return bool(webbrowser.open(url, new=2, autoraise=True))
     except Exception:

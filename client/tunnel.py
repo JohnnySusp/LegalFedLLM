@@ -23,10 +23,13 @@ class SshTunnelConfig:
     remote_host: str = "127.0.0.1"
     remote_port: int = 8000
     reconnect_seconds: float = 3.0
+    external: bool = False
+    external_forward_host: str = "127.0.0.1"
 
     @classmethod
     def from_environment(cls) -> "SshTunnelConfig":
         enabled = os.getenv("CLIENT_SSH_TUNNEL_ENABLED", "false").strip().lower()
+        external = os.getenv("CLIENT_SSH_TUNNEL_EXTERNAL", "false").strip().lower()
         return cls(
             enabled=enabled in {"1", "true", "yes"},
             target=os.getenv("CLIENT_SSH_TARGET", "").strip(),
@@ -39,12 +42,20 @@ class SshTunnelConfig:
             reconnect_seconds=float(
                 os.getenv("CLIENT_SSH_RECONNECT_SECONDS", "3")
             ),
+            external=external in {"1", "true", "yes"},
+            external_forward_host=os.getenv(
+                "CLIENT_SSH_EXTERNAL_FORWARD_HOST", "127.0.0.1"
+            ).strip(),
         )
 
     def validate(self) -> None:
         if not self.enabled:
+            if self.external:
+                raise SshTunnelError(
+                    "CLIENT_SSH_TUNNEL_EXTERNAL requires CLIENT_SSH_TUNNEL_ENABLED=true"
+                )
             return
-        if not self.target:
+        if not self.external and not self.target:
             raise SshTunnelError("CLIENT_SSH_TARGET is required")
         for name, value in (
             ("ssh_port", self.ssh_port),
@@ -55,6 +66,8 @@ class SshTunnelConfig:
                 raise SshTunnelError(f"{name} must be between 1 and 65535")
         if not self.remote_host:
             raise SshTunnelError("remote Coordinator host must not be blank")
+        if self.external and not self.external_forward_host:
+            raise SshTunnelError("external SSH forward host must not be blank")
         if self.reconnect_seconds <= 0:
             raise SshTunnelError("SSH reconnect interval must be positive")
 
@@ -97,7 +110,7 @@ class SshTunnelManager:
         ]
 
     def start(self) -> None:
-        if not self.config.enabled:
+        if not self.config.enabled or self.config.external:
             return
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -152,7 +165,7 @@ class SshTunnelManager:
             raise SshTunnelError("SSH forward poll interval must be positive")
         while not self._stop.is_set():
             status = self.status()
-            if status["running"] and status["forward_reachable"]:
+            if status["forward_reachable"]:
                 print(
                     "LegalFedLLM SSH tunnel established; starting Client Agent API.",
                     flush=True,
@@ -163,6 +176,8 @@ class SshTunnelManager:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.config.external:
+            return
         with self._lock:
             process = self._process
         if process is not None and process.poll() is None:
@@ -179,24 +194,32 @@ class SshTunnelManager:
     def _forward_reachable(self) -> bool:
         if not self.config.enabled:
             return False
+        host = (
+            self.config.external_forward_host
+            if self.config.external
+            else "127.0.0.1"
+        )
         sock = socket.socket()
         sock.settimeout(0.5)
         try:
-            return sock.connect_ex(("127.0.0.1", self.config.local_port)) == 0
+            return sock.connect_ex((host, self.config.local_port)) == 0
         finally:
             sock.close()
 
     def status(self) -> dict[str, Any]:
+        forward_reachable = self._forward_reachable()
         with self._lock:
             process = self._process
-            running = process is not None and process.poll() is None
-            pid = process.pid if running else None
+            process_running = process is not None and process.poll() is None
+            pid = process.pid if process_running else None
             last_exit_code = self._last_exit_code
+        running = forward_reachable if self.config.external else process_running
         return {
             "enabled": self.config.enabled,
+            "external": self.config.external,
             "running": running,
             "pid": pid,
-            "forward_reachable": self._forward_reachable(),
+            "forward_reachable": forward_reachable,
             "local_port": self.config.local_port,
             "remote_host": self.config.remote_host,
             "remote_port": self.config.remote_port,
