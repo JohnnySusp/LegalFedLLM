@@ -60,24 +60,40 @@ training examples remain on the Client machine.
 
 ## Using LegalFedLLM
 
-The desktop Client can currently be run directly from a source checkout. The
-source-launch path expects its Python environment to be prepared in advance;
-starting `desktop.app` does **not** install missing Python packages automatically.
-Docker is used separately for the managed Ollama and AnythingLLM services.
+The Linux desktop Client can be used in two ways:
 
-### First installation from source
+1. **from source**, using a prepared Python virtual environment; or
+2. **from the Linux x86_64 AppImage**, which packages the GUI/controller and
+   runs the heavy Client ML runtime in Docker.
 
-Before starting, make sure the machine has:
+Both paths use the same saved-profile and federation workflow. In both cases the
+remote Host/Coordinator must already be running, and Docker is used for the
+managed Ollama + AnythingLLM services.
 
-- Python with `venv` support;
-- Docker Engine and Docker Compose, with Docker running;
+### Common prerequisites
+
+Before starting, make sure the Client machine has:
+
+- Docker Engine and Docker Compose, with Docker running and usable by the current
+  user;
 - OpenSSH (`ssh`);
-- an NVIDIA/CUDA-capable environment for the real Qwen or Granite Client path; and
+- an NVIDIA/CUDA-capable environment for the real Qwen or Granite Client path;
+- enough free disk space for Docker images plus downloaded model/tokenizer data;
+  and
 - the Host SSH address/port plus a fresh one-time enrollment token supplied by
-  the Host/Coordinator operator.
+  the Host/Coordinator operator for each new Client profile.
+
+The current 1.0 Client path assumes NVIDIA/CUDA. The AppImage does **not** install
+Docker, the NVIDIA container runtime/driver stack, or OpenSSH for the user.
+
+### Method 1 — install and run from source
+
+Source mode additionally requires Python 3 with `venv` support. The source path
+runs the Client Transformers/PEFT runtime from the local Python environment.
+Docker is used separately for Ollama and AnythingLLM.
 
 Clone the repository, create a virtual environment, and install the desktop
-requirements from the repository root:
+requirements:
 
 ```bash
 git clone https://github.com/JohnnySusp/LegalFedLLM.git
@@ -90,59 +106,159 @@ python -m pip install -r requirements-desktop.txt
 ```
 
 `requirements-desktop.txt` includes the normal LegalFedLLM runtime requirements
-as well as PySide6 and PyInstaller. The initial installation can therefore be
-large because the source-run Client uses the local Transformers/PEFT/PyTorch
-environment directly.
+plus PySide6 and the desktop build dependencies. The initial source installation
+can therefore be large because the local environment contains the
+Transformers/PEFT/PyTorch Client stack.
 
-Check that Docker is available:
+Check Docker before launching:
 
 ```bash
 docker --version
 docker compose version
 ```
 
-Then launch the desktop Client from the repository root while the virtual
-environment is active:
+Start the desktop Client from the repository root:
 
 ```bash
+source .venv/bin/activate
 python -m desktop.app
 ```
 
-Keep that launch terminal open. LegalFedLLM deliberately leaves SSH password
-entry to OpenSSH, so when a profile connects to the remote Host the password
-prompt appears in this terminal. The SSH password is not stored by LegalFedLLM.
+Keep that terminal open. LegalFedLLM deliberately leaves SSH password entry to
+OpenSSH, so the Host SSH password is entered in the launch terminal and is not
+handled or stored by LegalFedLLM.
 
-On the first launch, create a Client profile in the GUI and provide:
+#### Source-mode data location
+
+When run from source, persistent desktop state is created inside the checkout:
+
+```text
+LegalFedLLM/
+├── ...
+└── LegalFedLLM-data/
+```
+
+`LegalFedLLM-data/` contains saved profiles, Client identities and state, local
+learning data, logs, downloaded Hugging Face model/tokenizer data, and the
+managed local-AI runtime copy. Do not delete it if you want to preserve the
+Client profiles between launches.
+
+To completely remove a source installation, remove both the repository checkout
+and its `LegalFedLLM-data/` directory, then follow the Docker cleanup notes under
+**Completely uninstalling the AppImage / desktop Docker resources** below if you
+also want the managed Docker data removed.
+
+### Method 2 — install and run the Linux AppImage
+
+For a published Linux release, download `LegalFedLLM-x86_64.AppImage` from the
+project's GitHub Releases page and place it in a stable directory before first
+use. For example:
+
+```text
+~/Applications/LegalFedLLM/
+└── LegalFedLLM-x86_64.AppImage
+```
+
+Make it executable:
+
+```bash
+chmod +x ~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
+```
+
+You can then double-click the AppImage in a file manager or launch it from a
+terminal:
+
+```bash
+~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
+```
+
+When launched graphically on Linux, the AppImage opens a terminal and starts the
+GUI from that terminal so OpenSSH can ask for the Host password there. If the
+desktop environment cannot provide one of the supported terminal launchers,
+start the AppImage directly from an existing terminal instead.
+
+The AppImage is intentionally lightweight: it packages the PySide6
+GUI/controller, SSH-tunnel control, and a release-specific Client runtime
+definition rather than embedding the full PyTorch/Transformers/PEFT stack. On
+first use it materializes that Client runtime under the portable data directory
+and builds a versioned `legalfedllm-client:<runtime-hash>` Docker image locally.
+That first build can take a while and can consume several gigabytes of Docker
+storage. Later launches reuse the matching image when it already exists.
+
+#### Important: where the AppImage stores its files
+
+By default, the AppImage creates its LegalFedLLM desktop data tree next to the
+AppImage itself. A deliberate data-root override can place it elsewhere:
+
+```text
+~/Applications/LegalFedLLM/
+├── LegalFedLLM-x86_64.AppImage
+└── LegalFedLLM-data/
+    ├── desktop-state.json
+    ├── profiles/
+    │   └── profile-.../
+    │       ├── profile.json
+    │       ├── profile.env
+    │       ├── client-data/
+    │       ├── private/
+    │       └── logs/
+    ├── models/
+    │   └── huggingface/
+    ├── client-runtime/
+    │   └── <runtime-hash>/
+    └── legalfed-ai/
+```
+
+The important rule is:
+
+```text
+AppImage directory
+├── LegalFedLLM-x86_64.AppImage
+└── LegalFedLLM-data/   ← persistent LegalFedLLM desktop state
+```
+
+The profile directories hold the Client identity/enrollment state, adapters and
+checkpoints, local-learning queue, and logs. `models/huggingface/` is the shared
+Hugging Face cache. `client-runtime/` holds the materialized Docker Client
+runtime for each release hash. `legalfed-ai/` contains the writable
+Ollama/AnythingLLM Compose configuration used by the desktop.
+
+This is a portable-state design: the current AppImage does not need an
+OS-global LegalFedLLM application-data directory. If you move the AppImage but
+want to keep the same profiles, move its sibling `LegalFedLLM-data/` directory
+with it. Moving only the AppImage makes the new directory look like a fresh
+installation. Deleting `LegalFedLLM-data/` deletes the saved LegalFedLLM desktop
+profiles and their persistent Client state.
+
+### First profile and enrollment
+
+On first launch, create a Client profile in the GUI and provide:
 
 - a profile name;
 - the Qwen or Granite Client model profile;
 - the Host SSH target, such as `user@host.example`;
 - the Host SSH port;
 - the local Coordinator-forward port and Client Agent port; and
-- the fresh one-time enrollment token issued for that Client.
+- a fresh one-time enrollment token issued by the Host/Coordinator.
 
-The enrollment token is consumed by successful registration. Later launches use
-the Client identity stored in the profile and do not require that token again.
-When running from source, portable desktop state is created under:
+The enrollment token is consumed by successful registration. Later launches of
+the same saved profile use its persisted Client identity and do not require a
+new enrollment token. A genuinely new profile requires a new one-time token.
 
-```text
-LegalFedLLM/LegalFedLLM-data/
-```
-
-Each profile has its own Client identity, local training state, adapter state,
-private-learning queue and logs. Downloaded Hugging Face model/tokenizer data is
-kept under the shared `LegalFedLLM-data/models/huggingface/` cache.
+Each profile owns an independent Client ID, Ed25519 identity, adapter/checkpoint
+state, private-learning queue, and logs. Downloaded Hugging Face model/tokenizer
+data is shared through `LegalFedLLM-data/models/huggingface/`.
 
 ### Ollama and AnythingLLM on first use
 
-After the Client Agent establishes the SSH tunnel and becomes healthy, the
-desktop manages the Docker Ollama and AnythingLLM stack and opens AnythingLLM in
-the default browser when the local AI stack is ready. Docker may pull the
-required service images when they are not already present.
+After the Client Agent establishes the SSH tunnel and becomes healthy,
+LegalFedLLM prepares the managed Docker Ollama and AnythingLLM stack. Docker may
+pull those service images if they are not already available. When the local AI
+stack is ready, the desktop opens AnythingLLM in the default browser.
 
 LegalFedLLM does **not** silently pull the selected Ollama compatibility model.
-If the GUI reports that the profile's Ollama model is missing after the managed
-Ollama container has started, install the model explicitly:
+If the GUI reports that the required model is missing after Ollama starts,
+install it explicitly:
 
 ```bash
 # Qwen Client profile
@@ -155,9 +271,9 @@ docker exec legalfed-ai-ollama ollama pull granite3.3:2b
 Only the model required by the active Client profile needs to be installed.
 Federated training and LOCAL LegalFedLLM inference use the exact pinned
 Transformers + PEFT Client state; Ollama remains a compatibility/local-AI
-serving component.
+serving component rather than a substitute for the active LegalFedLLM adapter.
 
-### Normal use after installation
+### Normal use
 
 For later source launches:
 
@@ -167,14 +283,22 @@ source .venv/bin/activate
 python -m desktop.app
 ```
 
-Select or create the required profile from the GUI. After the SSH tunnel, Client
-Agent and local AI services are ready, AnythingLLM opens automatically. The
-OpenAI-compatible Client endpoint exposes the LOCAL and HOST LegalFedLLM model
-routes used by the desktop integration.
+For later AppImage launches, start the same AppImage from the directory that
+also contains its existing `LegalFedLLM-data/` directory.
+
+Select the saved profile. A previously enrolled profile still needs the SSH
+password for the new tunnel connection, but it does not need another enrollment
+token. After the Client Agent and local AI services are ready, AnythingLLM opens
+automatically.
+
+The OpenAI-compatible Client endpoint exposes the `legalfedllm-local` and
+`legalfedllm-host` routes used by the desktop integration. `LOCAL` stays on the
+Client and uses the active Client PEFT state. `HOST` explicitly forwards through
+the LegalFedLLM Host/Coordinator path.
 
 The main federation action is **Participate in the current federated round**. It
-is enabled only when the active Client is connected, compatible, selected for a
-collecting round and has not already participated. Queued LOCAL learning is
+is available only when the active Client is connected, compatible, selected for
+a collecting round, and has not already participated. Queued LOCAL learning is
 applied before participation when present.
 
 The global desktop settings are available from the Options menu:
@@ -182,17 +306,113 @@ The global desktop settings are available from the Options menu:
 - **Constant Learning** is enabled by default. LOCAL interactions are added to
   the one-use local-learning queue automatically. Disable it to restore the
   explicit **Learn from this** / **Dismiss** decision.
-- **Low VRAM Mode** is disabled by default. Enable it when Client training or
-  reverse distillation encounters CUDA out-of-memory pressure; it trades memory
-  usage for additional computation and restarts LegalFedLLM after confirmation.
+- **Low VRAM Mode** is disabled by default. When enabled, LegalFedLLM turns on
+  the lower-memory Client training policy and restarts the desktop after
+  confirmation. It trades memory use for additional computation.
 - **Debug Mode** is disabled by default. Enable it to open the additional Client
   state and NVIDIA/GPU diagnostic terminals.
+- **Reset Defaults** restores Constant Learning to on, Debug Mode to off, and
+  Low VRAM Mode to off. If that changes a restart-sensitive setting, the GUI
+  reports that a restart is needed.
 
 When a completed round contains useful Host-to-Client teaching samples,
-LegalFedLLM asks before applying reverse learning. On application exit, if the
-managed Ollama or AnythingLLM services are still running, the GUI asks whether
-to stop them or leave them running. Stopping the services preserves their Docker
-volumes.
+LegalFedLLM asks before applying reverse learning.
+
+### Closing LegalFedLLM
+
+Closing the GUI stops the Client Agent and its SSH tunnel. In the AppImage path,
+the profile-specific LegalFedLLM Client Docker container is also brought down;
+the Client's persistent profile state, model cache, and locally built Docker
+image are retained for later launches.
+
+If managed Ollama or AnythingLLM services are actually running, the GUI asks
+whether to stop them or leave them running. Choosing **Stop Docker and Close**
+stops those services while preserving their Docker volumes. If both services
+are already stopped, the desktop closes without that prompt.
+
+### Completely uninstalling the AppImage / desktop Docker resources
+
+A normal AppImage installation has LegalFedLLM-specific persistent state in two
+places:
+
+1. the directory containing the AppImage and its sibling `LegalFedLLM-data/`;
+2. Docker resources created or used by the desktop.
+
+First close LegalFedLLM. If the Ollama/AnythingLLM shutdown prompt appears,
+choose **Stop Docker and Close**.
+
+Then delete the AppImage and its sibling portable data directory. For the example
+layout above:
+
+```bash
+rm -f ~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
+rm -rf ~/Applications/LegalFedLLM/LegalFedLLM-data
+```
+
+Those commands remove the AppImage and the filesystem state owned by that
+portable installation. Adjust the path if you stored the AppImage elsewhere.
+
+If you also want to remove the Docker resources associated with LegalFedLLM,
+inspect them first:
+
+```bash
+docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' \
+  | grep -E '(^NAMES|legalfedllm-|legalfed-ai-)'
+
+docker image ls legalfedllm-client
+docker volume ls | grep 'legalfed-ai-'
+docker network ls | grep 'legalfed-ai-net'
+```
+
+Then, for a complete LegalFedLLM-specific Docker cleanup:
+
+```bash
+# Remove any remaining profile Client containers.
+docker ps -a --format '{{.ID}} {{.Names}}' \
+  | awk '$2 ~ /^legalfedllm-profile-.*-client-1$/ {print $1}' \
+  | xargs -r docker rm -f
+
+# Remove the managed local-AI containers.
+docker rm -f \
+  legalfed-ai-anythingllm \
+  legalfed-ai-ollama \
+  2>/dev/null || true
+
+# Remove persistent AnythingLLM and Ollama data.
+docker volume rm \
+  legalfed-ai-anythingllm-data \
+  legalfed-ai-ollama-data \
+  2>/dev/null || true
+
+# Remove the LegalFedLLM local-AI network.
+docker network rm legalfed-ai-net 2>/dev/null || true
+
+# Remove locally built LegalFedLLM Client runtime images.
+docker image ls legalfedllm-client -q \
+  | sort -u \
+  | xargs -r docker image rm
+```
+
+The two `legalfed-ai-*` volumes contain persistent AnythingLLM state and Ollama
+model data. Removing them is destructive and should only be done for a complete
+uninstall.
+
+The generic third-party Ollama and AnythingLLM image layers may remain in
+Docker's shared image cache, and Docker can also retain shared build cache.
+LegalFedLLM intentionally does not recommend broad commands such as
+`docker system prune` or `docker builder prune` as part of its uninstall path,
+because those can delete resources belonging to unrelated projects.
+
+LegalFedLLM does not store the SSH password. OpenSSH may add the Host key to the
+user's normal `~/.ssh/known_hosts`; that file belongs to OpenSSH rather than
+LegalFedLLM. A user who also wants to remove that Host-key record can use
+`ssh-keygen -R <host>` (and, for a non-default SSH port, the corresponding
+`[host]:port` form).
+
+With the AppImage file, its sibling `LegalFedLLM-data/`, the LegalFedLLM-specific
+Docker containers/images/volumes/network, and any deliberately removed OpenSSH
+host-key record gone, the current portable AppImage path does not require any
+other OS-global LegalFedLLM application-data directory.
 
 ## Status at a glance
 
@@ -210,7 +430,7 @@ volumes.
 | Automatic Host → Qwen reverse distillation | Implemented and real-tested |
 | Exact submission acknowledgement reconciliation | Implemented and regression-tested |
 | Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
-| Portable PySide6 desktop Client source | Implemented and model-free tested; Linux/Bazzite source GUI accepted, AppImage packaging and Windows acceptance pending |
+| Portable PySide6 desktop Client | Source path accepted on Linux/Bazzite; Linux x86_64 AppImage implemented and real-tested with the Qwen Client through startup/enrollment, AnythingLLM LOCAL use, a complete forward federated round, browser launch, and clean Client-Docker shutdown; Windows packaging/acceptance pending |
 | LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented; real Bazzite AnythingLLM chat/RAG path accepted through active Qwen PEFT state |
 | HOST OpenAI-compatible forwarding through bounded Host queue | Implemented and model-free tested; real desktop/Host acceptance pending |
 | Configurable local learning queue | Implemented; Constant Learning is on by default, with Learn/Dismiss consent available when disabled; real Bazzite AnythingLLM queue behavior accepted |
@@ -352,84 +572,97 @@ The repository currently includes:
 - portable multi-profile desktop state with per-profile Client identities;
 - user-approved one-use local-learning queues and reverse-learning consent;
 - Agent-owned OpenSSH tunnel supervision;
-- PySide6 desktop source with PyInstaller build tooling and Linux AppImage wrapper support; and
+- PySide6 desktop source plus a lightweight Linux x86_64 AppImage path with a versioned Docker Client runtime; and
 - split-machine tmux orchestration with preserved run evidence.
 
 The deterministic mock path remains available for protocol and failure-policy
 regression tests. Mock loss/safety values are fixtures; they are not real-model
 measurements.
 
-## Portable desktop Client candidate
+## Portable desktop Client
 
-The repository now contains a first portable desktop Client candidate under
-`desktop/`. This is source-level implementation work pending authoritative
-Windows/Linux packaging and real-model acceptance; it is not yet claimed as a
-released desktop binary.
+The repository contains both the source desktop Client and the lightweight Linux
+x86_64 AppImage path. The AppImage packages the PySide6 GUI/controller,
+OpenSSH-tunnel control, profile management, local-AI orchestration, and the
+release-specific Client runtime definition. The heavy Client
+PyTorch/Transformers/PEFT stack runs in Docker rather than being embedded in the
+AppImage.
 
-The locked PoC behavior is:
+For AppImage mode, the GUI process owns the host OpenSSH tunnel. The Docker
+Client uses that already-established local forward as an external tunnel rather
+than spawning a second SSH process. The versioned Client runtime is materialized
+under `LegalFedLLM-data/client-runtime/<runtime-hash>/`, and its Docker image is
+named `legalfedllm-client:<runtime-hash-prefix>`. Closing the GUI stops the
+profile-specific Client Docker stack and tunnel while preserving profile data,
+model caches, checkpoints, and the Docker image.
+
+The Linux AppImage path has been real-tested on Bazzite with the Qwen Client for
+profile creation/enrollment, SSH startup, Docker Client creation, direct LOCAL
+Transformers + PEFT serving through AnythingLLM, local-learning queue behavior,
+a complete forward federated round against the remote Mistral Nemo Host,
+AnythingLLM browser launch, and clean Client-Docker shutdown. Windows packaging
+and acceptance remain pending. The AppImage reverse-learning attempt with Low
+VRAM Mode disabled encountered CUDA out-of-memory pressure on the tested
+approximately 8 GB Client GPU; it failed without promoting a reverse candidate,
+so that attempt is not documented as a successful AppImage reverse-learning
+acceptance.
+
+The locked desktop behavior is:
 
 - one Client codebase with Qwen and Granite selected through approved model profiles;
 - PySide6 GUI, with PyInstaller as the per-OS executable bundler and an AppImage
   wrapper on Linux;
-- portable state in a sibling `LegalFedLLM-data/` directory rather than OS-global
-  application state;
+- portable state in a sibling `LegalFedLLM-data/` directory rather than an
+  OS-global LegalFedLLM application-data directory;
 - each saved profile owns an independent Client ID, Ed25519 identity, adapter
   state and one-time enrollment;
-- the Client Agent is a child process of the GUI and owns the OpenSSH tunnel; on
-  initial connection, OpenSSH asks for the SSH password in the launch terminal
-  before the Agent API starts. The password is never handled or stored by
-  LegalFedLLM. The global `Debug Mode` option is off by default, leaving only the
-  launch/SSH/HTTP terminal; when enabled it additionally opens the state terminal
-  (HTTP 200 OK plus Client state) and NVIDIA/GPU terminal;
-- the global `Low VRAM Mode` option is off by default. Changing it asks for
-  Yes/No confirmation and, when confirmed, automatically restarts LegalFedLLM so
-  the Client Agent starts with the new CUDA-memory policy. When enabled it sets
+- the Client Agent is a child process of the GUI. OpenSSH asks for the SSH
+  password in the launch terminal before the Agent API starts, and the password
+  is never handled or stored by LegalFedLLM;
+- AppImage mode keeps the host SSH tunnel outside the Client Docker container and
+  gives the container an explicit external-tunnel contract;
+- the global `Debug Mode` option is off by default, leaving only the launch/SSH
+  terminal; when enabled it additionally opens the state and NVIDIA/GPU
+  diagnostic terminals;
+- the global `Low VRAM Mode` option is off by default. When enabled it sets
   `CLIENT_GRADIENT_CHECKPOINTING=true` and
-  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce peak CUDA-memory
-  pressure during Client training and reverse distillation. Gradient checkpointing
-  trades memory for extra computation, so training may take longer and keep the GPU
-  busy for longer;
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the Client runtime and
+  restarts the desktop after confirmation;
 - Ollama models are installed by the user. LegalFedLLM checks that the selected
   profile's expected Ollama model is installed, but federated training and LOCAL
-  serving use the exact pinned Transformers + PEFT state; on Linux/PyTorch 2.13+
-  environments without Python development headers, the Client disables only the
-  native `bmm` override that would otherwise make Triton JIT require `Python.h`;
-- before a real-model participation is submitted, the Client resolves its signed
-  Client↔Host alignment profile and verifies both exact pinned tokenizers from the
-  local Hugging Face cache. A missing tokenizer may be downloaded from its pinned
-  repository revision and is validated before D^P inference continues; this
-  preflight does not download Host model weights;
+  serving use the exact pinned Transformers + PEFT state;
+- before real-model participation, the Client resolves its signed Client↔Host
+  alignment profile and verifies both exact pinned tokenizers from the local
+  Hugging Face cache. This preflight does not download Host model weights;
 - D^P is downloaded from the Coordinator and verified against the signed round
   manifest;
-- LOCAL AnythingLLM-style interactions enter the generated per-profile
-  `train.jsonl` queue automatically while the global `Constant Learning` option is
-  enabled (the default). Turning it off restores the explicit `Learn from this` /
-  `Dismiss` decision for each LOCAL interaction;
-- queued local examples are consumed once. They are removed only after the
-  resulting adapter is safely promoted; failed training restores the queue;
+- LOCAL AnythingLLM interactions enter the generated per-profile `train.jsonl`
+  queue automatically while `Constant Learning` is enabled (the default).
+  Turning it off restores the explicit `Learn from this` / `Dismiss` decision;
+- queued local examples are consumed once and removed only after the resulting
+  adapter is safely promoted; failed training restores the queue;
 - the main GUI action is `Participate in the current federated round`;
 - reverse Host learning requires a verified Host package, at least one selected
-  Host-teacher sample, and explicit user consent; and
-- the OpenAI-compatible provider exposes only `legalfedllm-local` and
-  `legalfedllm-host` in this milestone. Collaborative inference remains future
-  work;
-- the repository carries a four-file `legalfed-ai/` bundle for Docker Ollama and
-  AnythingLLM. On profile activation, the desktop seeds a writable copy under
-  `LegalFedLLM-data/legalfed-ai/`, preserves an existing AnythingLLM JWT/RAG
-  configuration when migrating from `~/legalfed-ai` and rewrites the Generic OpenAI
-  provider to the active profile's loopback Client Agent. The GUI does not start
-  Docker while OpenSSH is still waiting for authentication. After the Client Agent
-  answers its first successful health poll, the desktop creates the external Docker
-  network if needed, starts Docker Ollama, verifies the profile's required Ollama
-  compatibility model without pulling it, and recreates AnythingLLM. After the
-  Client Agent and local AI stack are both ready, the desktop asks the OS
-  default browser to open `http://127.0.0.1:3001/`. On GUI exit, the user chooses
-  whether to stop Ollama/AnythingLLM or leave them running; stopping uses Compose
-  `stop` and preserves persistent volumes. The existing `legalfed-ai-*` container
-  and volume names are intentionally preserved for 1.0 compatibility;
-- AnythingLLM native Generic OpenAI tool calling is disabled for the 1.0 path.
-  Ordinary chat and RAG are supported; Agent/tool calling is not yet part of the
-  LegalFedLLM OpenAI-compatibility contract.
+  Host-teacher sample, and explicit user consent;
+- the OpenAI-compatible provider exposes `legalfedllm-local` and
+  `legalfedllm-host` for the current milestone; collaborative inference remains
+  future work;
+- the repository carries the `legalfed-ai/` Docker Ollama + AnythingLLM bundle.
+  On profile activation the desktop seeds a writable copy under
+  `LegalFedLLM-data/legalfed-ai/`, preserves compatible existing AnythingLLM
+  configuration when migrating from `~/legalfed-ai`, and rewrites the Generic
+  OpenAI provider to the active profile's loopback Client Agent;
+- Docker local-AI services are not started while OpenSSH is still waiting for
+  authentication. After the Client Agent becomes healthy, LegalFedLLM starts
+  Ollama, verifies the required compatibility model without pulling it, starts
+  AnythingLLM, and opens `http://127.0.0.1:3001/` in the host default browser;
+- on GUI exit, the profile-specific AppImage Client Docker stack is brought down
+  automatically. The user separately chooses whether managed
+  Ollama/AnythingLLM services should stop or remain running; stopping them
+  preserves their persistent volumes; and
+- AnythingLLM native Generic OpenAI tool calling is disabled for the current 1.0
+  path. Ordinary chat and RAG are supported; Agent/tool calling is not yet part
+  of the LegalFedLLM OpenAI-compatibility contract.
 
 The desktop build helpers are:
 
@@ -438,9 +671,11 @@ python scripts/build_desktop.py
 python scripts/build_desktop.py --appimage   # Linux; requires appimagetool
 ```
 
-Windows and Linux artifacts must be built on their respective operating systems;
-PyInstaller is not a cross-compiler. `requirements-desktop.txt` contains the
-desktop/build additions on top of the normal runtime requirements.
+The normal PyInstaller build and Linux AppImage are distinct packaging paths.
+The Linux AppImage is built as a small `--onedir` controller bundle and stages
+the Docker Client runtime inputs rather than collecting the complete ML runtime
+inside the AppImage. Windows and Linux artifacts must be built on their
+respective operating systems; PyInstaller is not a cross-compiler.
 
 ## Pinned model profiles
 
@@ -1059,6 +1294,22 @@ Some real-model tests are opt-in and require the pinned model/tokenizer artifact
 plus the expected CUDA/Transformers/PEFT environment. A missing optional ML
 dependency should be distinguished from a source-code regression.
 
+### Desktop/AppImage packaging and lifecycle regressions
+
+Focused model-free coverage for the lightweight AppImage/Docker Client boundary
+is:
+
+```bash
+python -m unittest -v \
+  tests.test_appimage_packaging \
+  tests.test_desktop_client_docker
+```
+
+This covers the AppImage packaging boundary, graphical terminal relaunch,
+sanitized host-browser launch, the versioned Client Docker runtime, portable
+profile/model mounts, writable local-learning state, the external SSH-tunnel
+contract, and full Docker-stack cleanup when the Client Agent terminates.
+
 ### Reliability and safety regressions
 
 Focused model-free coverage includes:
@@ -1302,7 +1553,7 @@ The current repository does **not** establish:
 - real Mistral Nemo serving through the current Host profile;
 - stable thesis measurements for end-to-end wall time, peak RAM/VRAM,
   communication cost, and scaling across multiple real Clients; or
-- a graphical end-user application.
+- Windows desktop packaging and real Windows Client acceptance.
 
 D^V validation is a strong held-out outcome gate, but it is not a proof against
 all targeted/backdoor behavior outside D^V coverage. Likewise, a low or accepted
@@ -1347,7 +1598,3 @@ A defensible current summary is:
 The repository is beyond a mock protocol demonstration, but it remains a
 research proof of concept rather than a production federated-learning system.
 
-
-### Desktop settings refinements
-
-The Options menu also provides **Reset Defaults**, which restores Constant Learning to on, Debug Mode to off and Low VRAM Mode to off. Direct Low VRAM Mode changes ask for Yes/No confirmation and automatically restart LegalFedLLM when confirmed; Reset Defaults still reports if a restart is needed because it changes the setting without opening that confirmation. The exit Docker prompt is shown only when the managed Ollama or AnythingLLM service is actually running; if both are already stopped, the desktop closes normally without asking.
