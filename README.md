@@ -58,14 +58,137 @@ training examples remain on the Client machine.
 > formal differential privacy, production-calibrated poisoning detection,
 > production identity management, or encrypted transport/storage.
 
-## Requirements
+## Windows x64
+
+> **Windows release status:** the native portable Windows Client is still under
+> development. The requirements below describe the intended initial **Windows
+> x64** target and should be treated as provisional until the native Client is
+> implemented and accepted on real Windows hardware. The Installation, Using
+> LegalFedLLM, and Uninstallation subsections are intentionally left as
+> placeholders for that release.
+
+The intended Windows distribution is a portable `LegalFedLLM.exe` with
+persistent state stored in a sibling `LegalFedLLM-data\` directory. The current
+design direction does **not** require WSL, Docker Desktop, Docker Compose, or the
+Linux NVIDIA Container Toolkit for the Windows Client.
+
+### Requirements
+
+| Requirement | Why LegalFedLLM needs it | Quick check | Official installation/help |
+| --- | --- | --- | --- |
+| NVIDIA GPU + working Windows driver | Required by the current real Qwen/Granite Client training path | `nvidia-smi` | [NVIDIA Drivers](https://www.nvidia.com/en-us/drivers/) |
+| OpenSSH Client | Used for the Client-to-Host SSH connection/tunnel | `ssh -V` | [Microsoft OpenSSH for Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) |
+| Ollama for Windows | Planned native local-AI/compatibility serving component | `ollama --version` | [Ollama for Windows](https://ollama.com/download/windows) |
+| AnythingLLM Desktop for Windows | Planned user-facing local RAG/application layer | Check **Settings → Apps → Installed apps**, or launch AnythingLLM | [AnythingLLM Download](https://anythingllm.com/download) |
+| Host SSH target and one-time enrollment token | Required to enroll and connect a new Client profile | Supplied by the Host/Coordinator operator | Not a separately installed component |
+
+You will also need enough free disk space for the LegalFedLLM portable data
+directory, downloaded model/tokenizer files, Ollama models, and AnythingLLM
+application data.
+
+If a quick check already succeeds, do not reinstall that component.
+
+#### NVIDIA driver
+
+A fresh Windows installation may already have a working NVIDIA driver. Check
+first:
+
+```powershell
+nvidia-smi
+```
+
+If the command succeeds and reports the expected NVIDIA GPU, no additional
+driver installation is required for this prerequisite.
+
+If the driver is missing or needs to be updated, use NVIDIA's official driver
+page:
+
+<https://www.nvidia.com/en-us/drivers/>
+
+The final Windows Client acceptance tests will determine whether any additional
+runtime component must be documented. Do not install the full CUDA Toolkit
+merely because LegalFedLLM uses CUDA-capable PyTorch unless the accepted Windows
+runtime later requires it explicitly.
+
+#### OpenSSH Client
+
+Windows provides OpenSSH Client as an optional Windows capability.
+
+Check whether it is already available:
+
+```powershell
+ssh -V
+```
+
+You can also inspect the Windows capability from PowerShell:
+
+```powershell
+Get-WindowsCapability -Online -Name OpenSSH.Client*
+```
+
+If it is missing, follow Microsoft's official OpenSSH installation instructions:
+
+<https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse>
+
+Microsoft documents both the **Optional Features** interface and the elevated
+PowerShell installation method. LegalFedLLM needs the OpenSSH **Client**, not the
+OpenSSH Server.
+
+#### Ollama
+
+Check whether Ollama is already installed:
+
+```powershell
+ollama --version
+```
+
+If it is missing, install the native Windows release from Ollama's official
+download page:
+
+<https://ollama.com/download/windows>
+
+Ollama is a serving/compatibility component. It is not the runtime that performs
+LegalFedLLM federated PEFT training.
+
+#### AnythingLLM
+
+Check **Settings → Apps → Installed apps** for AnythingLLM, or launch the
+AnythingLLM Desktop application if it is already installed.
+
+If it is missing, obtain the native Windows Desktop release from the official
+AnythingLLM download page:
+
+<https://anythingllm.com/download>
+
+AnythingLLM is the intended user-facing RAG/application layer. LegalFedLLM
+remains responsible for federation, model learning, and its own Client/Host
+inference boundary.
+
+### Installation
+
+*To be completed after the native portable Windows Client is implemented and
+accepted.*
+
+### Using LegalFedLLM
+
+*To be completed after the native portable Windows Client is implemented and
+accepted.*
+
+### Uninstallation
+
+*To be completed after the native portable Windows Client is implemented and
+accepted.*
+
+## Linux
+
+### Requirements
 
 LegalFedLLM v1.0.0 can be run on Linux either from the published **x86_64
 AppImage** or directly from source. The AppImage packages the desktop
 GUI/controller, but it deliberately does not install host-level prerequisites
 such as Docker, OpenSSH, or the NVIDIA runtime.
 
-### Runtime requirements
+#### Runtime requirements
 
 | Requirement | AppImage | Source | Quick check |
 | --- | --- | --- | --- |
@@ -86,9 +209,9 @@ larger than the AppImage file itself.
 
 If a command in the table already works, do not reinstall that component.
 
-### Installing the required host tools
+#### Installing the required host tools
 
-#### Docker Engine and Docker Compose
+##### Docker Engine and Docker Compose
 
 On a normal mutable Linux distribution, use Docker Engine rather than relying on
 the AppImage to provide Docker. Docker publishes distribution-specific
@@ -147,7 +270,7 @@ docker run --rm hello-world
 > [Linux post-installation guidance](https://docs.docker.com/engine/install/linux-postinstall/)
 > before enabling it on a shared machine.
 
-#### OpenSSH client
+##### OpenSSH client
 
 On Ubuntu/Debian:
 
@@ -179,7 +302,7 @@ ssh -V
 LegalFedLLM deliberately leaves SSH password entry to OpenSSH. It does not
 handle or store the Host SSH password.
 
-#### NVIDIA driver and NVIDIA Container Toolkit
+##### NVIDIA driver and NVIDIA Container Toolkit
 
 The current real Qwen and Granite Client paths assume an NVIDIA/CUDA-capable
 Linux environment. First install a working NVIDIA driver using the supported
@@ -233,7 +356,7 @@ Finally verify Docker GPU access:
 docker run --rm --gpus all ubuntu nvidia-smi
 ```
 
-#### Git
+##### Git
 
 Git is needed only for the source installation/development path.
 
@@ -263,7 +386,7 @@ Verify with:
 git --version
 ```
 
-#### Python 3, `venv`, and `pip`
+##### Python 3, `venv`, and `pip`
 
 Python is needed only for the source installation/development path. The
 published AppImage does not require a separate LegalFedLLM Python environment.
@@ -301,7 +424,7 @@ The LegalFedLLM Python libraries do **not** need to be installed one by one.
 PySide6 and PyInstaller. The Installation section below installs the pinned set
 into a project-local virtual environment.
 
-#### `appimagetool` — build-only
+##### `appimagetool` — build-only
 
 `appimagetool` is **not** required to run the published AppImage or to run
 LegalFedLLM from source. It is required only when building the Linux AppImage
@@ -324,13 +447,13 @@ install -m 0755 appimagetool-x86_64.AppImage ~/.local/bin/appimagetool
 If `~/.local/bin` is not already on `PATH`, add it in your shell configuration.
 No host package layering is required.
 
-## Installation
+### Installation
 
 The **Linux x86_64 AppImage is the recommended end-user installation path** for
 the v1.0.0 release. The source path remains available for development,
 inspection, and direct source execution.
 
-### Method 1 — Linux x86_64 AppImage
+#### Method 1 — Linux x86_64 AppImage
 
 Download `LegalFedLLM-x86_64.AppImage` from the project's
 [GitHub Releases](https://github.com/JohnnySusp/LegalFedLLM/releases) page and
@@ -352,7 +475,7 @@ the Client runtime below the portable data directory and builds a versioned
 `legalfedllm-client:<runtime-hash>` Docker image locally. Later launches reuse
 the matching image.
 
-#### AppImage data location
+##### AppImage data location
 
 By default, persistent LegalFedLLM desktop state is stored next to the AppImage:
 
@@ -393,7 +516,7 @@ If you move the AppImage and want to preserve the same profiles, move its
 sibling `LegalFedLLM-data/` directory with it. Moving only the AppImage makes the
 new directory look like a fresh installation.
 
-### Method 2 — source checkout
+#### Method 2 — source checkout
 
 Clone the repository, create a project-local virtual environment, and install
 the desktop requirements:
@@ -422,7 +545,7 @@ ssh -V
 nvidia-smi
 ```
 
-#### Source-mode data location
+##### Source-mode data location
 
 When run from source, persistent desktop state is created inside the checkout:
 
@@ -436,12 +559,12 @@ Do not delete `LegalFedLLM-data/` if you want to preserve Client profiles,
 identities, adapters/checkpoints, local-learning state, logs, model/tokenizer
 downloads, and the managed local-AI runtime copy.
 
-## Using LegalFedLLM
+### Using LegalFedLLM
 
 Both installation methods use the same saved-profile, local-AI, and federation
 workflow.
 
-### Starting LegalFedLLM
+#### Starting LegalFedLLM
 
 For a source installation, start the desktop Client from the repository root:
 
@@ -467,7 +590,7 @@ GUI from that terminal so OpenSSH can ask for the Host password there. If the
 desktop environment cannot provide one of the supported terminal launchers,
 start the AppImage from an existing terminal.
 
-### First profile and enrollment
+#### First profile and enrollment
 
 On first launch, create a Client profile in the GUI and provide:
 
@@ -486,7 +609,7 @@ Each profile owns an independent Client ID, Ed25519 identity, adapter/checkpoint
 state, private-learning queue, and logs. Downloaded Hugging Face model/tokenizer
 data is shared through `LegalFedLLM-data/models/huggingface/`.
 
-### Ollama and AnythingLLM on first use
+#### Ollama and AnythingLLM on first use
 
 After the Client Agent establishes the SSH tunnel and becomes healthy,
 LegalFedLLM prepares the managed Docker Ollama and AnythingLLM stack. Docker may
@@ -510,7 +633,7 @@ Federated training and LOCAL LegalFedLLM inference use the exact pinned
 Transformers + PEFT Client state; Ollama remains a compatibility/local-AI
 serving component rather than a substitute for the active LegalFedLLM adapter.
 
-### Normal use
+#### Normal use
 
 On later launches, start LegalFedLLM using the same source or AppImage command
 from **Starting LegalFedLLM**, then select the saved profile.
@@ -546,7 +669,7 @@ The global desktop settings are available from the Options menu:
 When a completed round contains useful Host-to-Client teaching samples,
 LegalFedLLM asks before applying reverse learning.
 
-### Closing LegalFedLLM
+#### Closing LegalFedLLM
 
 Closing the GUI stops the Client Agent and its SSH tunnel. In the AppImage path,
 the profile-specific LegalFedLLM Client Docker container is also brought down;
@@ -558,9 +681,9 @@ whether to stop them or leave them running. Choosing **Stop Docker and Close**
 stops those services while preserving their Docker volumes. If both services
 are already stopped, the desktop closes without that prompt.
 
-## Uninstallation
+### Uninstallation
 
-### AppImage and desktop Docker resources
+#### AppImage and desktop Docker resources
 
 A normal AppImage installation has LegalFedLLM-specific persistent state in two
 places:
@@ -643,7 +766,7 @@ Docker containers/images/volumes/network, and any deliberately removed OpenSSH
 host-key record gone, the current portable AppImage path does not require any
 other OS-global LegalFedLLM application-data directory.
 
-### Source checkout
+#### Source checkout
 
 To completely remove a source installation, remove the repository checkout
 including its `LegalFedLLM-data/` directory. If you also want to remove the
