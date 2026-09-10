@@ -58,137 +58,303 @@ training examples remain on the Client machine.
 > formal differential privacy, production-calibrated poisoning detection,
 > production identity management, or encrypted transport/storage.
 
-## Using LegalFedLLM
+## Requirements
 
-The Linux desktop Client can be used in two ways:
+LegalFedLLM v1.0.0 can be run on Linux either from the published **x86_64
+AppImage** or directly from source. The AppImage packages the desktop
+GUI/controller, but it deliberately does not install host-level prerequisites
+such as Docker, OpenSSH, or the NVIDIA runtime.
 
-1. **from source**, using a prepared Python virtual environment; or
-2. **from the Linux x86_64 AppImage**, which packages the GUI/controller and
-   runs the heavy Client ML runtime in Docker.
+### Runtime requirements
 
-Both paths use the same saved-profile and federation workflow. In both cases the
-remote Host/Coordinator must already be running, and Docker is used for the
-managed Ollama + AnythingLLM services.
+| Requirement | AppImage | Source | Quick check |
+| --- | --- | --- | --- |
+| Linux x86_64 | Required by the current published AppImage | Current tested desktop platform | `uname -m` |
+| Docker Engine | Required | Required for the managed local-AI stack | `docker --version` |
+| Docker Compose | Required | Required for the managed local-AI stack | `docker compose version` |
+| OpenSSH client | Required | Required | `ssh -V` |
+| NVIDIA GPU + working Linux driver | Required by the current real Qwen/Granite Client path | Required by the current real Qwen/Granite Client path | `nvidia-smi` |
+| NVIDIA Container Toolkit / Docker GPU runtime | Required by the Dockerized real-model path | Required when the managed Docker services use the GPU | `docker run --rm --gpus all ubuntu nvidia-smi` |
+| Git | Not required | Required to clone/update the source checkout | `git --version` |
+| Python 3 with `venv` and `pip` | Not required | Required | `python3 --version` |
+| Host SSH target and one-time enrollment token | Required | Required | Supplied by the Host/Coordinator operator |
 
-### Common prerequisites
+You also need enough free disk space for Docker images and downloaded
+model/tokenizer data. The first AppImage launch builds a versioned
+`legalfedllm-client:<runtime-hash>` image locally, so Docker storage usage is
+larger than the AppImage file itself.
 
-Before starting, make sure the Client machine has:
+If a command in the table already works, do not reinstall that component.
 
-- Docker Engine and Docker Compose, with Docker running and usable by the current
-  user;
-- OpenSSH (`ssh`);
-- an NVIDIA/CUDA-capable environment for the real Qwen or Granite Client path;
-- enough free disk space for Docker images plus downloaded model/tokenizer data;
-  and
-- the Host SSH address/port plus a fresh one-time enrollment token supplied by
-  the Host/Coordinator operator for each new Client profile.
+### Installing the required host tools
 
-The current 1.0 Client path assumes NVIDIA/CUDA. The AppImage does **not** install
-Docker, the NVIDIA container runtime/driver stack, or OpenSSH for the user.
+#### Docker Engine and Docker Compose
 
-### Method 1 — install and run from source
+On a normal mutable Linux distribution, use Docker Engine rather than relying on
+the AppImage to provide Docker. Docker publishes distribution-specific
+instructions for [Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
+[Debian](https://docs.docker.com/engine/install/debian/), and
+[Fedora](https://docs.docker.com/engine/install/fedora/).
 
-Source mode additionally requires Python 3 with `venv` support. The source path
-runs the Client Transformers/PEFT runtime from the local Python environment.
-Docker is used separately for Ollama and AnythingLLM.
-
-Clone the repository, create a virtual environment, and install the desktop
-requirements:
+For Fedora, after adding Docker's official repository as documented above:
 
 ```bash
-git clone https://github.com/JohnnySusp/LegalFedLLM.git
-cd LegalFedLLM
-
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-desktop.txt
+sudo dnf config-manager addrepo --from-repofile \
+  https://download.docker.com/linux/fedora/docker-ce.repo
+sudo dnf install docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
 ```
 
-`requirements-desktop.txt` includes the normal LegalFedLLM runtime requirements
-plus PySide6 and the desktop build dependencies. The initial source installation
-can therefore be large because the local environment contains the
-Transformers/PEFT/PyTorch Client stack.
+For Ubuntu or Debian, after adding Docker's official `apt` repository as
+documented for the distribution:
 
-Check Docker before launching:
+```bash
+sudo apt install docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+On Fedora Silverblue and Silverblue-derived immutable systems, a Fedora-native
+host installation can instead be layered with `rpm-ostree`:
+
+```bash
+sudo rpm-ostree install moby-engine docker-cli docker-compose
+systemctl reboot
+sudo systemctl enable --now docker
+```
+
+Bazzite and other image-based systems may already include some of these
+components. Check first and layer only what is missing.
+
+LegalFedLLM launches Docker as the current desktop user, so Docker must work
+without prefixing every command with `sudo`. If your Docker installation uses
+the normal `docker` group:
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+Sign out and back in after changing group membership, then verify:
 
 ```bash
 docker --version
 docker compose version
+docker run --rm hello-world
 ```
 
-Start the desktop Client from the repository root:
+> **Security note:** membership in the `docker` group grants root-level
+> privileges through the Docker daemon. See Docker's
+> [Linux post-installation guidance](https://docs.docker.com/engine/install/linux-postinstall/)
+> before enabling it on a shared machine.
+
+#### OpenSSH client
+
+On Ubuntu/Debian:
 
 ```bash
-source .venv/bin/activate
-python -m desktop.app
+sudo apt update
+sudo apt install openssh-client
 ```
 
-Keep that terminal open. LegalFedLLM deliberately leaves SSH password entry to
-OpenSSH, so the Host SSH password is entered in the launch terminal and is not
-handled or stored by LegalFedLLM.
-
-#### Source-mode data location
-
-When run from source, persistent desktop state is created inside the checkout:
-
-```text
-LegalFedLLM/
-├── ...
-└── LegalFedLLM-data/
-```
-
-`LegalFedLLM-data/` contains saved profiles, Client identities and state, local
-learning data, logs, downloaded Hugging Face model/tokenizer data, and the
-managed local-AI runtime copy. Do not delete it if you want to preserve the
-Client profiles between launches.
-
-To completely remove a source installation, remove both the repository checkout
-and its `LegalFedLLM-data/` directory, then follow the Docker cleanup notes under
-**Completely uninstalling the AppImage / desktop Docker resources** below if you
-also want the managed Docker data removed.
-
-### Method 2 — install and run the Linux AppImage
-
-For a published Linux release, download `LegalFedLLM-x86_64.AppImage` from the
-project's GitHub Releases page and place it in a stable directory before first
-use. For example:
-
-```text
-~/Applications/LegalFedLLM/
-└── LegalFedLLM-x86_64.AppImage
-```
-
-Make it executable:
+On mutable Fedora:
 
 ```bash
+sudo dnf install openssh-clients
+```
+
+On Fedora Silverblue/Silverblue-derived systems, if `ssh` is not already
+present:
+
+```bash
+sudo rpm-ostree install openssh-clients
+systemctl reboot
+```
+
+Verify with:
+
+```bash
+ssh -V
+```
+
+LegalFedLLM deliberately leaves SSH password entry to OpenSSH. It does not
+handle or store the Host SSH password.
+
+#### NVIDIA driver and NVIDIA Container Toolkit
+
+The current real Qwen and Granite Client paths assume an NVIDIA/CUDA-capable
+Linux environment. First install a working NVIDIA driver using the supported
+package/image method for your distribution, then verify:
+
+```bash
+nvidia-smi
+```
+
+For normal mutable distributions, install the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+using NVIDIA's repository for your distribution. On Fedora/RPM-based systems,
+the short form after adding NVIDIA's repository is:
+
+```bash
+curl -s -L \
+  https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+  | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+
+sudo dnf install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+For Ubuntu/Debian, use the `apt` repository setup in NVIDIA's installation
+guide, install `nvidia-container-toolkit`, then run the same
+`nvidia-ctk runtime configure --runtime=docker` command and restart Docker.
+
+On **Bazzite**, use the appropriate NVIDIA Bazzite image for the GPU; Bazzite's
+NVIDIA images already carry and update the NVIDIA driver. If the NVIDIA
+Container Toolkit itself is missing, add NVIDIA's RPM repository and layer the
+toolkit:
+
+```bash
+curl -s -L \
+  https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+  | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+
+sudo rpm-ostree install nvidia-container-toolkit
+systemctl reboot
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+For other Silverblue-derived systems, make sure the host NVIDIA driver is
+working before layering the Container Toolkit.
+
+Finally verify Docker GPU access:
+
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+#### Git
+
+Git is needed only for the source installation/development path.
+
+On Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install git
+```
+
+On mutable Fedora:
+
+```bash
+sudo dnf install git
+```
+
+On Fedora Silverblue/Silverblue-derived systems, if Git is not already present:
+
+```bash
+sudo rpm-ostree install git
+systemctl reboot
+```
+
+Verify with:
+
+```bash
+git --version
+```
+
+#### Python 3, `venv`, and `pip`
+
+Python is needed only for the source installation/development path. The
+published AppImage does not require a separate LegalFedLLM Python environment.
+
+On Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install python3 python3-venv python3-pip
+```
+
+On mutable Fedora:
+
+```bash
+sudo dnf install python3 python3-pip
+```
+
+On Fedora Silverblue/Silverblue-derived systems, if the required Python tools
+are not already present:
+
+```bash
+sudo rpm-ostree install python3 python3-pip
+systemctl reboot
+```
+
+Verify that virtual environments work:
+
+```bash
+python3 --version
+python3 -m venv --help >/dev/null
+```
+
+The LegalFedLLM Python libraries do **not** need to be installed one by one.
+`requirements-desktop.txt` includes the normal runtime requirements plus
+PySide6 and PyInstaller. The Installation section below installs the pinned set
+into a project-local virtual environment.
+
+#### `appimagetool` — build-only
+
+`appimagetool` is **not** required to run the published AppImage or to run
+LegalFedLLM from source. It is required only when building the Linux AppImage
+with:
+
+```bash
+python scripts/build_desktop.py --appimage
+```
+
+Download the current x86_64 binary from the
+[`AppImage/appimagetool` releases](https://github.com/AppImage/appimagetool/releases),
+make it executable, and place it somewhere on `PATH`. A user-local installation
+works on both mutable and immutable Linux:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 0755 appimagetool-x86_64.AppImage ~/.local/bin/appimagetool
+```
+
+If `~/.local/bin` is not already on `PATH`, add it in your shell configuration.
+No host package layering is required.
+
+## Installation
+
+The **Linux x86_64 AppImage is the recommended end-user installation path** for
+the v1.0.0 release. The source path remains available for development,
+inspection, and direct source execution.
+
+### Method 1 — Linux x86_64 AppImage
+
+Download `LegalFedLLM-x86_64.AppImage` from the project's
+[GitHub Releases](https://github.com/JohnnySusp/LegalFedLLM/releases) page and
+place it in a stable directory before first use. For example:
+
+```bash
+mkdir -p ~/Applications/LegalFedLLM
+mv ~/Downloads/LegalFedLLM-x86_64.AppImage ~/Applications/LegalFedLLM/
 chmod +x ~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
 ```
 
-You can then double-click the AppImage in a file manager or launch it from a
-terminal:
+The release page publishes the SHA-256 checksum for the AppImage. Before first
+use, compare the downloaded file against the checksum shown for that release.
 
-```bash
-~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
-```
+The AppImage is intentionally lightweight: it contains the PySide6
+GUI/controller, SSH-tunnel control, profile management, local-AI orchestration,
+and the release-specific Client runtime definition. On first use it materializes
+the Client runtime below the portable data directory and builds a versioned
+`legalfedllm-client:<runtime-hash>` Docker image locally. Later launches reuse
+the matching image.
 
-When launched graphically on Linux, the AppImage opens a terminal and starts the
-GUI from that terminal so OpenSSH can ask for the Host password there. If the
-desktop environment cannot provide one of the supported terminal launchers,
-start the AppImage directly from an existing terminal instead.
+#### AppImage data location
 
-The AppImage is intentionally lightweight: it packages the PySide6
-GUI/controller, SSH-tunnel control, and a release-specific Client runtime
-definition rather than embedding the full PyTorch/Transformers/PEFT stack. On
-first use it materializes that Client runtime under the portable data directory
-and builds a versioned `legalfedllm-client:<runtime-hash>` Docker image locally.
-That first build can take a while and can consume several gigabytes of Docker
-storage. Later launches reuse the matching image when it already exists.
-
-#### Important: where the AppImage stores its files
-
-By default, the AppImage creates its LegalFedLLM desktop data tree next to the
-AppImage itself. A deliberate data-root override can place it elsewhere:
+By default, persistent LegalFedLLM desktop state is stored next to the AppImage:
 
 ```text
 ~/Applications/LegalFedLLM/
@@ -217,18 +383,89 @@ AppImage directory
 └── LegalFedLLM-data/   ← persistent LegalFedLLM desktop state
 ```
 
-The profile directories hold the Client identity/enrollment state, adapters and
+The profile directories contain Client identity/enrollment state, adapters and
 checkpoints, local-learning queue, and logs. `models/huggingface/` is the shared
-Hugging Face cache. `client-runtime/` holds the materialized Docker Client
-runtime for each release hash. `legalfed-ai/` contains the writable
-Ollama/AnythingLLM Compose configuration used by the desktop.
+Hugging Face cache. `client-runtime/` contains the materialized Docker Client
+runtime. `legalfed-ai/` contains the writable Ollama/AnythingLLM Compose
+configuration used by the desktop.
 
-This is a portable-state design: the current AppImage does not need an
-OS-global LegalFedLLM application-data directory. If you move the AppImage but
-want to keep the same profiles, move its sibling `LegalFedLLM-data/` directory
-with it. Moving only the AppImage makes the new directory look like a fresh
-installation. Deleting `LegalFedLLM-data/` deletes the saved LegalFedLLM desktop
-profiles and their persistent Client state.
+If you move the AppImage and want to preserve the same profiles, move its
+sibling `LegalFedLLM-data/` directory with it. Moving only the AppImage makes the
+new directory look like a fresh installation.
+
+### Method 2 — source checkout
+
+Clone the repository, create a project-local virtual environment, and install
+the desktop requirements:
+
+```bash
+git clone https://github.com/JohnnySusp/LegalFedLLM.git
+cd LegalFedLLM
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-desktop.txt
+```
+
+`requirements-desktop.txt` includes the normal LegalFedLLM runtime requirements
+plus PySide6 and the desktop build dependencies. The first source installation
+can therefore be large because the local environment contains the
+Transformers/PEFT/PyTorch Client stack.
+
+Before first launch, verify the host-level prerequisites:
+
+```bash
+docker --version
+docker compose version
+ssh -V
+nvidia-smi
+```
+
+#### Source-mode data location
+
+When run from source, persistent desktop state is created inside the checkout:
+
+```text
+LegalFedLLM/
+├── ...
+└── LegalFedLLM-data/
+```
+
+Do not delete `LegalFedLLM-data/` if you want to preserve Client profiles,
+identities, adapters/checkpoints, local-learning state, logs, model/tokenizer
+downloads, and the managed local-AI runtime copy.
+
+## Using LegalFedLLM
+
+Both installation methods use the same saved-profile, local-AI, and federation
+workflow.
+
+### Starting LegalFedLLM
+
+For a source installation, start the desktop Client from the repository root:
+
+```bash
+cd LegalFedLLM
+source .venv/bin/activate
+python -m desktop.app
+```
+
+Keep that terminal open. LegalFedLLM leaves SSH password entry to OpenSSH, so
+the Host SSH password is entered in the launch terminal and is not handled or
+stored by LegalFedLLM.
+
+For an AppImage installation, double-click the AppImage in a file manager or
+launch it from a terminal:
+
+```bash
+~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
+```
+
+When launched graphically on Linux, the AppImage opens a terminal and starts the
+GUI from that terminal so OpenSSH can ask for the Host password there. If the
+desktop environment cannot provide one of the supported terminal launchers,
+start the AppImage from an existing terminal.
 
 ### First profile and enrollment
 
@@ -275,21 +512,12 @@ serving component rather than a substitute for the active LegalFedLLM adapter.
 
 ### Normal use
 
-For later source launches:
+On later launches, start LegalFedLLM using the same source or AppImage command
+from **Starting LegalFedLLM**, then select the saved profile.
 
-```bash
-cd LegalFedLLM
-source .venv/bin/activate
-python -m desktop.app
-```
-
-For later AppImage launches, start the same AppImage from the directory that
-also contains its existing `LegalFedLLM-data/` directory.
-
-Select the saved profile. A previously enrolled profile still needs the SSH
-password for the new tunnel connection, but it does not need another enrollment
-token. After the Client Agent and local AI services are ready, AnythingLLM opens
-automatically.
+A previously enrolled profile still needs the SSH password for the new tunnel
+connection, but it does not need another enrollment token. After the Client
+Agent and local AI services are ready, AnythingLLM opens automatically.
 
 The OpenAI-compatible Client endpoint exposes the `legalfedllm-local` and
 `legalfedllm-host` routes used by the desktop integration. `LOCAL` stays on the
@@ -330,7 +558,9 @@ whether to stop them or leave them running. Choosing **Stop Docker and Close**
 stops those services while preserving their Docker volumes. If both services
 are already stopped, the desktop closes without that prompt.
 
-### Completely uninstalling the AppImage / desktop Docker resources
+## Uninstallation
+
+### AppImage and desktop Docker resources
 
 A normal AppImage installation has LegalFedLLM-specific persistent state in two
 places:
@@ -341,16 +571,16 @@ places:
 First close LegalFedLLM. If the Ollama/AnythingLLM shutdown prompt appears,
 choose **Stop Docker and Close**.
 
-Then delete the AppImage and its sibling portable data directory. For the example
-layout above:
+Then delete the AppImage and its sibling portable data directory. For the
+example layout above:
 
 ```bash
 rm -f ~/Applications/LegalFedLLM/LegalFedLLM-x86_64.AppImage
 rm -rf ~/Applications/LegalFedLLM/LegalFedLLM-data
 ```
 
-Those commands remove the AppImage and the filesystem state owned by that
-portable installation. Adjust the path if you stored the AppImage elsewhere.
+Those commands remove the AppImage and filesystem state owned by that portable
+installation. Adjust the path if you stored the AppImage elsewhere.
 
 If you also want to remove the Docker resources associated with LegalFedLLM,
 inspect them first:
@@ -358,7 +588,6 @@ inspect them first:
 ```bash
 docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' \
   | grep -E '(^NAMES|legalfedllm-|legalfed-ai-)'
-
 docker image ls legalfedllm-client
 docker volume ls | grep 'legalfed-ai-'
 docker network ls | grep 'legalfed-ai-net'
@@ -406,13 +635,21 @@ because those can delete resources belonging to unrelated projects.
 LegalFedLLM does not store the SSH password. OpenSSH may add the Host key to the
 user's normal `~/.ssh/known_hosts`; that file belongs to OpenSSH rather than
 LegalFedLLM. A user who also wants to remove that Host-key record can use
-`ssh-keygen -R <host>` (and, for a non-default SSH port, the corresponding
-`[host]:port` form).
+`ssh-keygen -R <host>` and, for a non-default SSH port, the corresponding
+`[host]:port` form.
 
 With the AppImage file, its sibling `LegalFedLLM-data/`, the LegalFedLLM-specific
 Docker containers/images/volumes/network, and any deliberately removed OpenSSH
 host-key record gone, the current portable AppImage path does not require any
 other OS-global LegalFedLLM application-data directory.
+
+### Source checkout
+
+To completely remove a source installation, remove the repository checkout
+including its `LegalFedLLM-data/` directory. If you also want to remove the
+managed Docker state created by the desktop, use the LegalFedLLM-specific Docker
+cleanup commands above. Do not use broad Docker prune commands unless you
+intend to remove resources belonging to other projects too.
 
 ## Status at a glance
 
