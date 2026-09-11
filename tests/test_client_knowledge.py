@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from client.knowledge import (
     encode_reference_samples,
@@ -294,6 +297,255 @@ class FedMKTAnswerOnlyMetricTests(unittest.TestCase):
             result[METRIC],
             torch.tensor([float(expected_lse - 2.5)]),
         )
+
+
+@unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is required for FedMKT metric tests")
+class FedMKTSequenceChunkTests(unittest.TestCase):
+    @staticmethod
+    def _collator(features):
+        import torch
+
+        return {
+            name: torch.tensor([feature[name] for feature in features])
+            for name in ("input_ids", "attention_mask", "labels")
+        }
+
+    @staticmethod
+    def _inputs():
+        return {
+            "input_ids": [[1, 2, 3, 4, 5, 6]],
+            "attention_mask": [[1, 1, 1, 1, 1, 1]],
+            "labels": [[-100, -100, 3, 4, 5, 6]],
+        }
+
+    @staticmethod
+    def _arguments():
+        return SimpleNamespace(
+            metric_type="ce",
+            top_k_strategy="highest",
+            top_k_logits_keep=3,
+        )
+
+    def test_sequence_chunked_generation_matches_existing_evidence(self) -> None:
+        import torch
+
+        from shared.fedmkt_core.ml.logit_generation import generate_pub_data_logits
+        from shared.fedmkt_core.ml.vars_define import (
+            FULL_LOGSUMEXP,
+            GOLD_TOKEN_IDS,
+            GOLD_TOKEN_LOGITS,
+            GOLD_TOKEN_NLL,
+            METRIC,
+            PER_STEP_INDICES,
+            PER_STEP_LOGITS,
+        )
+
+        class TinyCachedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+                self.cached_calls: list[tuple[list[int], int]] = []
+
+            def forward(
+                self,
+                input_ids,
+                attention_mask,
+                use_cache,
+                past_key_values=None,
+                cache_position=None,
+            ):
+                if past_key_values is None:
+                    past = input_ids[:, :0]
+                else:
+                    past = past_key_values
+                if use_cache:
+                    expected = torch.arange(
+                        past.size(1),
+                        past.size(1) + input_ids.size(1),
+                        device=input_ids.device,
+                    )
+                    torch.testing.assert_close(cache_position, expected)
+                    self.cached_calls.append(
+                        (cache_position.tolist(), attention_mask.size(1))
+                    )
+                full = torch.cat((past, input_ids), dim=1)
+                vocabulary = torch.arange(
+                    9,
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                ).view(1, 1, -1)
+                rows = []
+                for local_index in range(input_ids.size(1)):
+                    global_index = past.size(1) + local_index
+                    prefix_sum = full[:, : global_index + 1].sum(
+                        dim=1,
+                        keepdim=True,
+                    ).float()
+                    position = torch.tensor(
+                        float(global_index),
+                        device=input_ids.device,
+                    )
+                    rows.append(
+                        prefix_sum.unsqueeze(-1) * 0.03
+                        + position * 0.17
+                        + vocabulary * 0.29
+                        + ((position + vocabulary) % 4) * 0.07
+                    )
+                logits = torch.cat(rows, dim=1)
+                return SimpleNamespace(
+                    logits=logits,
+                    past_key_values=full.detach() if use_cache else None,
+                )
+
+        full_model = TinyCachedModel()
+        full = generate_pub_data_logits(
+            self._inputs(),
+            full_model,
+            self._arguments(),
+            self._collator,
+        )
+        self.assertEqual(full_model.cached_calls, [])
+
+        chunked_model = TinyCachedModel()
+        chunked = generate_pub_data_logits(
+            self._inputs(),
+            chunked_model,
+            self._arguments(),
+            self._collator,
+            sequence_chunk_size=2,
+        )
+        self.assertEqual(
+            chunked_model.cached_calls,
+            [([0, 1], 2), ([2, 3], 4), ([4, 5], 6)],
+        )
+        self.assertTrue(
+            torch.equal(full[PER_STEP_INDICES], chunked[PER_STEP_INDICES])
+        )
+        self.assertTrue(
+            torch.equal(full[GOLD_TOKEN_IDS], chunked[GOLD_TOKEN_IDS])
+        )
+        for key in (
+            PER_STEP_LOGITS,
+            FULL_LOGSUMEXP,
+            GOLD_TOKEN_LOGITS,
+            GOLD_TOKEN_NLL,
+            METRIC,
+        ):
+            torch.testing.assert_close(
+                chunked[key],
+                full[key],
+                rtol=0,
+                atol=1e-6,
+            )
+
+    def test_negative_sequence_chunk_size_is_rejected(self) -> None:
+        import torch
+
+        from shared.fedmkt_core.ml.logit_generation import generate_pub_data_logits
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, input_ids, attention_mask, use_cache):
+                return SimpleNamespace(
+                    logits=torch.zeros(input_ids.size(0), input_ids.size(1), 9)
+                )
+
+        with self.assertRaisesRegex(ValueError, "sequence_chunk_size"):
+            generate_pub_data_logits(
+                self._inputs(),
+                TinyModel(),
+                self._arguments(),
+                self._collator,
+                sequence_chunk_size=-1,
+            )
+
+    def test_sequence_chunking_rejects_multi_sample_batch(self) -> None:
+        import torch
+
+        from shared.fedmkt_core.ml.logit_generation import generate_pub_data_logits
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, input_ids, attention_mask, use_cache):
+                return SimpleNamespace(
+                    logits=torch.zeros(input_ids.size(0), input_ids.size(1), 9)
+                )
+
+        inputs = self._inputs()
+        inputs = {key: value * 2 for key, value in inputs.items()}
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            generate_pub_data_logits(
+                inputs,
+                TinyModel(),
+                self._arguments(),
+                self._collator,
+                sequence_chunk_size=2,
+            )
+
+
+class KnowledgeSequenceChunkConfigurationTests(unittest.TestCase):
+    def test_backend_defaults_off_and_reads_explicit_chunk_size(self) -> None:
+        from client.peft_backend import TransformersPeftTrainingBackend
+
+        profile = pinned_client_profile(QWEN_PROFILE_ID)
+        execution = SimpleNamespace(backend="transformers")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "CLIENT_KNOWLEDGE_BATCH_SIZE": "1",
+                    "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE": "0",
+                },
+                clear=False,
+            ):
+                backend = TransformersPeftTrainingBackend(
+                    data_dir=directory,
+                    model_profile=profile,
+                    execution_profile=execution,
+                )
+                self.assertEqual(backend.knowledge_sequence_chunk_size, 0)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "CLIENT_KNOWLEDGE_BATCH_SIZE": "1",
+                    "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE": "64",
+                },
+                clear=False,
+            ):
+                backend = TransformersPeftTrainingBackend(
+                    data_dir=directory,
+                    model_profile=profile,
+                    execution_profile=execution,
+                )
+                self.assertEqual(backend.knowledge_sequence_chunk_size, 64)
+
+    def test_backend_requires_batch_one_when_sequence_chunking_is_enabled(self) -> None:
+        from client.peft_backend import TransformersPeftTrainingBackend
+
+        profile = pinned_client_profile(QWEN_PROFILE_ID)
+        execution = SimpleNamespace(backend="transformers")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "CLIENT_KNOWLEDGE_BATCH_SIZE": "2",
+                    "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE": "64",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(ValueError, "BATCH_SIZE=1"):
+                    TransformersPeftTrainingBackend(
+                        data_dir=directory,
+                        model_profile=profile,
+                        execution_profile=execution,
+                    )
 
 
 if __name__ == "__main__":

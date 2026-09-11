@@ -105,6 +105,19 @@ class TransformersPeftTrainingBackend:
         )
         if self.knowledge_batch_size < 1:
             raise ValueError("knowledge batch size must be positive")
+        self.knowledge_sequence_chunk_size = int(
+            os.getenv("CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE", "0")
+        )
+        if self.knowledge_sequence_chunk_size < 0:
+            raise ValueError("knowledge sequence chunk size must be non-negative")
+        if (
+            self.knowledge_sequence_chunk_size > 0
+            and self.knowledge_batch_size != 1
+        ):
+            raise ValueError(
+                "sequence-chunked knowledge generation requires "
+                "CLIENT_KNOWLEDGE_BATCH_SIZE=1"
+            )
         self.checkpoints = AdapterCheckpointStore(
             self.data_dir / "adapters",
             model_profile,
@@ -445,6 +458,7 @@ class TransformersPeftTrainingBackend:
                     model,
                     arguments,
                     collator,
+                    sequence_chunk_size=self.knowledge_sequence_chunk_size,
                 )
                 token_ids = result[PER_STEP_INDICES]
                 logits = result[PER_STEP_LOGITS]
