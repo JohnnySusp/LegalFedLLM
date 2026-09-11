@@ -8,14 +8,22 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
+from client.model_profiles import (
+    GRANITE_3_3_2B_CLIENT_PROFILE_ID,
+    QWEN_PROFILE_ID,
+    pinned_client_profile,
+)
 from client.runtime import ClientRuntime
 from host.model_profiles import pinned_host_profile
 from client.training import (
     TrainingExecutionProfile,
     execution_profile_from_environment,
 )
-from shared.alignment_profiles import POC_DTW_PROFILE_ID
+from shared.alignment_profiles import (
+    UnsupportedAlignmentProfile,
+    supported_alignment_profile_ids,
+    validate_alignment_pair,
+)
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.fedmkt_core.safety import inspect_knowledge_package
 from shared.knowledge_artifact import load_package_samples
@@ -58,6 +66,63 @@ def mock_host_profile() -> ModelProfile:
     )
 
 
+def _acceptance_alignment_profile_id(
+    client_profile: ModelProfile,
+    host_profile: ModelProfile,
+) -> str:
+    matches: list[str] = []
+    for profile_id in supported_alignment_profile_ids():
+        try:
+            validate_alignment_pair(
+                profile_id,
+                client_profile=client_profile,
+                host_profile=host_profile,
+            )
+        except UnsupportedAlignmentProfile:
+            continue
+        matches.append(profile_id)
+    if len(matches) != 1:
+        raise AssertionError(
+            "expected exactly one acceptance alignment profile for "
+            f"Client {client_profile.profile_id!r} and "
+            f"Host {host_profile.profile_id!r}; matches: {matches}"
+        )
+    return matches[0]
+
+
+class RealClientAcceptanceHarnessTests(unittest.TestCase):
+    def test_qwen_and_granite_resolve_unique_fixture_alignment(self) -> None:
+        host_profile = pinned_host_profile()
+        resolved: dict[str, str] = {}
+        for client_profile_id in (
+            QWEN_PROFILE_ID,
+            GRANITE_3_3_2B_CLIENT_PROFILE_ID,
+        ):
+            client_profile = pinned_client_profile(client_profile_id)
+            alignment_profile_id = _acceptance_alignment_profile_id(
+                client_profile,
+                host_profile,
+            )
+            alignment_profile = validate_alignment_pair(
+                alignment_profile_id,
+                client_profile=client_profile,
+                host_profile=host_profile,
+            )
+            self.assertEqual(
+                alignment_profile.client.profile_id,
+                client_profile.profile_id,
+            )
+            self.assertEqual(
+                alignment_profile.host.profile_id,
+                host_profile.profile_id,
+            )
+            resolved[client_profile_id] = alignment_profile_id
+        self.assertNotEqual(
+            resolved[QWEN_PROFILE_ID],
+            resolved[GRANITE_3_3_2B_CLIENT_PROFILE_ID],
+        )
+
+
 @unittest.skipUnless(
     RUN_REAL_MODEL_TESTS,
     "set LEGALFEDLLM_RUN_REAL_MODEL_TESTS=true for the model download test",
@@ -74,6 +139,11 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
             QWEN_PROFILE_ID,
         )
         profile = pinned_client_profile(profile_id)
+        host_profile = pinned_host_profile()
+        alignment_profile_id = _acceptance_alignment_profile_id(
+            profile,
+            host_profile,
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             private_path = root / "private.jsonl"
@@ -119,10 +189,10 @@ class RealClientModelAcceptanceTests(unittest.TestCase):
                 round_id=round_id,
                 coordinator_id="coordinator",
                 current_host_adapter_version=0,
-                host_model_profile=pinned_host_profile(),
+                host_model_profile=host_profile,
                 selected_client_profile_hashes={"client-a": profile.profile_hash()},
                 selected_client_alignment_profiles={
-                    "client-a": POC_DTW_PROFILE_ID
+                    "client-a": alignment_profile_id
                 },
                 request=request,
                 submission_deadline=utc_text(utc_now() + timedelta(hours=2)),
