@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -11,8 +13,13 @@ SCRIPT = ROOT / "scripts" / "run_split_round_tmux.sh"
 
 class SplitRoundTmuxScriptTests(unittest.TestCase):
     def run_script(self, *args: str) -> subprocess.CompletedProcess[str]:
+        if os.name == "nt":
+            self.skipTest("split-round tmux execution is Linux-only")
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is unavailable for the split-round tmux harness")
         return subprocess.run(
-            ["bash", str(SCRIPT), *args],
+            [bash, str(SCRIPT), *args],
             cwd=ROOT,
             text=True,
             capture_output=True,

@@ -69,7 +69,8 @@ class AppImagePackagingTests(unittest.TestCase):
             (root / "desktop/app.py").write_text("", encoding="utf-8")
             dist = root / "dist/LegalFedLLM"
             dist.mkdir(parents=True)
-            (dist / "LegalFedLLM").write_text("binary", encoding="utf-8")
+            executable = "LegalFedLLM.exe" if os.name == "nt" else "LegalFedLLM"
+            (dist / executable).write_text("binary", encoding="utf-8")
 
             commands: list[list[str]] = []
             def fake_run(command: list[str]) -> None:
@@ -102,7 +103,8 @@ class AppImagePackagingTests(unittest.TestCase):
             (root / "desktop/app.py").write_text("", encoding="utf-8")
             dist = root / "dist"
             dist.mkdir()
-            (dist / "LegalFedLLM").write_text("binary", encoding="utf-8")
+            executable = "LegalFedLLM.exe" if os.name == "nt" else "LegalFedLLM"
+            (dist / executable).write_text("binary", encoding="utf-8")
             commands: list[list[str]] = []
             with (
                 mock.patch.object(build_desktop, "ROOT", root),

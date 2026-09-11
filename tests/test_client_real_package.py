@@ -337,6 +337,8 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
             fixture = await self._fixture(root)
             runtime = fixture["runtime"]
             manifest = fixture["manifest"]
+            alignment_preflight = mock.Mock(return_value=None)
+            runtime.ensure_alignment_tokenizers = alignment_preflight
             original_create = runtime.create_knowledge_package
             started = threading.Event()
             release = threading.Event()
@@ -404,6 +406,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
                 coordinator_artifact_path.read_bytes(),
             )
             self.assertEqual(fixture["generator"].call_count, 1)
+            self.assertEqual(alignment_preflight.call_count, 1)
             state = await fixture["stack"].coordinator_service.round_status(
                 manifest.round_id
             )
