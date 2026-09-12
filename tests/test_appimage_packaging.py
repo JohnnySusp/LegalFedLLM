@@ -92,6 +92,7 @@ class AppImagePackagingTests(unittest.TestCase):
             self.assertNotIn("--collect-submodules client", joined)
             self.assertNotIn("--collect-submodules host", joined)
             self.assertNotIn("--collect-submodules coordinator", joined)
+            self.assertNotIn("--collect-submodules uvicorn", joined)
             self.assertIn("desktop.agent_entry", command)
             self.assertIn("client-runtime", joined)
 
@@ -118,6 +119,33 @@ class AppImagePackagingTests(unittest.TestCase):
             self.assertIn("client", command)
             self.assertIn("host", command)
             self.assertIn("coordinator", command)
+            self.assertIn("uvicorn", command)
+
+
+    def test_windows_normal_build_embeds_desktop_icon(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "legalfed-ai").mkdir()
+            (root / "desktop").mkdir()
+            (root / "desktop/app.py").write_text("", encoding="utf-8")
+            icon = root / "desktop/legalfedllm.ico"
+            icon.write_bytes(b"ico")
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "LegalFedLLM.exe").write_text("binary", encoding="utf-8")
+            commands: list[list[str]] = []
+            with (
+                mock.patch.object(build_desktop, "ROOT", root),
+                mock.patch.object(build_desktop, "DIST", dist),
+                mock.patch.object(build_desktop, "WINDOWS_ICON", icon),
+                mock.patch.object(build_desktop, "_is_windows", return_value=True),
+                mock.patch.object(build_desktop, "run", side_effect=lambda command: commands.append(command)),
+            ):
+                artifact = build_desktop.build_pyinstaller(clean=False, appimage=False)
+            self.assertEqual(artifact, dist / "LegalFedLLM.exe")
+            command = commands[0]
+            self.assertIn("--icon", command)
+            self.assertIn(str(icon), command)
 
     def test_client_runtime_bundle_contains_only_runtime_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -12,7 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 DESKTOP_ICON = ROOT / "desktop" / "legalfedllm.png"
+WINDOWS_ICON = ROOT / "desktop" / "legalfedllm.ico"
 CLIENT_RUNTIME_TEMPLATE = ROOT / "desktop" / "client-runtime"
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def run(command: list[str]) -> None:
@@ -74,8 +79,12 @@ def build_pyinstaller(*, clean: bool, appimage: bool = False) -> Path:
             ]
         )
     else:
-        for package in ("client", "coordinator", "host", "shared", "desktop"):
+        for package in ("client", "coordinator", "host", "shared", "desktop", "uvicorn"):
             command.extend(["--collect-submodules", package])
+        if _is_windows():
+            if not WINDOWS_ICON.is_file():
+                raise RuntimeError(f"Windows icon is missing: {WINDOWS_ICON}")
+            command.extend(["--icon", str(WINDOWS_ICON)])
 
     command.extend(
         [
@@ -99,7 +108,7 @@ def build_pyinstaller(*, clean: bool, appimage: bool = False) -> Path:
         command.append("desktop/app.py")
         run(command)
 
-    suffix = ".exe" if os.name == "nt" else ""
+    suffix = ".exe" if _is_windows() else ""
     artifact = DIST / name if appimage else DIST / f"{name}{suffix}"
     expected = artifact / f"{name}{suffix}" if appimage else artifact
     if not expected.is_file():
