@@ -285,6 +285,55 @@ def _local_ai_start_ready(
     return agent_healthy and not already_attempted
 
 
+def _anythingllm_browser_url(payload: dict[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    value = str(payload.get("anythingllm_url") or "").strip()
+    return value or None
+
+
+def _local_ai_ready_message(payload: dict[str, Any]) -> str:
+    if payload.get("mode") == "windows-native":
+        return (
+            "Ready. Native Ollama is available. Configure AnythingLLM Desktop using "
+            "the integration details below."
+        )
+    return (
+        "Ready. AnythingLLM is available at "
+        f"{payload.get('anythingllm_url', 'http://127.0.0.1:3001')}."
+    )
+
+
+def _provider_details_text(
+    profile: DesktopProfile,
+    *,
+    admin_token: str,
+    local_ai: LocalAiStack,
+) -> str:
+    base_url = f"http://127.0.0.1:{profile.agent_port}/v1"
+    if local_ai.is_windows:
+        return (
+            "AnythingLLM Desktop is external to LegalFedLLM on Windows. Configure it through "
+            "AnythingLLM Desktop's own settings. LegalFedLLM does not edit AnythingLLM Desktop files.\n\n"
+            "Provider: Generic OpenAI\n"
+            f"OpenAI-compatible base URL:\n{base_url}\n\n"
+            f"API key for this local profile:\n{admin_token}\n\n"
+            f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
+            f"Required native Ollama model:\n{profile.ollama_model}\n\n"
+            "The API key is the local per-profile Client Agent token, not a Host credential. "
+            "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue."
+        )
+    return (
+        "AnythingLLM is configured automatically when this profile is activated.\n\n"
+        "AnythingLLM UI:\nhttp://127.0.0.1:3001\n\n"
+        f"OpenAI-compatible base URL:\n{base_url}\n\n"
+        f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
+        f"Runtime files:\n{local_ai.runtime_root}\n\n"
+        "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue. "
+        "AnythingLLM native Generic OpenAI tool calling is disabled for the current 1.0 scope."
+    )
+
+
 def _appimage_host_environment() -> dict[str, str]:
     environment = dict(os.environ)
     original_library_path = environment.pop("LD_LIBRARY_PATH_ORIG", None)
@@ -949,7 +998,9 @@ def run_gui(data_root: Path | None = None) -> int:
             profile = self.profile
             admin_token = self.manager.admin_token(profile.profile_id)
             self.message.setText(
-                "SSH connected. Starting local Ollama and AnythingLLM…"
+                "SSH connected. Verifying native Ollama…"
+                if self.local_ai.is_windows
+                else "SSH connected. Starting local Ollama and AnythingLLM…"
             )
             self._run_worker(
                 lambda: self.local_ai.prepare(profile, admin_token),
@@ -961,9 +1012,7 @@ def run_gui(data_root: Path | None = None) -> int:
             self.local_ai_payload = dict(payload) if isinstance(payload, dict) else {}
             self._maybe_open_anythingllm()
             if self.agent_has_been_healthy:
-                self.message.setText(
-                    f"Ready. AnythingLLM is available at {self.local_ai_payload.get('anythingllm_url', 'http://127.0.0.1:3001')}."
-                )
+                self.message.setText(_local_ai_ready_message(self.local_ai_payload))
 
         def _maybe_open_anythingllm(self) -> None:
             if not _browser_launch_ready(
@@ -972,17 +1021,20 @@ def run_gui(data_root: Path | None = None) -> int:
                 already_attempted=self.anythingllm_browser_attempted,
             ):
                 return
+            url = _anythingllm_browser_url(self.local_ai_payload)
+            if url is None:
+                return
             self.anythingllm_browser_attempted = True
-            url = str((self.local_ai_payload or {}).get("anythingllm_url") or "http://127.0.0.1:3001")
             open_default_browser(url.rstrip("/") + "/")
 
         def _local_ai_failed(self, error: str) -> None:
-            self.message.setText(f"Local AnythingLLM/Ollama stack unavailable: {error}")
-            QMessageBox.warning(
-                self,
-                APP_TITLE,
-                "LegalFedLLM could not prepare the local Ollama/AnythingLLM stack.\n\n" + error,
-            )
+            if self.local_ai.is_windows:
+                self.message.setText(f"Native Ollama unavailable: {error}")
+                detail = "LegalFedLLM could not verify native Ollama for Windows.\n\n" + error
+            else:
+                self.message.setText(f"Local AnythingLLM/Ollama stack unavailable: {error}")
+                detail = "LegalFedLLM could not prepare the local Ollama/AnythingLLM stack.\n\n" + error
+            QMessageBox.warning(self, APP_TITLE, detail)
 
         def _run_worker(
             self,
@@ -1277,14 +1329,10 @@ def run_gui(data_root: Path | None = None) -> int:
         def _show_provider_details(self) -> None:
             if self.profile is None:
                 return
-            text = (
-                "AnythingLLM is configured automatically when this profile is activated.\n\n"
-                f"AnythingLLM UI:\nhttp://127.0.0.1:3001\n\n"
-                f"OpenAI-compatible base URL:\nhttp://127.0.0.1:{self.profile.agent_port}/v1\n\n"
-                f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
-                f"Runtime files:\n{self.local_ai.runtime_root}\n\n"
-                "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue. "
-                "AnythingLLM native Generic OpenAI tool calling is disabled for the current 1.0 scope."
+            text = _provider_details_text(
+                self.profile,
+                admin_token=self.manager.admin_token(self.profile.profile_id),
+                local_ai=self.local_ai,
             )
             QMessageBox.information(self, "AnythingLLM integration details", text)
 

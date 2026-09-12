@@ -95,13 +95,19 @@ class LocalAiStack:
         *,
         bundle_root: str | Path | None = None,
         legacy_root: str | Path | None = None,
+        platform: str | None = None,
     ):
         self.data_root = Path(data_root).resolve()
+        self.platform = platform or sys.platform
         self.runtime_root = self.data_root / "legalfed-ai"
         self.bundle_root = Path(bundle_root or bundled_local_ai_root()).resolve()
         self.legacy_root = Path(
             legacy_root or (Path.home() / "legalfed-ai")
         ).expanduser().resolve()
+
+    @property
+    def is_windows(self) -> bool:
+        return self.platform.startswith("win")
 
     def ensure_runtime_files(self) -> Path:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -164,7 +170,10 @@ class LocalAiStack:
         _write_env(docker_env, updates)
         _write_env(self.runtime_root / "anythingllm.env", dict(updates))
 
-    def prepare(self, profile: DesktopProfile, admin_token: str) -> dict[str, str]:
+    def prepare(self, profile: DesktopProfile, admin_token: str) -> dict[str, Any]:
+        if self.is_windows:
+            return self._prepare_windows(profile)
+
         self.configure_anythingllm(profile, admin_token)
         docker = shutil.which("docker")
         if docker is None:
@@ -180,12 +189,32 @@ class LocalAiStack:
         self._verify_ollama_model(profile.ollama_model)
         self._run([*compose, "up", "-d", "--force-recreate", "anythingllm"])
         return {
+            "mode": "linux-docker",
             "runtime_root": str(self.runtime_root),
             "ollama_model": profile.ollama_model,
             "anythingllm_url": ANYTHINGLLM_URL,
+            "openai_base_url": f"http://127.0.0.1:{profile.agent_port}/v1",
+            "anythingllm_managed": True,
+        }
+
+    def _prepare_windows(self, profile: DesktopProfile) -> dict[str, Any]:
+        if shutil.which("ollama") is None:
+            raise RuntimeError(
+                "Native Ollama for Windows was not found on PATH. Install/start Ollama for Windows "
+                "before launching LegalFedLLM."
+            )
+        self._wait_for_ollama()
+        self._verify_ollama_model(profile.ollama_model)
+        return {
+            "mode": "windows-native",
+            "ollama_model": profile.ollama_model,
+            "openai_base_url": f"http://127.0.0.1:{profile.agent_port}/v1",
+            "anythingllm_managed": False,
         }
 
     def running_services(self) -> set[str]:
+        if self.is_windows:
+            return set()
         if not self.runtime_root.is_dir():
             return set()
         docker = shutil.which("docker")
@@ -216,6 +245,8 @@ class LocalAiStack:
         return bool(self.running_services())
 
     def stop(self) -> None:
+        if self.is_windows:
+            return
         if not self.runtime_root.is_dir():
             return
         docker = shutil.which("docker")
@@ -265,7 +296,7 @@ class LocalAiStack:
             except Exception as exc:
                 last_error = str(exc)
             time.sleep(0.5)
-        raise RuntimeError(f"Docker Ollama did not become ready: {last_error}")
+        raise RuntimeError(f"Ollama did not become ready: {last_error}")
 
     def _verify_ollama_model(self, expected_model: str) -> None:
         try:
@@ -273,7 +304,7 @@ class LocalAiStack:
             response.raise_for_status()
             payload: Any = response.json()
         except Exception as exc:
-            raise RuntimeError(f"Could not inspect Docker Ollama models: {exc}") from exc
+            raise RuntimeError(f"Could not inspect Ollama models: {exc}") from exc
 
         models = payload.get("models", []) if isinstance(payload, dict) else []
         names = {

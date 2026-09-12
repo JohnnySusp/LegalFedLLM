@@ -135,6 +135,70 @@ class LocalAiStackTests(unittest.TestCase):
             self.assertEqual(values["JWT_SECRET"], first)
             self.assertEqual(values["GENERIC_OPEN_AI_API_KEY"], "second-token")
 
+
+    def test_windows_prepare_uses_native_ollama_without_docker_or_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            profile = self._profile(agent_port=8123)
+            with (
+                mock.patch("desktop.local_ai.shutil.which", return_value=r"C:\Program Files\Ollama\ollama.exe") as which,
+                mock.patch.object(stack, "configure_anythingllm") as configure,
+                mock.patch.object(stack, "_run") as run,
+                mock.patch.object(stack, "_wait_for_ollama") as wait,
+                mock.patch.object(stack, "_verify_ollama_model") as verify,
+            ):
+                result = stack.prepare(profile, "client-admin-secret")
+
+            which.assert_called_once_with("ollama")
+            configure.assert_not_called()
+            run.assert_not_called()
+            wait.assert_called_once_with()
+            verify.assert_called_once_with("qwen3:1.7b")
+            self.assertFalse(stack.runtime_root.exists())
+            self.assertEqual(result["mode"], "windows-native")
+            self.assertEqual(result["openai_base_url"], "http://127.0.0.1:8123/v1")
+            self.assertFalse(result["anythingllm_managed"])
+            self.assertNotIn("anythingllm_url", result)
+
+    def test_windows_prepare_requires_native_ollama_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            with mock.patch("desktop.local_ai.shutil.which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "Native Ollama for Windows"):
+                    stack.prepare(self._profile(), "client-admin-secret")
+            self.assertFalse(stack.runtime_root.exists())
+
+    def test_windows_stack_does_not_claim_or_stop_external_services(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            with (
+                mock.patch("desktop.local_ai.shutil.which") as which,
+                mock.patch.object(stack, "_run") as run,
+            ):
+                self.assertEqual(stack.running_services(), set())
+                self.assertFalse(stack.is_running())
+                stack.stop()
+            which.assert_not_called()
+            run.assert_not_called()
+
     def test_prepare_creates_missing_network_starts_ollama_then_anythingllm(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,6 +206,7 @@ class LocalAiStackTests(unittest.TestCase):
                 root / "data",
                 bundle_root=self._bundle(root),
                 legacy_root=root / "missing-legacy",
+                platform="linux",
             )
             calls: list[list[str]] = []
 
@@ -192,6 +257,7 @@ class LocalAiStackTests(unittest.TestCase):
                 root / "data",
                 bundle_root=self._bundle(root),
                 legacy_root=root / "missing-legacy",
+                platform="linux",
             )
             stack.ensure_runtime_files()
             result = subprocess.CompletedProcess(
@@ -228,6 +294,7 @@ class LocalAiStackTests(unittest.TestCase):
                 root / "data",
                 bundle_root=self._bundle(root),
                 legacy_root=root / "missing-legacy",
+                platform="linux",
             )
             self.assertEqual(stack.running_services(), set())
             stack.ensure_runtime_files()
@@ -242,6 +309,7 @@ class LocalAiStackTests(unittest.TestCase):
                 root / "data",
                 bundle_root=self._bundle(root),
                 legacy_root=root / "missing-legacy",
+                platform="linux",
             )
             stack.ensure_runtime_files()
             calls: list[list[str]] = []

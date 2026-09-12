@@ -9,16 +9,20 @@ from unittest import mock
 from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
 from desktop.app import (
+    _anythingllm_browser_url,
     _browser_launch_ready,
     _desktop_restart_command,
     _diagnostics_ready,
+    _local_ai_ready_message,
     _local_ai_start_ready,
+    _provider_details_text,
     open_default_browser,
     _enrollment_ready,
     _host_preview_finished,
     _host_preview_should_start,
     _poll_failure_state,
 )
+from desktop.local_ai import LocalAiStack
 from desktop.profiles import PortableProfileManager
 
 
@@ -216,6 +220,47 @@ class PortableDesktopProfileTests(unittest.TestCase):
         )
         self.assertFalse(_host_preview_should_start(round_id, previewed, inflight))
         self.assertIn(round_id, previewed)
+
+
+    def test_windows_native_local_ai_has_no_browser_target(self) -> None:
+        self.assertIsNone(
+            _anythingllm_browser_url(
+                {
+                    "mode": "windows-native",
+                    "openai_base_url": "http://127.0.0.1:8001/v1",
+                    "anythingllm_managed": False,
+                }
+            )
+        )
+        self.assertEqual(
+            _anythingllm_browser_url({"anythingllm_url": "http://127.0.0.1:3001"}),
+            "http://127.0.0.1:3001",
+        )
+
+    def test_windows_native_ready_message_points_to_manual_anythingllm_configuration(self) -> None:
+        message = _local_ai_ready_message({"mode": "windows-native"})
+        self.assertIn("Native Ollama", message)
+        self.assertIn("Configure AnythingLLM Desktop", message)
+
+    def test_windows_provider_details_expose_only_local_profile_connection_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "Windows")
+            stack = LocalAiStack(manager.data_root, platform="win32")
+            text = _provider_details_text(
+                profile,
+                admin_token="local-profile-secret",
+                local_ai=stack,
+            )
+
+        self.assertIn("AnythingLLM Desktop is external", text)
+        self.assertIn(f"http://127.0.0.1:{profile.agent_port}/v1", text)
+        self.assertIn("local-profile-secret", text)
+        self.assertIn("legalfedllm-local", text)
+        self.assertIn("legalfedllm-host", text)
+        self.assertIn("not a Host credential", text)
+        self.assertNotIn("Runtime files", text)
+        self.assertNotIn("http://127.0.0.1:3001", text)
 
     def test_anythingllm_browser_launch_waits_for_agent_and_local_stack(self) -> None:
         self.assertFalse(
