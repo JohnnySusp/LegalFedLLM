@@ -445,6 +445,12 @@ def _desktop_restart_command(data_root: Path) -> list[str]:
         command = [sys.executable, "-m", "desktop.app"]
     return [*command, "--data-root", str(Path(data_root).resolve())]
 
+def _desktop_restart_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return environment
+
 def _diagnostic_command(mode: str, profile_id: str, data_root: Path) -> list[str]:
     if getattr(sys, "frozen", False):
         return [
@@ -923,7 +929,7 @@ def run_gui(data_root: Path | None = None) -> int:
             self.diagnostics_launched = False
             self.controller.stop()
             command = _desktop_restart_command(self.manager.data_root)
-            os.execvpe(command[0], command, dict(os.environ))
+            os.execvpe(command[0], command, _desktop_restart_environment())
 
         def _reset_settings_defaults(self) -> None:
             settings = self.manager.reset_desktop_settings()

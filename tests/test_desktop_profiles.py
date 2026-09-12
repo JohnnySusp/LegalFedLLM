@@ -12,6 +12,7 @@ from desktop.app import (
     _anythingllm_browser_url,
     _browser_launch_ready,
     _desktop_restart_command,
+    _desktop_restart_environment,
     _diagnostics_ready,
     _local_ai_ready_message,
     _local_ai_start_ready,
@@ -123,6 +124,25 @@ class PortableDesktopProfileTests(unittest.TestCase):
                 command = _desktop_restart_command(data_root)
             self.assertEqual(command[:3], [os.sys.executable, "-m", "desktop.app"])
             self.assertEqual(command[3:], ["--data-root", str(data_root)])
+    def test_windows_frozen_restart_resets_pyinstaller_environment(self) -> None:
+        app_module = __import__("desktop.app", fromlist=["sys"])
+        with mock.patch.dict(
+            os.environ,
+            {"PYINSTALLER_RESET_ENVIRONMENT": "0"},
+            clear=False,
+        ), mock.patch.object(app_module.sys, "platform", "win32"), mock.patch.object(
+            app_module.sys, "frozen", True, create=True
+        ):
+            environment = _desktop_restart_environment()
+        self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+    def test_source_restart_does_not_force_pyinstaller_reset(self) -> None:
+        app_module = __import__("desktop.app", fromlist=["sys"])
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            app_module.sys, "platform", "win32"
+        ), mock.patch.object(app_module.sys, "frozen", False, create=True):
+            environment = _desktop_restart_environment()
+        self.assertNotIn("PYINSTALLER_RESET_ENVIRONMENT", environment)
 
     def test_low_vram_mode_controls_agent_cuda_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
