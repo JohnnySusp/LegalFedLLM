@@ -146,16 +146,68 @@ class LocalAiStackTests(unittest.TestCase):
                 platform="win32",
             )
             profile = self._profile(agent_port=8123)
+            setup_before = mock.Mock(status_code=200)
+            setup_before.json.return_value = {
+                "results": {
+                    "LLMProvider": "ollama",
+                    "GenericOpenAiBasePath": None,
+                    "GenericOpenAiModelPref": None,
+                    "GenericOpenAiTokenLimit": None,
+                    "GenericOpenAiKey": False,
+                    "GenericOpenAiMaxTokens": None,
+                }
+            }
+            onboarding = mock.Mock(status_code=200)
+            onboarding.json.return_value = {"onboardingComplete": True}
+            configured = mock.Mock(status_code=200)
+            configured.json.return_value = {
+                "newValues": {
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8123/v1",
+                    "GenericOpenAiKey": "client-admin-secret",
+                    "GenericOpenAiModelPref": "legalfedllm-local",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiMaxTokens": "1024",
+                },
+                "error": False,
+            }
+            setup_after = mock.Mock(status_code=200)
+            setup_after.json.return_value = {
+                "results": {
+                    "LLMProvider": "ollama",
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8123/v1",
+                    "GenericOpenAiModelPref": "legalfedllm-local",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiKey": True,
+                    "GenericOpenAiMaxTokens": "1024",
+                }
+            }
+            anythingllm_executable = Path(
+                r"C:\Users\test\AppData\Local\Programs\AnythingLLM\AnythingLLM.exe"
+            )
             with (
-                mock.patch("desktop.local_ai.shutil.which", return_value=r"C:\Program Files\Ollama\ollama.exe") as which,
+                mock.patch(
+                    "desktop.local_ai.shutil.which",
+                    return_value=r"C:\Program Files\Ollama\ollama.exe",
+                ) as which,
                 mock.patch.object(stack, "configure_anythingllm") as configure,
                 mock.patch.object(stack, "_run") as run,
                 mock.patch.object(stack, "_wait_for_ollama") as wait,
                 mock.patch.object(stack, "_verify_ollama_model") as verify,
+                mock.patch.object(
+                    stack,
+                    "_ensure_windows_anythingllm_backend",
+                    return_value=anythingllm_executable,
+                ) as ensure_anythingllm,
+                mock.patch(
+                    "desktop.local_ai.httpx.get",
+                    side_effect=[setup_before, onboarding, setup_after],
+                ) as get,
+                mock.patch("desktop.local_ai.httpx.post", return_value=configured) as post,
             ):
                 result = stack.prepare(profile, "client-admin-secret")
 
             which.assert_called_once_with("ollama")
+            ensure_anythingllm.assert_called_once_with()
             configure.assert_not_called()
             run.assert_not_called()
             wait.assert_called_once_with()
@@ -163,8 +215,186 @@ class LocalAiStackTests(unittest.TestCase):
             self.assertFalse(stack.runtime_root.exists())
             self.assertEqual(result["mode"], "windows-native")
             self.assertEqual(result["openai_base_url"], "http://127.0.0.1:8123/v1")
+            self.assertEqual(result["anythingllm_url"], "http://127.0.0.1:3001")
+            self.assertTrue(result["anythingllm_configured"])
             self.assertFalse(result["anythingllm_managed"])
-            self.assertNotIn("anythingllm_url", result)
+            self.assertEqual(result["anythingllm_executable"], str(anythingllm_executable))
+            self.assertEqual(result["anythingllm_settings"]["context_window"], "4096")
+            self.assertEqual(result["anythingllm_settings"]["max_tokens"], "1024")
+            self.assertEqual(result["anythingllm_settings"]["default_provider"], "ollama")
+            self.assertTrue(result["anythingllm_settings"]["onboarding_complete"])
+            self.assertEqual(
+                get.call_args_list,
+                [
+                    mock.call("http://127.0.0.1:3001/api/setup-complete", timeout=3.0),
+                    mock.call("http://127.0.0.1:3001/api/onboarding", timeout=3.0),
+                    mock.call("http://127.0.0.1:3001/api/setup-complete", timeout=3.0),
+                ],
+            )
+            post.assert_called_once_with(
+                "http://127.0.0.1:3001/api/system/update-env",
+                json={
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8123/v1",
+                    "GenericOpenAiKey": "client-admin-secret",
+                    "GenericOpenAiModelPref": "legalfedllm-local",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiMaxTokens": "1024",
+                },
+                timeout=10.0,
+            )
+
+    def test_windows_prepare_preconfigures_generic_openai_without_completing_onboarding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            setup_before = mock.Mock(status_code=200)
+            setup_before.json.return_value = {"results": {"LLMProvider": None}}
+            onboarding = mock.Mock(status_code=200)
+            onboarding.json.return_value = {"onboardingComplete": False}
+            configured = mock.Mock(status_code=200)
+            configured.json.return_value = {
+                "newValues": {
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
+                    "GenericOpenAiKey": "client-admin-secret",
+                    "GenericOpenAiModelPref": "legalfedllm-local",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiMaxTokens": "1024",
+                },
+                "error": False,
+            }
+            setup_after = mock.Mock(status_code=200)
+            setup_after.json.return_value = {
+                "results": {
+                    "LLMProvider": None,
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
+                    "GenericOpenAiModelPref": "legalfedllm-local",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiKey": True,
+                    "GenericOpenAiMaxTokens": "1024",
+                }
+            }
+            with (
+                mock.patch(
+                    "desktop.local_ai.shutil.which",
+                    return_value=r"C:\Program Files\Ollama\ollama.exe",
+                ),
+                mock.patch.object(stack, "_wait_for_ollama"),
+                mock.patch.object(stack, "_verify_ollama_model"),
+                mock.patch.object(
+                    stack,
+                    "_ensure_windows_anythingllm_backend",
+                    return_value=Path(r"C:\AnythingLLM.exe"),
+                ),
+                mock.patch(
+                    "desktop.local_ai.httpx.get",
+                    side_effect=[setup_before, onboarding, setup_after],
+                ),
+                mock.patch("desktop.local_ai.httpx.post", return_value=configured) as post,
+            ):
+                result = stack.prepare(self._profile(), "client-admin-secret")
+
+            self.assertFalse(result["anythingllm_settings"]["onboarding_complete"])
+            self.assertIsNone(result["anythingllm_settings"]["default_provider"])
+            sent = post.call_args.kwargs["json"]
+            self.assertNotIn("LLMProvider", sent)
+            self.assertEqual(sent["GenericOpenAiModelPref"], "legalfedllm-local")
+
+    def test_windows_prepare_fails_closed_when_anythingllm_requires_authentication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            setup = mock.Mock(status_code=200)
+            setup.json.return_value = {"results": {"LLMProvider": "ollama"}}
+            onboarding = mock.Mock(status_code=200)
+            onboarding.json.return_value = {"onboardingComplete": True}
+            denied = mock.Mock(status_code=401)
+            with (
+                mock.patch(
+                    "desktop.local_ai.shutil.which",
+                    return_value=r"C:\Program Files\Ollama\ollama.exe",
+                ),
+                mock.patch.object(stack, "_wait_for_ollama"),
+                mock.patch.object(stack, "_verify_ollama_model"),
+                mock.patch.object(
+                    stack,
+                    "_ensure_windows_anythingllm_backend",
+                    return_value=Path(r"C:\AnythingLLM.exe"),
+                ),
+                mock.patch(
+                    "desktop.local_ai.httpx.get",
+                    side_effect=[setup, onboarding],
+                ),
+                mock.patch("desktop.local_ai.httpx.post", return_value=denied),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "requires its own authentication"):
+                    stack.prepare(self._profile(), "client-admin-secret")
+
+    def test_windows_backend_auto_launches_installed_anythingllm_desktop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            executable = root / "AnythingLLM.exe"
+            executable.write_bytes(b"")
+            with (
+                mock.patch.object(stack, "_windows_anythingllm_executable", return_value=executable),
+                mock.patch.object(
+                    stack,
+                    "_anythingllm_setup_available",
+                    side_effect=[False, False, True],
+                ),
+                mock.patch.object(stack, "_launch_windows_anythingllm") as launch,
+                mock.patch("desktop.local_ai.time.sleep"),
+            ):
+                self.assertEqual(stack._ensure_windows_anythingllm_backend(), executable)
+            launch.assert_called_once_with(executable)
+
+    def test_windows_backend_fails_closed_when_anythingllm_is_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            with (
+                mock.patch.object(stack, "_windows_anythingllm_executable", return_value=None),
+                mock.patch.object(stack, "_anythingllm_setup_available", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Install AnythingLLM Desktop"):
+                    stack._ensure_windows_anythingllm_backend()
+
+    def test_windows_open_anythingllm_relaunches_desktop_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            executable = root / "AnythingLLM.exe"
+            with (
+                mock.patch.object(stack, "_windows_anythingllm_executable", return_value=executable),
+                mock.patch.object(stack, "_launch_windows_anythingllm") as launch,
+            ):
+                self.assertTrue(stack.open_windows_anythingllm())
+            launch.assert_called_once_with(executable)
 
     def test_windows_prepare_requires_native_ollama_on_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

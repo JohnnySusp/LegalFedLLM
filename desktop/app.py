@@ -19,7 +19,11 @@ from client.model_profiles import (
     QWEN_PROFILE_ID,
     ollama_model_for_profile,
 )
-from desktop.local_ai import LocalAiStack
+from desktop.local_ai import (
+    ANYTHINGLLM_CONTEXT_WINDOW,
+    ANYTHINGLLM_MAX_TOKENS,
+    LocalAiStack,
+)
 from desktop.profiles import DesktopProfile, PortableProfileManager
 
 
@@ -286,7 +290,7 @@ def _local_ai_start_ready(
 
 
 def _anythingllm_browser_url(payload: dict[str, Any] | None) -> str | None:
-    if not payload:
+    if not payload or payload.get("mode") == "windows-native":
         return None
     value = str(payload.get("anythingllm_url") or "").strip()
     return value or None
@@ -294,9 +298,16 @@ def _anythingllm_browser_url(payload: dict[str, Any] | None) -> str | None:
 
 def _local_ai_ready_message(payload: dict[str, Any]) -> str:
     if payload.get("mode") == "windows-native":
+        settings = payload.get("anythingllm_settings") or {}
+        if not settings.get("onboarding_complete", False):
+            return (
+                "Ready. Native Ollama is available and LegalFedLLM's Generic OpenAI connection "
+                "is preconfigured. Complete AnythingLLM Desktop's one-time setup; its default "
+                "LLM provider remains your choice."
+            )
         return (
-            "Ready. Native Ollama is available. Configure AnythingLLM Desktop using "
-            "the integration details below."
+            "Ready. Native Ollama is available and LegalFedLLM's Generic OpenAI connection is "
+            "configured. AnythingLLM's default LLM provider was left unchanged."
         )
     return (
         "Ready. AnythingLLM is available at "
@@ -313,12 +324,18 @@ def _provider_details_text(
     base_url = f"http://127.0.0.1:{profile.agent_port}/v1"
     if local_ai.is_windows:
         return (
-            "AnythingLLM Desktop is external to LegalFedLLM on Windows. Configure it through "
-            "AnythingLLM Desktop's own settings. LegalFedLLM does not edit AnythingLLM Desktop files.\n\n"
+            "AnythingLLM Desktop is external to LegalFedLLM on Windows. LegalFedLLM reserves "
+            "AnythingLLM's Generic OpenAI connection for the active LegalFedLLM profile, but it "
+            "does not change AnythingLLM's default LLM provider or complete AnythingLLM onboarding. "
+            "In an AnythingLLM workspace, choose Generic OpenAI and select legalfedllm-local or "
+            "legalfedllm-host. These values are the manual fallback if automatic configuration is "
+            "unavailable.\n\n"
             "Provider: Generic OpenAI\n"
             f"OpenAI-compatible base URL:\n{base_url}\n\n"
             f"API key for this local profile:\n{admin_token}\n\n"
             f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
+            f"Model context window:\n{ANYTHINGLLM_CONTEXT_WINDOW}\n\n"
+            f"Max tokens:\n{ANYTHINGLLM_MAX_TOKENS}\n\n"
             f"Required native Ollama model:\n{profile.ollama_model}\n\n"
             "The API key is the local per-profile Client Agent token, not a Host credential. "
             "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue."
@@ -1021,16 +1038,26 @@ def run_gui(data_root: Path | None = None) -> int:
                 already_attempted=self.anythingllm_browser_attempted,
             ):
                 return
+            self.anythingllm_browser_attempted = True
+            if self.local_ai_payload and self.local_ai_payload.get("mode") == "windows-native":
+                if not self.local_ai.open_windows_anythingllm():
+                    self.message.setText(
+                        "AnythingLLM Desktop is configured, but LegalFedLLM could not open its "
+                        "Windows application. Open AnythingLLM Desktop manually."
+                    )
+                return
             url = _anythingllm_browser_url(self.local_ai_payload)
             if url is None:
                 return
-            self.anythingllm_browser_attempted = True
             open_default_browser(url.rstrip("/") + "/")
 
         def _local_ai_failed(self, error: str) -> None:
             if self.local_ai.is_windows:
-                self.message.setText(f"Native Ollama unavailable: {error}")
-                detail = "LegalFedLLM could not verify native Ollama for Windows.\n\n" + error
+                self.message.setText(f"Windows local AI integration unavailable: {error}")
+                detail = (
+                    "LegalFedLLM could not prepare native Ollama and AnythingLLM Desktop.\n\n"
+                    + error
+                )
             else:
                 self.message.setText(f"Local AnythingLLM/Ollama stack unavailable: {error}")
                 detail = "LegalFedLLM could not prepare the local Ollama/AnythingLLM stack.\n\n" + error

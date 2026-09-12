@@ -23,6 +23,9 @@ BUNDLE_FILES = (
 NETWORK_NAME = "legalfed-ai-net"
 OLLAMA_URL = "http://127.0.0.1:11434"
 ANYTHINGLLM_URL = "http://127.0.0.1:3001"
+ANYTHINGLLM_CONTEXT_WINDOW = "4096"
+ANYTHINGLLM_MAX_TOKENS = "1024"
+ANYTHINGLLM_WINDOWS_RELATIVE_EXE = Path("Programs") / "AnythingLLM" / "AnythingLLM.exe"
 _PLACEHOLDER_SECRETS = {
     "",
     "PASTE_RANDOM_SECRET_HERE",
@@ -172,7 +175,7 @@ class LocalAiStack:
 
     def prepare(self, profile: DesktopProfile, admin_token: str) -> dict[str, Any]:
         if self.is_windows:
-            return self._prepare_windows(profile)
+            return self._prepare_windows(profile, admin_token)
 
         self.configure_anythingllm(profile, admin_token)
         docker = shutil.which("docker")
@@ -197,7 +200,11 @@ class LocalAiStack:
             "anythingllm_managed": True,
         }
 
-    def _prepare_windows(self, profile: DesktopProfile) -> dict[str, Any]:
+    def _prepare_windows(
+        self,
+        profile: DesktopProfile,
+        admin_token: str,
+    ) -> dict[str, Any]:
         if shutil.which("ollama") is None:
             raise RuntimeError(
                 "Native Ollama for Windows was not found on PATH. Install/start Ollama for Windows "
@@ -205,11 +212,231 @@ class LocalAiStack:
             )
         self._wait_for_ollama()
         self._verify_ollama_model(profile.ollama_model)
+        anythingllm_executable = self._ensure_windows_anythingllm_backend()
+        anythingllm = self._configure_windows_anythingllm(profile, admin_token)
         return {
             "mode": "windows-native",
             "ollama_model": profile.ollama_model,
             "openai_base_url": f"http://127.0.0.1:{profile.agent_port}/v1",
+            "anythingllm_url": ANYTHINGLLM_URL,
+            "anythingllm_executable": (
+                str(anythingllm_executable) if anythingllm_executable is not None else None
+            ),
+            "anythingllm_configured": True,
             "anythingllm_managed": False,
+            "anythingllm_settings": anythingllm,
+        }
+
+    def _windows_anythingllm_executable(self) -> Path | None:
+        override = os.getenv("LEGALFEDLLM_ANYTHINGLLM_EXE", "").strip()
+        if override:
+            candidate = Path(override).expanduser()
+            if candidate.is_file():
+                return candidate.resolve()
+
+        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            candidate = Path(local_app_data) / ANYTHINGLLM_WINDOWS_RELATIVE_EXE
+            if candidate.is_file():
+                return candidate.resolve()
+
+        discovered = shutil.which("AnythingLLM.exe") or shutil.which("AnythingLLM")
+        if discovered:
+            return Path(discovered).resolve()
+        return None
+
+    def _anythingllm_setup_available(self) -> bool:
+        try:
+            response = httpx.get(f"{ANYTHINGLLM_URL}/api/setup-complete", timeout=3.0)
+        except Exception:
+            return False
+        return response.status_code == 200
+
+    def _ensure_windows_anythingllm_backend(self) -> Path | None:
+        executable = self._windows_anythingllm_executable()
+        if self._anythingllm_setup_available():
+            return executable
+        if executable is None:
+            raise RuntimeError(
+                "AnythingLLM Desktop is not reachable and its Windows executable was not found. "
+                "Install AnythingLLM Desktop before launching LegalFedLLM."
+            )
+        self._launch_windows_anythingllm(executable)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if self._anythingllm_setup_available():
+                return executable
+            time.sleep(0.5)
+        raise RuntimeError(
+            "AnythingLLM Desktop was launched, but its local API did not become ready at "
+            "http://127.0.0.1:3001."
+        )
+
+    def _launch_windows_anythingllm(self, executable: Path) -> None:
+        try:
+            subprocess.Popen([str(executable)], close_fds=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"AnythingLLM Desktop could not be launched from {executable}."
+            ) from exc
+
+    def open_windows_anythingllm(self) -> bool:
+        if not self.is_windows:
+            return False
+        executable = self._windows_anythingllm_executable()
+        if executable is None:
+            return False
+        self._launch_windows_anythingllm(executable)
+        return True
+
+    def _configure_windows_anythingllm(
+        self,
+        profile: DesktopProfile,
+        admin_token: str,
+    ) -> dict[str, Any]:
+        try:
+            setup_response = httpx.get(
+                f"{ANYTHINGLLM_URL}/api/setup-complete",
+                timeout=3.0,
+            )
+            onboarding_response = httpx.get(
+                f"{ANYTHINGLLM_URL}/api/onboarding",
+                timeout=3.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop local API is not reachable at http://127.0.0.1:3001."
+            ) from exc
+        if setup_response.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop did not answer its local setup API "
+                f"(HTTP {setup_response.status_code})."
+            )
+        if onboarding_response.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop did not answer its onboarding status API "
+                f"(HTTP {onboarding_response.status_code})."
+            )
+        try:
+            setup_payload: Any = setup_response.json()
+            onboarding_payload: Any = onboarding_response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop returned an invalid setup response."
+            ) from exc
+        setup_values = setup_payload.get("results") if isinstance(setup_payload, dict) else None
+        if not isinstance(setup_values, dict):
+            raise RuntimeError("AnythingLLM Desktop returned an invalid setup response.")
+        if not isinstance(onboarding_payload, dict):
+            raise RuntimeError("AnythingLLM Desktop returned an invalid onboarding response.")
+        onboarding_complete = bool(onboarding_payload.get("onboardingComplete"))
+        default_provider = setup_values.get("LLMProvider")
+
+        settings = {
+            "GenericOpenAiBasePath": f"http://127.0.0.1:{profile.agent_port}/v1",
+            "GenericOpenAiKey": admin_token,
+            "GenericOpenAiModelPref": "legalfedllm-local",
+            "GenericOpenAiTokenLimit": ANYTHINGLLM_CONTEXT_WINDOW,
+            "GenericOpenAiMaxTokens": ANYTHINGLLM_MAX_TOKENS,
+        }
+        try:
+            response = httpx.post(
+                f"{ANYTHINGLLM_URL}/api/system/update-env",
+                json=settings,
+                timeout=10.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop is reachable, but LegalFedLLM could not configure its "
+                "Generic OpenAI connection."
+            ) from exc
+        if response.status_code in {401, 403}:
+            raise RuntimeError(
+                "AnythingLLM Desktop requires its own authentication, so LegalFedLLM will not "
+                "change its settings automatically. Use the AnythingLLM integration details "
+                "button as the manual fallback."
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop rejected automatic Generic OpenAI configuration "
+                f"(HTTP {response.status_code})."
+            )
+        try:
+            payload: Any = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop returned an invalid configuration response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("AnythingLLM Desktop returned an invalid configuration response.")
+        error = payload.get("error")
+        if error:
+            raise RuntimeError(f"AnythingLLM Desktop configuration failed: {error}")
+        new_values = payload.get("newValues")
+        if not isinstance(new_values, dict):
+            raise RuntimeError("AnythingLLM Desktop did not confirm its updated settings.")
+        for key, expected in settings.items():
+            if str(new_values.get(key, "")) != expected:
+                raise RuntimeError(
+                    "AnythingLLM Desktop did not confirm the expected setting "
+                    f"'{key}'."
+                )
+
+        try:
+            verified = httpx.get(
+                f"{ANYTHINGLLM_URL}/api/setup-complete",
+                timeout=3.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop was configured, but its settings could not be verified."
+            ) from exc
+        if verified.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop was configured, but its settings verification failed "
+                f"(HTTP {verified.status_code})."
+            )
+        try:
+            verified_payload: Any = verified.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop returned an invalid settings verification response."
+            ) from exc
+        verified_values = (
+            verified_payload.get("results") if isinstance(verified_payload, dict) else None
+        )
+        if not isinstance(verified_values, dict):
+            raise RuntimeError(
+                "AnythingLLM Desktop returned an invalid settings verification response."
+            )
+        if verified_values.get("LLMProvider") != default_provider:
+            raise RuntimeError(
+                "AnythingLLM Desktop changed its default LLM provider unexpectedly while "
+                "LegalFedLLM configured Generic OpenAI."
+            )
+        verification = {
+            "GenericOpenAiBasePath": settings["GenericOpenAiBasePath"],
+            "GenericOpenAiModelPref": settings["GenericOpenAiModelPref"],
+            "GenericOpenAiTokenLimit": settings["GenericOpenAiTokenLimit"],
+            "GenericOpenAiMaxTokens": settings["GenericOpenAiMaxTokens"],
+        }
+        for key, expected in verification.items():
+            if str(verified_values.get(key, "")) != expected:
+                raise RuntimeError(
+                    "AnythingLLM Desktop did not persist the expected setting "
+                    f"'{key}'."
+                )
+        if not verified_values.get("GenericOpenAiKey"):
+            raise RuntimeError("AnythingLLM Desktop did not persist the Generic OpenAI API key.")
+
+        return {
+            "provider": "generic-openai",
+            "base_url": settings["GenericOpenAiBasePath"],
+            "model": settings["GenericOpenAiModelPref"],
+            "context_window": settings["GenericOpenAiTokenLimit"],
+            "max_tokens": settings["GenericOpenAiMaxTokens"],
+            "default_provider": default_provider,
+            "onboarding_complete": onboarding_complete,
         }
 
     def running_services(self) -> set[str]:

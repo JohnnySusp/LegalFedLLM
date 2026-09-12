@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from client.runtime import ClientRuntime, ClientRuntimeError
@@ -1030,35 +1032,101 @@ def create_app(
     async def openai_chat_completion(
         request: OpenAIChatCompletionRequest,
         http_request: Request,
-    ) -> dict[str, Any]:
-        if request.stream:
-            raise HTTPException(status_code=400, detail="streaming is not implemented")
+    ) -> Any:
         if request.model not in {"legalfedllm-local", "legalfedllm-host"}:
             raise HTTPException(status_code=404, detail="unknown LegalFedLLM model")
         messages = [item.model_dump(mode="json") for item in request.messages]
-        if request.model == "legalfedllm-local":
-            text = await generate_local_messages(messages, request.max_tokens)
-            last_user = next(
-                (item["content"] for item in reversed(messages) if item["role"] == "user"),
-                None,
-            )
-            suggestion = (
-                client_runtime.record_learning_suggestion(last_user, text)
-                if (
-                    last_user
-                    and text.strip()
-                    and not await http_request.is_disconnected()
-                )
-                else None
-            )
-        else:
+        last_user = next(
+            (item["content"] for item in reversed(messages) if item["role"] == "user"),
+            None,
+        )
+
+        async def generate_text() -> str:
+            if request.model == "legalfedllm-local":
+                return await generate_local_messages(messages, request.max_tokens)
             prompt = "\n\n".join(
                 f"{item['role'].upper()}: {item['content']}"
                 for item in messages
             )
             result = await coordinator.generate_host(prompt, request.max_tokens)
-            text = str(result.get("text", ""))
-            suggestion = None
+            return str(result.get("text", ""))
+
+        def record_suggestion(text: str) -> dict[str, Any] | None:
+            if request.model != "legalfedllm-local" or not last_user or not text.strip():
+                return None
+            return client_runtime.record_learning_suggestion(last_user, text)
+
+        if request.stream:
+            completion_id = f"chatcmpl-{int(time.time() * 1000)}"
+            created = int(time.time())
+
+            def event(payload: dict[str, Any]) -> str:
+                return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+            async def stream_events():
+                base = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                }
+                yield event(
+                    {
+                        **base,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                text = await generate_text()
+                if await http_request.is_disconnected():
+                    return
+                if text:
+                    yield event(
+                        {
+                            **base,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                if await http_request.is_disconnected():
+                    return
+                record_suggestion(text)
+                yield event(
+                    {
+                        **base,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_events(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
+        text = await generate_text()
+        suggestion = (
+            record_suggestion(text)
+            if not await http_request.is_disconnected()
+            else None
+        )
         response: dict[str, Any] = {
             "id": f"chatcmpl-{int(time.time() * 1000)}",
             "object": "chat.completion",

@@ -222,12 +222,14 @@ class PortableDesktopProfileTests(unittest.TestCase):
         self.assertIn(round_id, previewed)
 
 
-    def test_windows_native_local_ai_has_no_browser_target(self) -> None:
+    def test_windows_native_local_ai_does_not_use_backend_as_browser_target(self) -> None:
         self.assertIsNone(
             _anythingllm_browser_url(
                 {
                     "mode": "windows-native",
                     "openai_base_url": "http://127.0.0.1:8001/v1",
+                    "anythingllm_url": "http://127.0.0.1:3001",
+                    "anythingllm_configured": True,
                     "anythingllm_managed": False,
                 }
             )
@@ -237,10 +239,35 @@ class PortableDesktopProfileTests(unittest.TestCase):
             "http://127.0.0.1:3001",
         )
 
-    def test_windows_native_ready_message_points_to_manual_anythingllm_configuration(self) -> None:
-        message = _local_ai_ready_message({"mode": "windows-native"})
+    def test_windows_native_ready_message_preserves_anythingllm_default_provider(self) -> None:
+        message = _local_ai_ready_message(
+            {
+                "mode": "windows-native",
+                "anythingllm_url": "http://127.0.0.1:3001",
+                "anythingllm_settings": {
+                    "onboarding_complete": True,
+                    "default_provider": "ollama",
+                },
+            }
+        )
         self.assertIn("Native Ollama", message)
-        self.assertIn("Configure AnythingLLM Desktop", message)
+        self.assertIn("Generic OpenAI connection is configured", message)
+        self.assertIn("default LLM provider was left unchanged", message)
+        self.assertNotIn("http://127.0.0.1:3001", message)
+
+    def test_windows_native_ready_message_leaves_fresh_anythingllm_onboarding_to_user(self) -> None:
+        message = _local_ai_ready_message(
+            {
+                "mode": "windows-native",
+                "anythingllm_settings": {
+                    "onboarding_complete": False,
+                    "default_provider": None,
+                },
+            }
+        )
+        self.assertIn("Generic OpenAI connection is preconfigured", message)
+        self.assertIn("Complete AnythingLLM Desktop's one-time setup", message)
+        self.assertIn("default LLM provider remains your choice", message)
 
     def test_windows_provider_details_expose_only_local_profile_connection_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -254,13 +281,18 @@ class PortableDesktopProfileTests(unittest.TestCase):
             )
 
         self.assertIn("AnythingLLM Desktop is external", text)
+        self.assertIn("reserves", text)
+        self.assertIn("does not change AnythingLLM's default LLM provider", text)
+        self.assertIn("choose Generic OpenAI", text)
+        self.assertIn("manual fallback", text)
         self.assertIn(f"http://127.0.0.1:{profile.agent_port}/v1", text)
         self.assertIn("local-profile-secret", text)
         self.assertIn("legalfedllm-local", text)
         self.assertIn("legalfedllm-host", text)
+        self.assertIn("4096", text)
+        self.assertIn("1024", text)
         self.assertIn("not a Host credential", text)
         self.assertNotIn("Runtime files", text)
-        self.assertNotIn("http://127.0.0.1:3001", text)
 
     def test_anythingllm_browser_launch_waits_for_agent_and_local_stack(self) -> None:
         self.assertFalse(

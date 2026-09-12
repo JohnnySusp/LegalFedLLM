@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,6 +96,64 @@ class DesktopClientApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(accepted.status_code, 200, accepted.text)
                 self.assertEqual(accepted.json()["queued_example_count"], 1)
                 self.assertEqual(runtime.learning_queue_status()["queued_example_count"], 1)
+
+    async def test_openai_streaming_facade_returns_sse_and_records_local_suggestion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ClientRuntime(
+                data_dir=Path(directory) / "client",
+                client_id="client-desktop",
+                model_profile=mock_profile(),
+                private_data_path=Path(directory) / "private" / "train.jsonl",
+            )
+            app = create_client_app(
+                runtime,
+                CoordinatorGateway("http://unused", None),
+                admin_token_override="local-provider-secret",
+                tunnel_manager=SshTunnelManager(SshTunnelConfig(enabled=False, target="")),
+            )
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://client",
+                headers={"Authorization": "Bearer local-provider-secret"},
+            ) as client:
+                with mock.patch(
+                    "starlette.requests.Request.is_disconnected",
+                    new=mock.AsyncMock(return_value=False),
+                ):
+                    completion = await client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "legalfedllm-local",
+                            "messages": [
+                                {"role": "user", "content": "Stream this locally."}
+                            ],
+                            "max_tokens": 32,
+                            "stream": True,
+                        },
+                    )
+
+            self.assertEqual(completion.status_code, 200, completion.text)
+            self.assertTrue(
+                completion.headers["content-type"].startswith("text/event-stream")
+            )
+            events = [
+                line.removeprefix("data: ")
+                for line in completion.text.splitlines()
+                if line.startswith("data: ")
+            ]
+            self.assertEqual(events[-1], "[DONE]")
+            chunks = [json.loads(event) for event in events[:-1]]
+            self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
+            streamed_text = "".join(
+                chunk["choices"][0]["delta"].get("content", "")
+                for chunk in chunks
+            )
+            self.assertIn("Stream this locally.", streamed_text)
+            self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+            suggestions = runtime.pending_learning_suggestions()
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0]["prompt"], "Stream this locally.")
 
     async def test_disconnected_local_request_does_not_create_learning_suggestion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
