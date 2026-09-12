@@ -78,8 +78,8 @@ Linux NVIDIA Container Toolkit for the Windows Client.
 | --- | --- | --- | --- |
 | NVIDIA GPU + working Windows driver | Required by the current real Qwen/Granite Client training path | `nvidia-smi` | [NVIDIA Drivers](https://www.nvidia.com/en-us/drivers/) |
 | OpenSSH Client | Used for the Client-to-Host SSH connection/tunnel | `ssh -V` | [Microsoft OpenSSH for Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) |
-| Ollama for Windows | Planned native local-AI/compatibility serving component | `ollama --version` | [Ollama for Windows](https://ollama.com/download/windows) |
-| AnythingLLM Desktop for Windows | Planned user-facing local RAG/application layer | Check **Settings → Apps → Installed apps**, or launch AnythingLLM | [AnythingLLM Download](https://anythingllm.com/download) |
+| Ollama for Windows | Native local-AI/compatibility serving component | `ollama --version` | [Ollama for Windows](https://ollama.com/download/windows) |
+| AnythingLLM Desktop for Windows | Native user-facing local RAG/application layer | Check **Settings → Apps → Installed apps**, or launch AnythingLLM | [AnythingLLM Download](https://anythingllm.com/download) |
 | Host SSH target and one-time enrollment token | Required to enroll and connect a new Client profile | Supplied by the Host/Coordinator operator | Not a separately installed component |
 
 You will also need enough free disk space for the LegalFedLLM portable data
@@ -163,6 +163,76 @@ AnythingLLM download page:
 AnythingLLM is the intended user-facing RAG/application layer. LegalFedLLM
 remains responsible for federation, model learning, and its own Client/Host
 inference boundary.
+
+#### Explicit model preload
+
+The current Windows source/testing path can preload the exact pinned
+Transformers model into the portable LegalFedLLM cache instead of waiting for
+the first AnythingLLM `LOCAL` request to trigger a multi-gigabyte download.
+
+From the repository root, first select the active Client model:
+
+```powershell
+# Granite 3.3 2B Client
+$env:LEGALFEDLLM_MODEL_REPO = "ibm-granite/granite-3.3-2b-instruct"
+$env:LEGALFEDLLM_MODEL_REVISION = "652c333dc5066f2a1764854a1bcd0ce67163d74f"
+```
+
+or:
+
+```powershell
+# Qwen3 1.7B Client
+$env:LEGALFEDLLM_MODEL_REPO = "Qwen/Qwen3-1.7B"
+$env:LEGALFEDLLM_MODEL_REVISION = "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"
+```
+
+Then populate `LegalFedLLM-data\models\huggingface` explicitly:
+
+```powershell
+cd C:\path\to\LegalFedLLM
+
+New-Item `
+  -ItemType Directory `
+  -Force `
+  ".\LegalFedLLM-data\models\huggingface" |
+  Out-Null
+
+$env:HF_HOME = Join-Path `
+  (Get-Location) `
+  "LegalFedLLM-data\models\huggingface"
+
+@'
+import os
+from huggingface_hub import snapshot_download
+
+path = snapshot_download(
+    repo_id=os.environ["LEGALFEDLLM_MODEL_REPO"],
+    revision=os.environ["LEGALFEDLLM_MODEL_REVISION"],
+)
+
+print(f"Model cached at: {path}")
+'@ | .\.venv\Scripts\python.exe -
+```
+
+Hugging Face reuses completed files and resumes compatible partial downloads in
+that cache. Warnings about the optional `hf_xet` package or unavailable Windows
+symlinks do not by themselves mean the download failed; wait for the command to
+print the final `Model cached at:` path.
+
+The Ollama compatibility copy is separate from the Transformers/PEFT cache.
+Install only the model required by the active Client profile:
+
+```powershell
+# Granite Client profile
+ollama pull granite3.3:2b
+
+# Qwen Client profile
+ollama pull qwen3:1.7b
+```
+
+The Ollama model does not replace the pinned Transformers model. LegalFedLLM
+needs the Transformers/PEFT copy for model-native LoRA training, adapter loading,
+validation, and `LOCAL` inference.
 
 ### Installation
 
@@ -633,6 +703,44 @@ Federated training and LOCAL LegalFedLLM inference use the exact pinned
 Transformers + PEFT Client state; Ollama remains a compatibility/local-AI
 serving component rather than a substitute for the active LegalFedLLM adapter.
 
+For a **source checkout**, the same pinned Transformers model can also be
+preloaded explicitly into the shared LegalFedLLM cache before the first
+model-backed request. Select one active Client profile:
+
+```bash
+# Granite 3.3 2B Client
+export LEGALFEDLLM_MODEL_REPO='ibm-granite/granite-3.3-2b-instruct'
+export LEGALFEDLLM_MODEL_REVISION='652c333dc5066f2a1764854a1bcd0ce67163d74f'
+
+# Or, for Qwen3 1.7B:
+# export LEGALFEDLLM_MODEL_REPO='Qwen/Qwen3-1.7B'
+# export LEGALFEDLLM_MODEL_REVISION='70d244cc86ccca08cf5af4e1e306ecf908b1ad5e'
+```
+
+Then run:
+
+```bash
+cd /path/to/LegalFedLLM
+source .venv/bin/activate
+mkdir -p LegalFedLLM-data/models/huggingface
+export HF_HOME="$PWD/LegalFedLLM-data/models/huggingface"
+
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+path = snapshot_download(
+    repo_id=os.environ["LEGALFEDLLM_MODEL_REPO"],
+    revision=os.environ["LEGALFEDLLM_MODEL_REVISION"],
+)
+
+print(f"Model cached at: {path}")
+PY
+```
+
+The source-mode command above is optional; normal LegalFedLLM model loading will
+also populate the same cache as needed.
+
 #### Normal use
 
 On later launches, start LegalFedLLM using the same source or AppImage command
@@ -774,6 +882,115 @@ managed Docker state created by the desktop, use the LegalFedLLM-specific Docker
 cleanup commands above. Do not use broad Docker prune commands unless you
 intend to remove resources belonging to other projects too.
 
+## Host
+
+The Host/Coordinator runs separately from the desktop Clients. The verified
+remote path uses a writable runtime root such as:
+
+```text
+/scratch/legalfedllm-test
+```
+
+with the repository at:
+
+```text
+/scratch/legalfedllm-test/work/LegalFedLLM
+```
+
+and the Python environment at:
+
+```text
+/scratch/legalfedllm-test/.venv
+```
+
+The real Host and Coordinator run directly from that environment. In the
+verified topology the Host binds to `127.0.0.1:8002`, the Coordinator binds to
+`127.0.0.1:8000`, and Clients reach the Coordinator through SSH forwarding.
+
+### Starting the Host/Coordinator
+
+From the remote repository root:
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+set -a
+. ./.env.host
+set +a
+
+python scripts/run_host_stack.py --env-file .env.host
+```
+
+Substitute the deployment's actual Host environment filename if it is not
+`.env.host`. Keep the process running while Clients are connected.
+
+### Health and GPU checks
+
+From another Host shell:
+
+```bash
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+curl -fsS http://127.0.0.1:8002/health
+curl -fsS http://127.0.0.1:8000/health
+nvidia-smi
+```
+
+A healthy deployment should answer both HTTP checks. Do not infer Host health
+only from GPU activity or from an unsupported port-inspection utility.
+
+### Issuing a Client enrollment token
+
+After the Host/Coordinator is healthy, issue one single-use enrollment token for
+each genuinely new Client profile:
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+python scripts/issue_enrollment_token.py --env-file .env.host
+```
+
+Give the resulting token to exactly one new Client profile. Successful
+registration consumes it; saved profiles use their persisted Client identity on
+later launches and do not require a new enrollment token.
+
+### Stopping and restarting
+
+If `run_host_stack.py` is running in the foreground, stop it with `Ctrl+C`.
+Before restarting, verify that no stale Host/Coordinator processes remain:
+
+```bash
+ps -ef | grep -E \
+  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+  | grep -v grep || true
+```
+
+Then confirm that the loopback services are no longer answering:
+
+```bash
+curl -fsS --max-time 2 http://127.0.0.1:8000/health || true
+curl -fsS --max-time 2 http://127.0.0.1:8002/health || true
+```
+
+If a stale `run_host_stack.py` parent remains, stop that parent first and
+re-check its children before using a stronger signal. Once the old processes are
+gone, restart with the normal **Starting the Host/Coordinator** command above.
+
+### Remote container notes
+
+The verified NVIDIA A40 environment is a constrained container rather than a
+normal workstation/server installation:
+
+- use the writable `/scratch` runtime tree rather than assuming ordinary home or
+  system paths are writable;
+- `ss` is not available/supported there, so use `ps` plus direct `/health`
+  requests for process/service checks;
+- `lsof` or `fuser` may be useful when installed, but they do not replace the
+  process/health checks; and
+- `nvidia-smi` is the normal GPU/VRAM monitoring command.
+
 ## Status at a glance
 
 | Capability | Current status |
@@ -790,8 +1007,8 @@ intend to remove resources belonging to other projects too.
 | Automatic Host → Qwen reverse distillation | Implemented and real-tested |
 | Exact submission acknowledgement reconciliation | Implemented and regression-tested |
 | Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
-| Portable PySide6 desktop Client | Source path accepted on Linux/Bazzite; Linux x86_64 AppImage implemented and real-tested with the Qwen Client through startup/enrollment, AnythingLLM LOCAL use, a complete forward federated round, browser launch, and clean Client-Docker shutdown; Windows packaging/acceptance pending |
-| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented; real Bazzite AnythingLLM chat/RAG path accepted through active Qwen PEFT state |
+| Portable PySide6 desktop Client | Source path accepted on Linux/Bazzite and Windows; Linux x86_64 AppImage implemented and real-tested with the Qwen Client through startup/enrollment, AnythingLLM LOCAL use, a complete forward federated round, browser launch, and clean Client-Docker shutdown; Windows native Granite source GUI + Ollama + AnythingLLM Desktop LOCAL integration accepted, while portable EXE packaging remains pending |
+| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented; real Bazzite Qwen and Windows Granite AnythingLLM LOCAL paths accepted through the Client Agent |
 | HOST OpenAI-compatible forwarding through bounded Host queue | Implemented and model-free tested; real desktop/Host acceptance pending |
 | Configurable local learning queue | Implemented; Constant Learning is on by default, with Learn/Dismiss consent available when disabled; real Bazzite AnythingLLM queue behavior accepted |
 | Real multi-Client round | Not yet demonstrated |
@@ -1007,15 +1224,23 @@ The locked desktop behavior is:
 - the OpenAI-compatible provider exposes `legalfedllm-local` and
   `legalfedllm-host` for the current milestone; collaborative inference remains
   future work;
-- the repository carries the `legalfed-ai/` Docker Ollama + AnythingLLM bundle.
-  On profile activation the desktop seeds a writable copy under
-  `LegalFedLLM-data/legalfed-ai/`, preserves compatible existing AnythingLLM
-  configuration when migrating from `~/legalfed-ai`, and rewrites the Generic
-  OpenAI provider to the active profile's loopback Client Agent;
-- Docker local-AI services are not started while OpenSSH is still waiting for
-  authentication. After the Client Agent becomes healthy, LegalFedLLM starts
-  Ollama, verifies the required compatibility model without pulling it, starts
-  AnythingLLM, and opens `http://127.0.0.1:3001/` in the host default browser;
+- on Linux/AppImage, the repository carries the `legalfed-ai/` Docker Ollama +
+  AnythingLLM bundle. On profile activation the desktop seeds a writable copy
+  under `LegalFedLLM-data/legalfed-ai/`, preserves compatible existing
+  AnythingLLM configuration when migrating from `~/legalfed-ai`, and rewrites
+  the Generic OpenAI provider to the active profile's loopback Client Agent;
+- on Linux/AppImage, Docker local-AI services are not started while OpenSSH is
+  still waiting for authentication. After the Client Agent becomes healthy,
+  LegalFedLLM starts Ollama, verifies the required compatibility model without
+  pulling it, starts AnythingLLM, and opens `http://127.0.0.1:3001/` in the host
+  default browser;
+- on Windows, LegalFedLLM uses native Ollama and AnythingLLM Desktop rather than
+  Docker. It verifies the required Ollama model without pulling it, detects or
+  launches AnythingLLM Desktop, configures the single reserved Generic OpenAI
+  connection through AnythingLLM's local backend API without taking over
+  AnythingLLM onboarding/default-provider choice, and brings the Desktop UI
+  forward. The active profile's `legalfedllm-local` and `legalfedllm-host`
+  models remain behind the authenticated loopback Client Agent;
 - on GUI exit, the profile-specific AppImage Client Docker stack is brought down
   automatically. The user separately chooses whether managed
   Ollama/AnythingLLM services should stop or remain running; stopping them
@@ -1044,7 +1269,7 @@ respective operating systems; PyInstaller is not a cross-compiler.
 | Profile | Model | Revision | Current role/status |
 | --- | --- | --- | --- |
 | `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | Real Client path with private training, D^P package generation and reverse training verified |
-| `granite-3.3-2b-instruct-client-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Pinned Client identity/alignment profile; no authoritative full private-training round yet |
+| `granite-3.3-2b-instruct-client-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Real Windows private training/D^P package and one-Client forward-federation path verified; reverse Granite training remains unaccepted on the tested 6 GiB Windows laptop |
 
 The Qwen profile uses `Qwen3ForCausalLM`, `Qwen2TokenizerFast`, vocabulary size
 151,936 and the non-thinking Qwen chat-template mode. The Granite profile uses
@@ -1522,98 +1747,6 @@ computes PASS / FAIL
 
 Observation is evidence collection only. It does not retry a submission, call
 `/sync`, mutate Client state, or otherwise recover a failed run automatically.
-
-## Remote NVIDIA A40 environment
-
-The remote Host/Coordinator path is designed around a writable runtime root such
-as:
-
-```text
-/scratch/legalfedllm-test
-```
-
-with a source checkout under:
-
-```text
-/scratch/legalfedllm-test/work/LegalFedLLM
-```
-
-and a Python virtual environment under:
-
-```text
-/scratch/legalfedllm-test/.venv
-```
-
-The real Host/Coordinator services run directly from that virtual environment,
-not through Docker. The Host binds to `127.0.0.1:8002`; the Coordinator binds to
-`127.0.0.1:8000` and is exposed to the local Client only through SSH forwarding.
-
-The verified environment uses an NVIDIA A40 with CUDA/BF16-capable PyTorch,
-Transformers, PEFT, Accelerate, Triton, and safetensors.
-
-### Remote container command limitations
-
-The remote environment is intentionally treated as a constrained container, not
-as a normal workstation/server installation.
-
-In particular:
-
-- `ss` is not available/supported in the container;
-- do not infer port state from an empty unsupported port-inspection command;
-- use `ps` to inspect the actual LegalFedLLM/Uvicorn processes;
-- use direct `curl` requests to `/health` to confirm whether Host/Coordinator are
-  alive or stopped;
-- `lsof` or `fuser` may be useful when installed, but they should not replace the
-  process/health check;
-- `nvidia-smi` is available for GPU/VRAM monitoring; and
-- use the writable `/scratch` runtime tree rather than assuming ordinary home or
-  system paths are writable.
-
-A practical cleanup check is:
-
-```bash
-ps -ef | grep -E \
-  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
-  | grep -v grep || true
-```
-
-followed by direct health checks:
-
-```bash
-curl -fsS --max-time 2 http://127.0.0.1:8000/health || true
-curl -fsS --max-time 2 http://127.0.0.1:8002/health || true
-```
-
-If stale Host/Coordinator processes exist, stop the `run_host_stack.py` parent
-first and re-check the children before using stronger signals.
-
-## Running the remote Host/Coordinator manually
-
-From the remote repository root:
-
-```bash
-source /scratch/legalfedllm-test/.venv/bin/activate
-set -a
-. ./.env.host
-set +a
-python scripts/run_host_stack.py --env-file .env.host
-```
-
-Keep that process running while the SSH tunnel and local Client are active.
-
-For a new Client, issue a one-time enrollment token from another remote shell:
-
-```bash
-source /scratch/legalfedllm-test/.venv/bin/activate
-python scripts/issue_enrollment_token.py --env-file .env.host
-```
-
-Useful health checks:
-
-```bash
-curl -fsS http://127.0.0.1:8002/health
-curl -fsS http://127.0.0.1:8000/health
-```
 
 ## Running a split Client manually
 
