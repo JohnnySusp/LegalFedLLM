@@ -131,17 +131,20 @@ class PortableDesktopProfileTests(unittest.TestCase):
 
             inherited = {
                 "CLIENT_GRADIENT_CHECKPOINTING": "true",
+                "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE": "128",
                 "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
             }
             with mock.patch.dict(os.environ, inherited, clear=False):
                 normal_env = manager.agent_environment(profile)
             self.assertEqual(normal_env["CLIENT_GRADIENT_CHECKPOINTING"], "false")
+            self.assertEqual(normal_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "0")
             self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", normal_env)
 
             manager.set_desktop_setting("low_vram_mode", True)
             with mock.patch.dict(os.environ, inherited, clear=False):
                 low_vram_env = manager.agent_environment(profile)
             self.assertEqual(low_vram_env["CLIENT_GRADIENT_CHECKPOINTING"], "true")
+            self.assertEqual(low_vram_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "64")
             self.assertEqual(
                 low_vram_env["PYTORCH_CUDA_ALLOC_CONF"],
                 "expandable_segments:True",

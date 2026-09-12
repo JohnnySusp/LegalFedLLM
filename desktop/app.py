@@ -845,7 +845,8 @@ def run_gui(data_root: Path | None = None) -> int:
             self.low_vram_mode_action.setCheckable(True)
             self.low_vram_mode_action.setChecked(settings["low_vram_mode"])
             self.low_vram_mode_action.setToolTip(
-                "Reduce peak CUDA memory pressure during Client training and reverse distillation."
+                "Reduce peak CUDA memory pressure during Client training, reference knowledge "
+                "generation, and reverse distillation."
             )
             self.low_vram_mode_action.toggled.connect(self._set_low_vram_mode)
             menu.addAction(self.low_vram_mode_action)
@@ -883,13 +884,14 @@ def run_gui(data_root: Path | None = None) -> int:
                 answer = QMessageBox.warning(
                     self,
                     "Low VRAM Mode",
-                    "This setting reduces peak GPU-memory pressure during Client training "
-                    "and reverse distillation by enabling gradient checkpointing and PyTorch "
-                    "expandable CUDA memory segments.\n\n"
-                    "Gradient checkpointing trades memory usage for additional computation. "
-                    "Training may take longer and keep the GPU under sustained load for longer, "
-                    "which can increase GPU temperatures, power usage, and fan noise. "
-                    "Enable this mode when you encounter CUDA out-of-memory errors.\n\n"
+                    "This setting reduces peak GPU-memory pressure during Client training, "
+                    "reference knowledge generation, and reverse distillation by enabling gradient "
+                    "checkpointing, 64-token causal sequence streaming, and PyTorch expandable "
+                    "CUDA memory segments.\n\n"
+                    "These memory-saving paths trade memory usage for additional computation. "
+                    "Training and knowledge generation may take longer and keep the GPU under "
+                    "sustained load for longer, which can increase GPU temperatures, power usage, "
+                    "and fan noise. Enable this mode when you encounter CUDA out-of-memory errors.\n\n"
                     "This will automatically restart the application. Are you sure you want to proceed?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,

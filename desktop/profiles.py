@@ -260,9 +260,11 @@ class PortableProfileManager:
         )
         if self.desktop_settings()["low_vram_mode"]:
             env["CLIENT_GRADIENT_CHECKPOINTING"] = "true"
+            env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"] = "64"
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         else:
             env["CLIENT_GRADIENT_CHECKPOINTING"] = "false"
+            env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"] = "0"
             env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         if enrollment_token:
             env["REGISTRATION_TOKEN"] = enrollment_token

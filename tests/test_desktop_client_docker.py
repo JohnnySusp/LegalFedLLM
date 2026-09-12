@@ -80,6 +80,19 @@ class DesktopClientDockerTests(unittest.TestCase):
             self.assertEqual(values["LEGALFEDLLM_HF_HOME"], str((data_root / "models/huggingface").resolve()))
             self.assertTrue(values["LEGALFEDLLM_CLIENT_IMAGE"].startswith("legalfedllm-client:"))
 
+    def test_appimage_client_runtime_forwards_sequence_chunk_size(self) -> None:
+        compose_path = (
+            Path(__file__).resolve().parents[1]
+            / "desktop"
+            / "client-runtime"
+            / "compose.yaml"
+        )
+        compose_text = compose_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE: ${CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE:-0}",
+            compose_text,
+        )
+
     def test_appimage_private_learning_directory_is_writable(self) -> None:
         compose_path = (
             Path(__file__).resolve().parents[1]
