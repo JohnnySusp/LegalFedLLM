@@ -13,6 +13,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $VenvRoot = Join-Path $RepoRoot ".venv"
 $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
 $Requirements = Join-Path $RepoRoot "requirements-desktop.txt"
+$Verifier = Join-Path $RepoRoot "scripts\verify_windows_desktop.py"
 $TorchIndex = "https://download.pytorch.org/whl/cu132"
 
 function Invoke-Checked {
@@ -26,6 +27,23 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code ${LASTEXITCODE}: $Executable $($Arguments -join ' ')"
     }
+}
+
+$PythonProbe = @'
+import struct
+import sys
+
+if sys.version_info[:2] != (3, 14):
+    raise SystemExit(f"LegalFedLLM requires Python 3.14 x64; found {sys.version_info.major}.{sys.version_info.minor}")
+if struct.calcsize("P") * 8 != 64:
+    raise SystemExit("LegalFedLLM requires 64-bit Python")
+print(sys.executable)
+'@
+
+Write-Host "+ verifying system Python 3.14 x64"
+$PythonProbe | & $PythonCommand -
+if ($LASTEXITCODE -ne 0) {
+    throw "Python 3.14 x64 verification failed."
 }
 
 if (-not (Test-Path $VenvPython)) {
@@ -48,28 +66,11 @@ if ($LASTEXITCODE -eq 0) {
     Invoke-Checked $VenvPython -m pip install --force-reinstall --no-deps torch==2.13.0 --index-url $TorchIndex
 }
 
-$Verification = @'
-import torch
-
-expected_version = "2.13.0+cu132"
-if torch.__version__ != expected_version:
-    raise SystemExit(f"expected torch {expected_version}, found {torch.__version__}")
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is not available to the pinned Windows Torch build")
-if torch.version.cuda != "13.2":
-    raise SystemExit(f"expected Torch CUDA 13.2, found {torch.version.cuda!r}")
-if not torch.cuda.is_bf16_supported():
-    raise SystemExit("the selected Windows GPU does not report BF16 support")
-print("torch:", torch.__version__)
-print("torch cuda:", torch.version.cuda)
-print("device:", torch.cuda.get_device_name(0))
-print("bf16:", torch.cuda.is_bf16_supported())
-'@
-
-Write-Host "+ verifying pinned Windows CUDA runtime"
-$Verification | & $VenvPython -
-if ($LASTEXITCODE -ne 0) {
-    throw "Windows CUDA runtime verification failed."
+if (-not (Test-Path $Verifier)) {
+    throw "Windows runtime verifier is missing: $Verifier"
 }
 
-Write-Host "LegalFedLLM Windows desktop source environment is ready."
+Write-Host "+ verifying LegalFedLLM Windows runtime"
+Invoke-Checked $VenvPython $Verifier
+
+Write-Host "LegalFedLLM Windows desktop environment is ready."

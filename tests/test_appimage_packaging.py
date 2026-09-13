@@ -96,7 +96,36 @@ class AppImagePackagingTests(unittest.TestCase):
             self.assertIn("desktop.agent_entry", command)
             self.assertIn("client-runtime", joined)
 
-    def test_normal_build_retains_onefile_full_runtime_contract(self) -> None:
+    def test_windows_normal_build_uses_thin_onefile_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "desktop").mkdir()
+            (root / "desktop/windows_launcher.py").write_text("", encoding="utf-8")
+            icon = root / "desktop/legalfedllm.ico"
+            icon.write_bytes(b"ico")
+            dist = root / "dist"
+            dist.mkdir()
+            (dist / "LegalFedLLM.exe").write_text("binary", encoding="utf-8")
+            commands: list[list[str]] = []
+            with (
+                mock.patch.object(build_desktop, "ROOT", root),
+                mock.patch.object(build_desktop, "DIST", dist),
+                mock.patch.object(build_desktop, "WINDOWS_ICON", icon),
+                mock.patch.object(build_desktop, "_is_windows", return_value=True),
+                mock.patch.object(build_desktop, "run", side_effect=lambda command: commands.append(command)),
+            ):
+                artifact = build_desktop.build_pyinstaller(clean=False, appimage=False)
+            self.assertEqual(artifact, dist / "LegalFedLLM.exe")
+            command = commands[0]
+            self.assertIn("--onefile", command)
+            self.assertNotIn("--onedir", command)
+            self.assertEqual(command[-1], str(root / "desktop/windows_launcher.py"))
+            joined = " ".join(command)
+            self.assertNotIn("--collect-submodules", joined)
+            self.assertNotIn("--collect-data huggingface_hub", joined)
+            self.assertNotIn("--add-data", joined)
+
+    def test_non_windows_normal_build_retains_onefile_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "legalfed-ai").mkdir()
@@ -104,30 +133,28 @@ class AppImagePackagingTests(unittest.TestCase):
             (root / "desktop/app.py").write_text("", encoding="utf-8")
             dist = root / "dist"
             dist.mkdir()
-            executable = "LegalFedLLM.exe" if os.name == "nt" else "LegalFedLLM"
-            (dist / executable).write_text("binary", encoding="utf-8")
+            (dist / "LegalFedLLM").write_text("binary", encoding="utf-8")
             commands: list[list[str]] = []
             with (
                 mock.patch.object(build_desktop, "ROOT", root),
                 mock.patch.object(build_desktop, "DIST", dist),
+                mock.patch.object(build_desktop, "_is_windows", return_value=False),
                 mock.patch.object(build_desktop, "run", side_effect=lambda command: commands.append(command)),
             ):
-                build_desktop.build_pyinstaller(clean=False, appimage=False)
+                artifact = build_desktop.build_pyinstaller(clean=False, appimage=False)
+            self.assertEqual(artifact, dist / "LegalFedLLM")
             command = commands[0]
             self.assertIn("--onefile", command)
-            self.assertIn("--collect-submodules", command)
-            self.assertIn("client", command)
-            self.assertIn("host", command)
-            self.assertIn("coordinator", command)
-            self.assertIn("uvicorn", command)
+            self.assertNotIn("--onedir", command)
+            self.assertIn("--collect-data", command)
+            self.assertIn("huggingface_hub", command)
 
 
     def test_windows_normal_build_embeds_desktop_icon(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "legalfed-ai").mkdir()
             (root / "desktop").mkdir()
-            (root / "desktop/app.py").write_text("", encoding="utf-8")
+            (root / "desktop/windows_launcher.py").write_text("", encoding="utf-8")
             icon = root / "desktop/legalfedllm.ico"
             icon.write_bytes(b"ico")
             dist = root / "dist"

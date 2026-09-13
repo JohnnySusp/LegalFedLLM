@@ -212,6 +212,55 @@ def _profile_model_label(profile_id: str) -> str:
     return profile_id
 
 
+def _participation_allowed(
+    round_info: dict[str, Any] | None,
+    *,
+    compatible: bool,
+    coordinator_connected: bool,
+) -> bool:
+    if not round_info:
+        return False
+    return bool(
+        compatible
+        and coordinator_connected
+        and round_info.get("selected")
+        and not round_info.get("participated")
+        and round_info.get("state") == "COLLECTING"
+    )
+
+
+def _participation_inflight_resolved(
+    round_info: dict[str, Any] | None,
+    inflight_round_id: str | None,
+) -> bool:
+    if not round_info:
+        return False
+    current_round_id = str(round_info.get("round_id") or "").strip()
+    if inflight_round_id and current_round_id and current_round_id != inflight_round_id:
+        return True
+    return bool(
+        round_info.get("participated")
+        or not round_info.get("selected")
+        or round_info.get("state") != "COLLECTING"
+    )
+
+
+def _desktop_icon_path(
+    directory: Path | None = None,
+    *,
+    platform: str | None = None,
+) -> Path | None:
+    root = Path(directory) if directory is not None else Path(__file__).resolve().parent
+    platform_name = platform or sys.platform
+    names = ("legalfedllm.ico", "legalfedllm.png") if platform_name == "win32" else (
+        "legalfedllm.png",
+        "legalfedllm.ico",
+    )
+    for name in names:
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _poll_failure_state(
@@ -534,7 +583,7 @@ def stop_diagnostics(processes: list[subprocess.Popen[Any]]) -> None:
 
 def run_gui(data_root: Path | None = None) -> int:
     from PySide6.QtCore import QThread, QTimer, Signal
-    from PySide6.QtGui import QAction
+    from PySide6.QtGui import QAction, QIcon
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -733,6 +782,8 @@ def run_gui(data_root: Path | None = None) -> int:
             self.suggestion_resolution_inflight: set[str] = set()
             self.previewed_rounds: set[str] = set()
             self.host_preview_inflight: set[str] = set()
+            self.participation_inflight = False
+            self.participation_round_id: str | None = None
             self._build_ui()
             self._profile_menu()
             self._settings_menu()
@@ -993,6 +1044,8 @@ def run_gui(data_root: Path | None = None) -> int:
             self.suggestion_resolution_inflight.clear()
             self.previewed_rounds.clear()
             self.host_preview_inflight.clear()
+            self.participation_inflight = False
+            self.participation_round_id = None
             self.profile_label.setText(profile.display_name)
             self.model_label.setText(
                 f"{_profile_model_label(profile.model_profile_id)} ({profile.ollama_model})"
@@ -1202,19 +1255,23 @@ def run_gui(data_root: Path | None = None) -> int:
                     self.my_state_label.setText("Selected / not participated")
                 else:
                     self.my_state_label.setText("Not selected")
-                enable = bool(
-                    self.compatible
-                    and status.get("coordinator_connected")
-                    and round_info.get("selected")
-                    and not round_info.get("participated")
-                    and round_info.get("state") == "COLLECTING"
+                if self.participation_inflight and _participation_inflight_resolved(
+                    round_info,
+                    self.participation_round_id,
+                ):
+                    self.participation_inflight = False
+                    self.participation_round_id = None
+                enable = _participation_allowed(
+                    round_info,
+                    compatible=self.compatible,
+                    coordinator_connected=bool(status.get("coordinator_connected")),
                 )
                 self._maybe_preview_host(round_info, status)
             else:
                 self.round_label.setText("No current round")
                 self.participants_label.setText("—")
                 self.my_state_label.setText("Idle")
-            self.participate_button.setEnabled(enable)
+            self.participate_button.setEnabled(enable and not self.participation_inflight)
             self._maybe_prompt_learning(payload.get("suggestions") or [])
 
         def _registered(self, _payload: Any) -> None:
@@ -1237,18 +1294,35 @@ def run_gui(data_root: Path | None = None) -> int:
             )
 
         def _participate(self) -> None:
-            if self.api is None:
+            if self.api is None or self.participation_inflight:
                 return
+            round_info = self.last_status.get("round") or {}
+            round_id = str(round_info.get("round_id") or "").strip()
+            self.participation_inflight = True
+            self.participation_round_id = round_id or None
             self.participate_button.setEnabled(False)
             self.message.setText(
                 "Participating: applying queued local learning if present, running Dᴾ reference inference, signing and submitting the Client package…"
             )
-            self._run_worker(self.api.participate, self._participated)
+            self._run_worker(
+                self.api.participate,
+                self._participated,
+                self._participation_failed,
+            )
 
         def _participated(self, payload: Any) -> None:
             self.message.setText(
                 f"Participated successfully in {payload.get('round_id', 'the current round')}."
             )
+
+        def _participation_failed(self, error: str) -> None:
+            self.participation_inflight = False
+            self.participation_round_id = None
+            self.message.setText(
+                "Participation failed. Refreshing the authoritative round state before allowing a retry."
+            )
+            QMessageBox.warning(self, APP_TITLE, error)
+            QTimer.singleShot(0, self._poll)
 
         def _maybe_prompt_learning(self, suggestions: list[dict[str, Any]]) -> None:
             if self.suggestion_dialog_open or not suggestions or self.api is None:
@@ -1420,7 +1494,13 @@ def run_gui(data_root: Path | None = None) -> int:
             event.accept()
 
     application = QApplication(sys.argv)
+    icon_path = _desktop_icon_path()
+    icon = QIcon(str(icon_path)) if icon_path is not None else QIcon()
+    if not icon.isNull():
+        application.setWindowIcon(icon)
     window = MainWindow()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
     return application.exec()
 

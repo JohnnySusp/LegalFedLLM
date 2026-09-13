@@ -58,12 +58,39 @@ def prepare_client_runtime_bundle(destination: Path) -> Path:
 
 def build_pyinstaller(*, clean: bool, appimage: bool = False) -> Path:
     name = "LegalFedLLM"
+
+    if _is_windows() and not appimage:
+        command = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--onefile",
+            "--console",
+            "--name",
+            name,
+        ]
+        if clean:
+            command.insert(4, "--clean")
+        if not WINDOWS_ICON.is_file():
+            raise RuntimeError(f"Windows icon is missing: {WINDOWS_ICON}")
+        launcher = ROOT / "desktop" / "windows_launcher.py"
+        if not launcher.is_file():
+            raise RuntimeError(f"Windows launcher is missing: {launcher}")
+        command.extend(["--icon", str(WINDOWS_ICON), str(launcher)])
+        run(command)
+        artifact = DIST / f"{name}.exe"
+        if not artifact.is_file():
+            raise RuntimeError(f"PyInstaller output is missing: {artifact}")
+        return artifact
+
+    onedir = appimage
     command = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--noconfirm",
-        "--onedir" if appimage else "--onefile",
+        "--onedir" if onedir else "--onefile",
         "--console",
         "--name",
         name,
@@ -81,10 +108,7 @@ def build_pyinstaller(*, clean: bool, appimage: bool = False) -> Path:
     else:
         for package in ("client", "coordinator", "host", "shared", "desktop", "uvicorn"):
             command.extend(["--collect-submodules", package])
-        if _is_windows():
-            if not WINDOWS_ICON.is_file():
-                raise RuntimeError(f"Windows icon is missing: {WINDOWS_ICON}")
-            command.extend(["--icon", str(WINDOWS_ICON)])
+        command.extend(["--collect-data", "huggingface_hub"])
 
     command.extend(
         [
@@ -109,8 +133,8 @@ def build_pyinstaller(*, clean: bool, appimage: bool = False) -> Path:
         run(command)
 
     suffix = ".exe" if _is_windows() else ""
-    artifact = DIST / name if appimage else DIST / f"{name}{suffix}"
-    expected = artifact / f"{name}{suffix}" if appimage else artifact
+    artifact = DIST / name if onedir else DIST / f"{name}{suffix}"
+    expected = artifact / f"{name}{suffix}" if onedir else artifact
     if not expected.is_file():
         raise RuntimeError(f"PyInstaller output is missing: {expected}")
     return artifact
