@@ -53,6 +53,33 @@ training examples remain on the Client machine.
 > privacy, production-calibrated poisoning detection, production identity
 > management, or encrypted transport/storage.
 
+## Hardware Requirements
+
+Hardware requirements depend on the selected Client and Host models, numerical
+precision, sequence length, LoRA configuration, batch size, reference-dataset
+size, and the amount of training or validation performed on the GPU. LegalFedLLM
+therefore does not define one universal VRAM or RAM minimum for every possible
+model profile.
+
+The following is a practical baseline for the small-model desktop configuration
+used during development and experimentation:
+
+| Role/resource | Baseline requirement | Experimental example |
+| --- | --- | --- |
+| Client GPU | NVIDIA CUDA-capable GPU with enough VRAM for the selected model and LoRA workload. Around 6–8 GB VRAM is a useful starting range for the small Client profiles used here. | Qwen3 1.7B was exercised on a Windows Client with about 6 GB VRAM; Granite 3.3 2B was exercised on a Linux Client with about 8 GB VRAM. |
+| Client system RAM | 16 GB or more is a sensible starting point for small Client models, especially because the constrained-GPU path can offload saved activations to system RAM. | The development configuration included a 16 GB RAM / 8 GB VRAM Linux Client. |
+| Host GPU | The Host normally needs substantially more VRAM than a Client because it may use a larger model and performs its own LoRA training and validation. | The Mistral Nemo Host experiments used an NVIDIA A40 with roughly 48 GB VRAM. |
+| Storage | Allow substantial free SSD space for Python environments, Docker images on Linux, Transformers snapshots, Ollama models, PEFT checkpoints, caches, logs, and runtime artifacts. Tens of gigabytes can be consumed even by a small-model setup. | Qwen3 1.7B, Granite 3.3 2B, Mistral Nemo, their caches, and the desktop runtimes were stored separately during testing. |
+| CPU/network | A modern multi-core x86_64 CPU and a stable network connection are sufficient for orchestration; the real training/inference path is primarily GPU-bound. | Clients reached the Coordinator through SSH forwarding while model computation remained local to each participant. |
+
+These figures are examples from the models used in the project, not fixed
+requirements of the LegalFedLLM protocol. A smaller model may run with less
+memory, while a larger model, longer sequences, different precision, or more
+aggressive training settings may require substantially more VRAM, RAM, and
+storage. The built-in Low VRAM Mode and admission checks reduce memory pressure
+for constrained Clients but do not guarantee that an arbitrary model will fit a
+particular GPU.
+
 ## Windows x64
 
 > **Windows release status:** the native portable Windows Client is implemented
@@ -66,12 +93,12 @@ a release-local `.venv`. Persistent LegalFedLLM state remains in the sibling
 design. WSL, Docker Desktop, Docker Compose and the Linux NVIDIA Container
 Toolkit are not part of the Windows Client path.
 
-The final physical proof-of-concept topology uses **Qwen3 1.7B on the Windows
-Client** and **Granite 3.3 2B on the Linux Client**, with a Mistral Nemo Host and
-normal trusted quorum 2. Earlier Windows Granite stress runs exposed hard
-platform resets under reverse-training load; the final Client memory policy and
-model placement were chosen conservatively around the available VRAM rather than
-reusing incompatible model/adaptor state.
+The physical experiments use **Qwen3 1.7B on the Windows Client** and
+**Granite 3.3 2B on the Linux Client**, with a Mistral Nemo Host and normal
+trusted quorum 2. Earlier Windows Granite stress runs exposed hard platform
+resets under reverse-training load; the current Client memory policy and
+experimental model placement were chosen conservatively around the available
+VRAM rather than reusing incompatible model/adaptor state.
 
 ### Requirements
 
@@ -1578,9 +1605,9 @@ host OpenSSH tunnel and the Docker Client consumes that already-established
 forward through an explicit external-tunnel contract.
 
 Windows uses a thin `LegalFedLLM.exe` launcher with adjacent source/runtime files,
-a release-local `.venv`, native Ollama and native AnythingLLM Desktop. The final
-proof-of-concept model placement uses Qwen3 1.7B on the constrained Windows GPU
-and Granite 3.3 2B on the larger Linux Client GPU.
+a release-local `.venv`, native Ollama and native AnythingLLM Desktop. The
+experimental model placement uses Qwen3 1.7B on the constrained Windows GPU and
+Granite 3.3 2B on the larger Linux Client GPU.
 
 Both desktop paths have been physically exercised for profile/enrollment,
 SSH/Agent startup, local-AI integration, real model participation and persistent
