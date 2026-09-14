@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -440,6 +441,8 @@ def create_app(
         try:
             yield
         finally:
+            async with app.state.ml_lock:
+                await asyncio.to_thread(client_runtime.release_serving_session)
             tunnel.stop()
 
     app = FastAPI(
@@ -457,13 +460,19 @@ def create_app(
     app.state.ml_lock = asyncio.Lock()
     app.state.training_lock = app.state.ml_lock
 
-    async def run_exclusive_ml(call, *args):
+    async def run_exclusive_ml(
+        call,
+        *args,
+        busy_detail: str = "another local ML job is already running",
+    ):
         if app.state.ml_lock.locked():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="another local ML job is already running",
+                detail=busy_detail,
             )
         async with app.state.ml_lock:
+            if call != client_runtime.generate_transformers:
+                await asyncio.to_thread(client_runtime.release_serving_session)
             return await asyncio.to_thread(call, *args)
 
     def require_client_admin_token(
@@ -986,6 +995,10 @@ def create_app(
                 client_runtime.generate_transformers,
                 messages,
                 max_new_tokens,
+                busy_detail=(
+                    "Client is performing local or federated learning; "
+                    "LOCAL inference is temporarily unavailable"
+                ),
             )
         prompt = messages[-1]["content"]
         return await client_runtime.generate(prompt, max_new_tokens)
@@ -1035,6 +1048,7 @@ def create_app(
     ) -> Any:
         if request.model not in {"legalfedllm-local", "legalfedllm-host"}:
             raise HTTPException(status_code=404, detail="unknown LegalFedLLM model")
+        logging.getLogger("uvicorn.error").info("LegalFedLLM requested model: %s", request.model)
         messages = [item.model_dump(mode="json") for item in request.messages]
         last_user = next(
             (item["content"] for item in reversed(messages) if item["role"] == "user"),

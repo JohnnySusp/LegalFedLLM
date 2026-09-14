@@ -10,10 +10,18 @@ from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from client.peft_backend import TransformersPeftTrainingBackend
+from client.peft_backend import (
+    TransformersPeftTrainingBackend, _attach_memory_callback,
+    _client_autocast, _client_trainer_class,
+)
 from shared.adapter_checkpoint import AdapterCheckpointMetadata
 from shared.alignment_profiles import resolve_alignment_profile
-from shared.answer_only import AnswerOnlyCollator
+from shared.answer_only import (
+    ANSWER_ONLY_LOSS_SEQUENCE_CHUNK_SIZE,
+    AnswerOnlyCollator,
+    bounded_causal_lm_state,
+    checkpointed_causal_lm_chunk,
+)
 from shared.client_reverse_artifact import load_client_reverse_training_artifact
 from shared.crypto import sha256_hex
 from shared.distillation_artifact import TENSOR_NAMES
@@ -32,7 +40,7 @@ from shared.tokenizer_validation import load_pinned_tokenizer
 
 
 CLIENT_QUALITY_NON_REGRESSION_TOLERANCE = 0.001
-CLIENT_REVERSE_LOSS_SEQUENCE_CHUNK_SIZE = 64
+CLIENT_REVERSE_LOSS_SEQUENCE_CHUNK_SIZE = ANSWER_ONLY_LOSS_SEQUENCE_CHUNK_SIZE
 
 
 class ReverseTrainingContract(BaseModel):
@@ -460,6 +468,51 @@ class _TrimmedClientReverseTrainingCollator:
         return collate_client_reverse_training_rows(torch, features)
 
 
+def _selective_client_chunk_sums(
+    torch: Any,
+    logits: Any,
+    labels: Any,
+    attention_mask: Any,
+    token_ids: Any,
+    probabilities: Any,
+    valid_mask: Any,
+) -> tuple[Any, Any]:
+    logits = logits.float()
+    supervised_mask = labels.ne(-100)
+    normalizer = torch.logsumexp(logits, dim=-1)
+    safe_labels = torch.where(
+        supervised_mask,
+        labels,
+        torch.zeros_like(labels),
+    )
+    selected_labels = torch.gather(
+        logits,
+        -1,
+        safe_labels.unsqueeze(-1),
+    ).squeeze(-1)
+    supervised_sum = (
+        (normalizer - selected_labels)
+        * supervised_mask.to(normalizer.dtype)
+    ).sum()
+
+    selected_sparse_logits = torch.gather(logits, -1, token_ids)
+    probabilities = probabilities.to(dtype=logits.dtype)
+    selected_sparse_log_probabilities = (
+        selected_sparse_logits - normalizer.unsqueeze(-1)
+    )
+    per_position_distillation = (
+        -probabilities
+        * selected_sparse_log_probabilities
+        * valid_mask.to(probabilities.dtype)
+    ).sum(dim=-1)
+    distillation_mask = supervised_mask & attention_mask.bool()
+    distillation_sum = (
+        per_position_distillation
+        * distillation_mask.to(per_position_distillation.dtype)
+    ).sum()
+    return supervised_sum, distillation_sum
+
+
 def selective_client_loss(
     torch: Any,
     logits: Any,
@@ -524,51 +577,20 @@ def selective_client_loss(
     shifted_sequence_length = logits.shape[1] - 1
     for start in range(0, shifted_sequence_length, sequence_chunk_size):
         end = min(start + sequence_chunk_size, shifted_sequence_length)
-        chunk_logits = logits[:, start:end, :]
-        normalizer = torch.logsumexp(chunk_logits, dim=-1)
-
-        chunk_supervised_mask = supervised_mask[:, start:end]
-        chunk_labels = shifted_labels[:, start:end]
-        safe_labels = torch.where(
-            chunk_supervised_mask,
-            chunk_labels,
-            torch.zeros_like(chunk_labels),
+        chunk_supervised, chunk_distillation = _selective_client_chunk_sums(
+            torch,
+            logits[:, start:end, :],
+            shifted_labels[:, start:end],
+            shifted_attention[:, start:end],
+            targets.token_ids[:, start:end, :],
+            targets.probabilities[:, start:end, :],
+            targets.valid_mask[:, start:end, :],
         )
-        selected_labels = torch.gather(
-            chunk_logits,
-            -1,
-            safe_labels.unsqueeze(-1),
-        ).squeeze(-1)
-        chunk_supervised = (
-            (normalizer - selected_labels)
-            * chunk_supervised_mask.to(normalizer.dtype)
-        ).sum()
         supervised_sum = (
             chunk_supervised
             if supervised_sum is None
             else supervised_sum + chunk_supervised
         )
-
-        chunk_token_ids = targets.token_ids[:, start:end, :]
-        chunk_probabilities = targets.probabilities[:, start:end, :]
-        chunk_valid_mask = targets.valid_mask[:, start:end, :]
-        selected_sparse_logits = torch.gather(
-            chunk_logits,
-            -1,
-            chunk_token_ids,
-        )
-        selected_sparse_log_probabilities = (
-            selected_sparse_logits - normalizer.unsqueeze(-1)
-        )
-        per_position_distillation = (
-            -chunk_probabilities * selected_sparse_log_probabilities
-            * chunk_valid_mask.to(chunk_probabilities.dtype)
-        ).sum(dim=-1)
-        chunk_distillation_mask = distillation_mask[:, start:end]
-        chunk_distillation = (
-            per_position_distillation
-            * chunk_distillation_mask.to(per_position_distillation.dtype)
-        ).sum()
         distillation_sum = (
             chunk_distillation
             if distillation_sum is None
@@ -586,13 +608,133 @@ def selective_client_loss(
     return 0.9 * supervised + 0.1 * distillation, supervised, distillation
 
 
+def selective_client_hidden_state_loss(
+    torch: Any,
+    model: Any,
+    inputs: dict[str, Any],
+    *,
+    sequence_chunk_size: int = CLIENT_REVERSE_LOSS_SEQUENCE_CHUNK_SIZE,
+) -> tuple[Any, Any, Any]:
+    from shared.fedmkt_core.ml.sparse_targets import (
+        SparseTargetBatch,
+        SparseTargetError,
+        validate_sparse_target_batch,
+    )
+
+    if type(sequence_chunk_size) is not int or sequence_chunk_size < 1:
+        raise ValueError(
+            "Client reverse loss sequence chunk size must be positive"
+        )
+    state = bounded_causal_lm_state(torch, model, inputs)
+    labels = inputs["labels"]
+    attention_mask = inputs["attention_mask"]
+    targets = SparseTargetBatch(
+        token_ids=inputs["sparse_target_token_ids"].long(),
+        probabilities=inputs["sparse_target_probabilities"],
+        valid_mask=inputs["sparse_target_valid_mask"].bool(),
+    )
+    validate_sparse_target_batch(
+        targets,
+        vocab_size=state.vocabulary_size,
+    )
+    if state.hidden_states.shape[:2] != targets.token_ids.shape[:2]:
+        raise SparseTargetError(
+            "Client reverse hidden states and sparse targets differ in batch or "
+            "sequence shape"
+        )
+    if state.hidden_states.device != targets.token_ids.device:
+        raise SparseTargetError(
+            "Client reverse hidden states and sparse targets must share one device"
+        )
+
+    shifted_labels = labels[..., 1:]
+    shifted_attention = attention_mask[..., 1:].bool()
+    supervised_mask = shifted_labels.ne(-100)
+    distillation_mask = supervised_mask & shifted_attention
+    supervised_positions = supervised_mask.sum()
+    distillation_positions = distillation_mask.sum()
+    if supervised_positions == 0:
+        raise SparseTargetError(
+            "answer-only supervision requires at least one supervised target token"
+        )
+    if distillation_positions == 0:
+        raise SparseTargetError(
+            "answer-only distillation requires at least one supervised target token"
+        )
+
+    def chunk_loss(
+        logits: Any,
+        chunk_labels: Any,
+        chunk_attention: Any,
+        chunk_token_ids: Any,
+        chunk_probabilities: Any,
+        chunk_valid_mask: Any,
+    ) -> tuple[Any, Any]:
+        return _selective_client_chunk_sums(
+            torch,
+            logits,
+            chunk_labels,
+            chunk_attention,
+            chunk_token_ids,
+            chunk_probabilities,
+            chunk_valid_mask,
+        )
+
+    supervised_sum = None
+    distillation_sum = None
+    active_positions = torch.nonzero(
+        supervised_mask.any(dim=0),
+        as_tuple=False,
+    ).flatten()
+    first_position = int(active_positions[0].item())
+    last_position = int(active_positions[-1].item()) + 1
+    first_chunk = (first_position // sequence_chunk_size) * sequence_chunk_size
+    for start in range(first_chunk, last_position, sequence_chunk_size):
+        end = min(start + sequence_chunk_size, last_position)
+        if not bool(supervised_mask[:, start:end].any().item()):
+            continue
+        chunk_supervised, chunk_distillation = checkpointed_causal_lm_chunk(
+            torch,
+            state,
+            state.hidden_states[:, start:end, :],
+            chunk_loss,
+            shifted_labels[:, start:end],
+            shifted_attention[:, start:end],
+            targets.token_ids[:, start:end, :],
+            targets.probabilities[:, start:end, :],
+            targets.valid_mask[:, start:end, :],
+        )
+        supervised_sum = (
+            chunk_supervised
+            if supervised_sum is None
+            else supervised_sum + chunk_supervised
+        )
+        distillation_sum = (
+            chunk_distillation
+            if distillation_sum is None
+            else distillation_sum + chunk_distillation
+        )
+
+    if supervised_sum is None or distillation_sum is None:
+        raise SparseTargetError(
+            "Client reverse loss requires at least two sequence tokens"
+        )
+    supervised = supervised_sum / supervised_positions.to(supervised_sum.dtype)
+    distillation = distillation_sum / distillation_positions.to(
+        distillation_sum.dtype
+    )
+    return 0.9 * supervised + 0.1 * distillation, supervised, distillation
+
 def _selective_client_trainer_class(transformers: Any, torch: Any) -> type:
-    class SelectiveClientTrainer(transformers.Trainer):
+    class SelectiveClientTrainer(_client_trainer_class(transformers, torch)):
         supervised_losses: list[float]
         distillation_losses: list[float]
 
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
+            # This objective averages within each micro-batch; Trainer must
+            # divide by accumulation steps instead of assuming token-sum loss.
+            self.model_accepts_loss_kwargs = False
             self.supervised_losses = []
             self.distillation_losses = []
 
@@ -604,21 +746,20 @@ def _selective_client_trainer_class(transformers: Any, torch: Any) -> type:
             num_items_in_batch: Any | None = None,
         ) -> Any:
             del num_items_in_batch
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                use_cache=False,
-            )
-            loss, supervised, distillation = selective_client_loss(
-                torch,
-                outputs.logits,
-                inputs,
-            )
+            with _client_autocast(self):
+                loss, supervised, distillation = selective_client_hidden_state_loss(
+                    torch,
+                    model,
+                    inputs,
+                )
+            self.memory_phase("loss_ready")
             self.supervised_losses.append(float(supervised.detach().float()))
             self.distillation_losses.append(
                 float(distillation.detach().float())
             )
-            return (loss, outputs) if return_outputs else loss
+            if return_outputs:
+                return loss, {"loss": loss}
+            return loss
 
     return SelectiveClientTrainer
 
@@ -706,7 +847,6 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
             frozen_checksum = self._frozen_parameter_checksum(torch, model)
             if self.execution_profile.gradient_checkpointing:
                 model.config.use_cache = False
-                model.enable_input_require_grads()
             profile = self.execution_profile
             arguments = transformers.TrainingArguments(
                 output_dir=str(output_dir),
@@ -722,6 +862,7 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 fp16=profile.precision == "float16",
                 use_cpu=profile.device == "cpu",
                 gradient_checkpointing=profile.gradient_checkpointing,
+                gradient_checkpointing_kwargs={"use_reentrant": False},
                 save_strategy="no",
                 eval_strategy="no",
                 logging_strategy="steps",
@@ -739,7 +880,10 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                 train_dataset=dataset,
                 data_collator=_TrimmedClientReverseTrainingCollator(),
             )
+            _attach_memory_callback(trainer, transformers, self.gpu_memory)
             train_output = trainer.train()
+            if self.gpu_memory is not None:
+                self.gpu_memory.phase("reverse_training_complete")
             optimizer_step_count = int(trainer.state.global_step)
             optimizer_loss = float(train_output.training_loss)
             if optimizer_step_count < 1:
@@ -962,6 +1106,8 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
     ) -> ClientValidationRecord:
         torch, transformers, peft, _ = self._dependencies()
         self._validate_device(torch)
+        if self.gpu_memory is not None:
+            self.gpu_memory.phase("reverse_validation_begin", adapter_role=adapter_role)
         transformers.set_seed(self.execution_profile.seed)
         profile = resolve_alignment_profile(
             job.manifest.alignment_profile_id_for(job.client_id)
@@ -1034,6 +1180,7 @@ class TransformersPeftReverseBackend(TransformersPeftTrainingBackend):
                     model,
                     arguments,
                     collator,
+                    sequence_chunk_size=self.knowledge_sequence_chunk_size,
                 )
                 token_ids = generated[PER_STEP_INDICES]
                 logits = generated[PER_STEP_LOGITS]

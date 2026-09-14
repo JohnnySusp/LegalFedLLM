@@ -25,6 +25,7 @@ from client.training import (
     PrivateTrainingExample,
     TrainingExecutionProfile,
     execution_profile_from_environment,
+    memory_efficient_execution_profile,
     load_private_examples,
     private_dataset_semantic_hash,
 )
@@ -181,7 +182,7 @@ class ClientRuntime:
         )
         if not self.private_dataset_id.strip():
             raise ValueError("private dataset ID must not be blank")
-        self.training_execution_profile = (
+        self.training_execution_profile = memory_efficient_execution_profile(
             training_execution_profile
             or execution_profile_from_environment(
                 self.model_profile.training_backend
@@ -2751,13 +2752,22 @@ class ClientRuntime:
             )
         from client.peft_backend import TransformersPeftTrainingBackend
 
-        backend = TransformersPeftTrainingBackend(
-            data_dir=self.store.root,
-            model_profile=self.model_profile,
-            execution_profile=self.training_execution_profile,
-            knowledge_batch_size=self.knowledge_batch_size,
-        )
+        backend = getattr(self, "_serving_backend", None)
+        if backend is None:
+            backend = TransformersPeftTrainingBackend(
+                data_dir=self.store.root,
+                model_profile=self.model_profile,
+                execution_profile=self.training_execution_profile,
+                knowledge_batch_size=self.knowledge_batch_size,
+            )
+            self._serving_backend = backend
         return backend.generate_text(messages, max_new_tokens)
+
+    def release_serving_session(self) -> None:
+        backend = getattr(self, "_serving_backend", None)
+        if backend is not None:
+            backend.release_serving_session()
+            self._serving_backend = None
 
     async def generate(self, prompt: str, max_new_tokens: int) -> str:
         if self.model_profile.serving_backend == "transformers":

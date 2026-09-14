@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,7 +84,7 @@ class PortableDesktopProfileTests(unittest.TestCase):
 
             self.assertEqual(
                 manager.desktop_settings(),
-                {"constant_learning": True, "debug_mode": False, "low_vram_mode": False},
+                {"constant_learning": True, "debug_mode": False, "low_vram_mode": True},
             )
             manager.set_desktop_setting("constant_learning", False)
             manager.set_desktop_setting("debug_mode", True)
@@ -110,7 +111,7 @@ class PortableDesktopProfileTests(unittest.TestCase):
 
             self.assertEqual(
                 settings,
-                {"constant_learning": True, "debug_mode": False, "low_vram_mode": False},
+                {"constant_learning": True, "debug_mode": False, "low_vram_mode": True},
             )
             self.assertEqual(manager.desktop_settings(), settings)
             self.assertEqual(manager.active_profile_id(), profile.profile_id)
@@ -149,6 +150,7 @@ class PortableDesktopProfileTests(unittest.TestCase):
             manager = PortableProfileManager(directory)
             profile = self._create(manager, "First")
 
+            manager.set_desktop_setting("low_vram_mode", False)
             inherited = {
                 "CLIENT_GRADIENT_CHECKPOINTING": "true",
                 "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE": "128",
@@ -156,19 +158,22 @@ class PortableDesktopProfileTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, inherited, clear=False):
                 normal_env = manager.agent_environment(profile)
-            self.assertEqual(normal_env["CLIENT_GRADIENT_CHECKPOINTING"], "false")
-            self.assertEqual(normal_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "0")
+            self.assertEqual(normal_env["CLIENT_GRADIENT_CHECKPOINTING"], "true")
+            self.assertEqual(normal_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "64")
             self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", normal_env)
 
             manager.set_desktop_setting("low_vram_mode", True)
             with mock.patch.dict(os.environ, inherited, clear=False):
                 low_vram_env = manager.agent_environment(profile)
             self.assertEqual(low_vram_env["CLIENT_GRADIENT_CHECKPOINTING"], "true")
-            self.assertEqual(low_vram_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "64")
-            self.assertEqual(
-                low_vram_env["PYTORCH_CUDA_ALLOC_CONF"],
-                "expandable_segments:True",
-            )
+            self.assertEqual(low_vram_env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"], "32")
+            if sys.platform == "win32":
+                self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", low_vram_env)
+            else:
+                self.assertEqual(
+                    low_vram_env["PYTORCH_CUDA_ALLOC_CONF"],
+                    "expandable_segments:True",
+                )
 
     def test_unknown_desktop_setting_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

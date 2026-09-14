@@ -20,7 +20,7 @@ from shared.protocol import utc_text
 DEFAULT_DESKTOP_SETTINGS = {
     "constant_learning": True,
     "debug_mode": False,
-    "low_vram_mode": False,
+    "low_vram_mode": True,
 }
 
 
@@ -164,9 +164,11 @@ class PortableProfileManager:
             return {}
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read desktop settings: {self.state_path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid desktop settings: {self.state_path}")
+        return payload
 
     def active_profile_id(self) -> str | None:
         value = self._read_state().get("active_profile_id")
@@ -218,6 +220,17 @@ class PortableProfileManager:
         )
         self._write_json(self.state_path, state)
 
+    def reverse_preview_rejected(self, profile_id: str, round_id: str) -> bool:
+        return round_id in self._read_state().get("rejected_reverse_previews", {}).get(profile_id, [])
+
+    def reject_reverse_preview(self, profile_id: str, round_id: str) -> None:
+        state = self._read_state()
+        rejected = state.setdefault("rejected_reverse_previews", {})
+        rounds = rejected.setdefault(profile_id, [])
+        if round_id not in rounds:
+            rounds.append(round_id)
+        self._write_json(self.state_path, state)
+
     def admin_token(self, profile_id: str) -> str:
         values = self._read_env(self.profile_paths(profile_id).env_file)
         token = values.get("CLIENT_ADMIN_TOKEN", "").strip()
@@ -258,13 +271,13 @@ class PortableProfileManager:
                 "CLIENT_AGENT_PORT": str(profile.agent_port),
             }
         )
-        if self.desktop_settings()["low_vram_mode"]:
-            env["CLIENT_GRADIENT_CHECKPOINTING"] = "true"
-            env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"] = "64"
+        env["CLIENT_GRADIENT_CHECKPOINTING"] = "true"
+        env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"] = (
+            "32" if self.desktop_settings()["low_vram_mode"] else "64"
+        )
+        if self.desktop_settings()["low_vram_mode"] and sys.platform != "win32":
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         else:
-            env["CLIENT_GRADIENT_CHECKPOINTING"] = "false"
-            env["CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE"] = "0"
             env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         if enrollment_token:
             env["REGISTRATION_TOKEN"] = enrollment_token
@@ -307,11 +320,17 @@ class PortableProfileManager:
     def _write_json(path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(path)
+        if sys.platform != "win32":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
 def portable_install_root() -> Path:

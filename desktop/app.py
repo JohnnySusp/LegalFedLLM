@@ -24,7 +24,7 @@ from desktop.local_ai import (
     ANYTHINGLLM_MAX_TOKENS,
     LocalAiStack,
 )
-from desktop.profiles import DesktopProfile, PortableProfileManager
+from desktop.profiles import DEFAULT_DESKTOP_SETTINGS, DesktopProfile, PortableProfileManager
 
 
 APP_TITLE = "LegalFedLLM Client"
@@ -245,6 +245,10 @@ def _participation_inflight_resolved(
     )
 
 
+def _low_vram_restart_required(effective: bool, requested: bool) -> bool:
+    return effective != requested
+
+
 def _desktop_icon_path(
     directory: Path | None = None,
     *,
@@ -292,6 +296,10 @@ def _enrollment_ready(
         return False
     tunnel = health.get("tunnel") or {}
     return bool(tunnel.get("forward_reachable"))
+
+
+def _host_preview_terminal_failure(error: str) -> bool:
+    return "HTTP 409" in error and "Host package timestamp is outside the allowed skew" in error
 
 
 def _host_preview_should_start(
@@ -583,7 +591,7 @@ def stop_diagnostics(processes: list[subprocess.Popen[Any]]) -> None:
 
 def run_gui(data_root: Path | None = None) -> int:
     from PySide6.QtCore import QThread, QTimer, Signal
-    from PySide6.QtGui import QAction, QIcon
+    from PySide6.QtGui import QAction, QFont, QIcon
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -604,6 +612,14 @@ def run_gui(data_root: Path | None = None) -> int:
         QVBoxLayout,
         QWidget,
     )
+
+
+    def _set_widget_point_font(widget, point_size: float, *, demi_bold: bool = False) -> None:
+        font = widget.font()
+        font.setPointSizeF(point_size)
+        if demi_bold:
+            font.setWeight(QFont.Weight.DemiBold)
+        widget.setFont(font)
 
     class Worker(QThread):
         success = Signal(object)
@@ -746,7 +762,7 @@ def run_gui(data_root: Path | None = None) -> int:
             )
             row = QHBoxLayout()
             accept = QPushButton("Learn from Host")
-            decline = QPushButton("Not now")
+            decline = QPushButton("Decline for this round")
             accept.clicked.connect(lambda: self._finish(True))
             decline.clicked.connect(lambda: self._finish(False))
             row.addWidget(accept)
@@ -782,8 +798,10 @@ def run_gui(data_root: Path | None = None) -> int:
             self.suggestion_resolution_inflight: set[str] = set()
             self.previewed_rounds: set[str] = set()
             self.host_preview_inflight: set[str] = set()
+            self.host_preview_retry_at: dict[str, float] = {}
             self.participation_inflight = False
             self.participation_round_id: str | None = None
+            self._effective_low_vram_mode = self.manager.desktop_settings()["low_vram_mode"]
             self._build_ui()
             self._profile_menu()
             self._settings_menu()
@@ -799,21 +817,21 @@ def run_gui(data_root: Path | None = None) -> int:
             layout = QVBoxLayout(central)
             top = QHBoxLayout()
             title = QLabel("LegalFedLLM Client")
-            title.setStyleSheet("font-size: 20px; font-weight: 600;")
+            _set_widget_point_font(title, 15.0, demi_bold=True)
             top.addWidget(title)
             top.addStretch(1)
             self.settings_button = QToolButton()
             self.settings_button.setText("⚙")
             self.settings_button.setToolTip("Options")
             self.settings_button.setFixedSize(50, 50)
-            self.settings_button.setStyleSheet("font-size: 18px;")
+            _set_widget_point_font(self.settings_button, 13.5)
             self.settings_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             top.addWidget(self.settings_button)
             self.profile_button = QToolButton()
             self.profile_button.setText("☰")
             self.profile_button.setToolTip("Profiles")
             self.profile_button.setFixedSize(50, 50)
-            self.profile_button.setStyleSheet("font-size: 18px;")
+            _set_widget_point_font(self.profile_button, 13.5)
             self.profile_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             top.addWidget(self.profile_button)
             layout.addLayout(top)
@@ -847,7 +865,7 @@ def run_gui(data_root: Path | None = None) -> int:
 
             self.participate_button = QPushButton("Participate in the current federated round")
             self.participate_button.setMinimumHeight(90)
-            self.participate_button.setStyleSheet("font-size: 17px; font-weight: 600;")
+            _set_widget_point_font(self.participate_button, 12.75, demi_bold=True)
             self.participate_button.clicked.connect(self._participate)
             self.participate_button.setEnabled(False)
             layout.addWidget(self.participate_button)
@@ -934,6 +952,18 @@ def run_gui(data_root: Path | None = None) -> int:
                 self.diagnostics_launched = False
                 self.message.setText("Debug Mode disabled. Extra diagnostic terminals are closed when possible.")
 
+        def _confirm_low_vram_restart(self) -> bool:
+            answer = QMessageBox.question(
+                self,
+                "Low VRAM Mode",
+                "This change will be saved now but will not affect the running Client Agent. "
+                "Restart LegalFedLLM manually when convenient to apply it. LegalFedLLM will "
+                "remain open until you close it yourself. Save this change?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+
         def _set_low_vram_mode(self, enabled: bool) -> None:
             previous = self.manager.desktop_settings()["low_vram_mode"]
 
@@ -941,48 +971,52 @@ def run_gui(data_root: Path | None = None) -> int:
                 answer = QMessageBox.warning(
                     self,
                     "Low VRAM Mode",
-                    "This setting reduces peak GPU-memory pressure during Client training, "
-                    "reference knowledge generation, and reverse distillation by enabling gradient "
-                    "checkpointing, 64-token causal sequence streaming, and PyTorch expandable "
-                    "CUDA memory segments.\n\n"
+                    "CUDA Clients always use gradient checkpointing, bounded training losses, "
+                    "a GPU memory budget, and streamed reference/validation inference. "
+                    "Low VRAM Mode further reduces reference/validation chunks from 64 to 32 "
+                    "tokens. On Linux it also requests expandable CUDA memory segments.\n\n"
                     "These memory-saving paths trade memory usage for additional computation. "
                     "Training and knowledge generation may take longer and keep the GPU under "
                     "sustained load for longer, which can increase GPU temperatures, power usage, "
                     "and fan noise. Enable this mode when you encounter CUDA out-of-memory errors.\n\n"
-                    "This will automatically restart the application. Are you sure you want to proceed?",
+                    "This change will be saved now. Restart LegalFedLLM manually when convenient "
+                    "to apply it; the running Client Agent will keep its current memory settings "
+                    "until then. LegalFedLLM will remain open. Save this change?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
+                confirmed = answer == QMessageBox.StandardButton.Yes
             else:
-                answer = QMessageBox.question(
-                    self,
-                    "Low VRAM Mode",
-                    "This will automatically restart the application. Are you sure you want to proceed?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
+                confirmed = self._confirm_low_vram_restart()
 
-            if answer != QMessageBox.StandardButton.Yes:
+            if not confirmed:
                 self.low_vram_mode_action.blockSignals(True)
                 self.low_vram_mode_action.setChecked(previous)
                 self.low_vram_mode_action.blockSignals(False)
                 return
 
             self.manager.set_desktop_setting("low_vram_mode", enabled)
-            self.message.setText(
-                f"Low VRAM Mode {'enabled' if enabled else 'disabled'}. Restarting LegalFedLLM…"
-            )
-            QTimer.singleShot(0, self._restart_application)
-
-        def _restart_application(self) -> None:
-            self.timer.stop()
-            stop_diagnostics(self.diagnostic_processes)
-            self.diagnostics_launched = False
-            self.controller.stop()
-            command = _desktop_restart_command(self.manager.data_root)
-            os.execvpe(command[0], command, _desktop_restart_environment())
+            if _low_vram_restart_required(self._effective_low_vram_mode, enabled):
+                self.message.setText(
+                    f"Low VRAM Mode {'enabled' if enabled else 'disabled'} for the next launch. "
+                    "Restart LegalFedLLM manually to apply the change; the current Client remains "
+                    "on its existing memory settings until then."
+                )
+            else:
+                self.message.setText(
+                    f"Low VRAM Mode {'enabled' if enabled else 'disabled'}. "
+                    "The running Client already matches this setting."
+                )
 
         def _reset_settings_defaults(self) -> None:
+            default_low_vram = bool(DEFAULT_DESKTOP_SETTINGS["low_vram_mode"])
+            restart_required = _low_vram_restart_required(
+                self._effective_low_vram_mode,
+                default_low_vram,
+            )
+            if restart_required and not self._confirm_low_vram_restart():
+                return
+
             settings = self.manager.reset_desktop_settings()
             for action, key in (
                 (self.constant_learning_action, "constant_learning"),
@@ -994,9 +1028,15 @@ def run_gui(data_root: Path | None = None) -> int:
                 action.blockSignals(False)
             stop_diagnostics(self.diagnostic_processes)
             self.diagnostics_launched = False
+            if restart_required:
+                self.message.setText(
+                    "Settings reset to defaults: Constant Learning on, Debug Mode off, Low VRAM "
+                    "Mode on. Restart LegalFedLLM manually to apply the Low VRAM change; the "
+                    "current Client remains on its existing memory settings until then."
+                )
+                return
             self.message.setText(
-                "Settings reset to defaults: Constant Learning on, Debug Mode off, Low VRAM Mode off. "
-                "Restart the Client Agent/LegalFedLLM if Low VRAM Mode changed."
+                "Settings reset to defaults: Constant Learning on, Debug Mode off, Low VRAM Mode on."
             )
 
         def _create_profile(self) -> None:
@@ -1043,6 +1083,7 @@ def run_gui(data_root: Path | None = None) -> int:
             self.anythingllm_browser_attempted = False
             self.suggestion_resolution_inflight.clear()
             self.previewed_rounds.clear()
+            self.host_preview_retry_at.clear()
             self.host_preview_inflight.clear()
             self.participation_inflight = False
             self.participation_round_id = None
@@ -1385,6 +1426,10 @@ def run_gui(data_root: Path | None = None) -> int:
             client_state = status.get("client_state") or {}
             if client_state.get("last_completed_round") == round_id:
                 return
+            if self.manager.reverse_preview_rejected(self.profile.profile_id, round_id):
+                return
+            if time.monotonic() < self.host_preview_retry_at.get(round_id, 0):
+                return
             if not _host_preview_should_start(
                 round_id,
                 self.previewed_rounds,
@@ -1406,10 +1451,14 @@ def run_gui(data_root: Path | None = None) -> int:
                 self.host_preview_inflight,
                 succeeded=False,
             )
-            self.message.setText(
-                "Host reverse-knowledge preview failed and remains retryable for this round."
-            )
-            self._show_error(error)
+            if _host_preview_terminal_failure(error):
+                self.manager.reject_reverse_preview(self.profile.profile_id, round_id)
+                self.previewed_rounds.add(round_id)
+                self.message.setText("Reverse learning skipped for this round: the Host package is stale.")
+                self._show_error(error)
+            else:
+                self.host_preview_retry_at[round_id] = time.monotonic() + 60
+                self.message.setText(f"Host preview failed; retrying in 60 seconds. {error}")
 
         def _host_preview_ready(self, round_id: str, payload: dict[str, Any]) -> None:
             _host_preview_finished(

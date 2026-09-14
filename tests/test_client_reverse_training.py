@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from pydantic import ValidationError
 from unittest import mock
@@ -16,10 +17,11 @@ from client.reverse_training import (
     ClientValidationRecord,
     ClientValidationSampleMetric,
     collate_client_reverse_training_rows,
+    selective_client_hidden_state_loss,
     selective_client_loss,
 )
 from client.runtime import ClientRuntime
-from client.training import TrainingExecutionProfile
+from client.training import TrainingExecutionProfile, memory_efficient_execution_profile
 from shared.crypto import Ed25519Identity, sha256_hex
 from shared.protocol import (
     ClientReverseTrainingArtifactDescriptor,
@@ -64,13 +66,13 @@ def reverse_fixture(
     base_parent: bool = False,
 ):
     profile = pinned_client_profile(QWEN_PROFILE_ID)
-    execution = TrainingExecutionProfile(
+    execution = memory_efficient_execution_profile(TrainingExecutionProfile(
         backend="transformers",
         device="cuda",
         precision="bfloat16",
         micro_batch_size=1,
         gradient_accumulation_steps=1,
-    )
+    ))
     samples = [
         ReferenceSample(
             schema_version=1,
@@ -593,6 +595,147 @@ class ClientReverseLossTests(unittest.TestCase):
 
         self.assertEqual(sequence_widths, [3, 3, 1])
         self.assertLessEqual(max(sequence_widths), 3)
+
+    def test_hidden_state_reverse_loss_matches_full_logits_and_bounds_projection(
+        self,
+    ) -> None:
+        import torch
+
+        class TinyDecoder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding = torch.nn.Embedding(17, 6)
+                self.adapter = torch.nn.Linear(6, 6, bias=False)
+
+            def forward(self, input_ids, attention_mask, use_cache=False):
+                del attention_mask, use_cache
+                hidden = self.adapter(self.embedding(input_ids))
+                return SimpleNamespace(last_hidden_state=hidden)
+
+        class TinyCausalLM(torch.nn.Module):
+            def __init__(self, *, model_type: str, logits_scaling: float = 1.0):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    model_type=model_type,
+                    vocab_size=17,
+                    logits_scaling=logits_scaling,
+                )
+                self.model = TinyDecoder()
+                self.lm_head = torch.nn.Linear(6, 17, bias=False)
+                for parameter in self.embedding_parameters():
+                    parameter.requires_grad = False
+                self.model.adapter.weight.requires_grad = True
+
+            def embedding_parameters(self):
+                yield from self.model.embedding.parameters()
+                yield from self.lm_head.parameters()
+
+            def get_output_embeddings(self):
+                return self.lm_head
+
+        class TinyPeftWrapper(torch.nn.Module):
+            def __init__(self, base_model: TinyCausalLM):
+                super().__init__()
+                self.base_model = base_model
+
+            def get_base_model(self):
+                return self.base_model
+
+            def forward(self, *args, **kwargs):
+                raise AssertionError(
+                    "reverse training must not call full CausalLM forward"
+                )
+
+        torch.manual_seed(17)
+        oracle = TinyCausalLM(model_type="granite", logits_scaling=2.0)
+        bounded = TinyCausalLM(model_type="granite", logits_scaling=2.0)
+        bounded.load_state_dict(oracle.state_dict())
+        oracle_wrapper = TinyPeftWrapper(oracle)
+        bounded_wrapper = TinyPeftWrapper(bounded)
+        inputs = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+            "labels": torch.tensor([[-100, -100, 3, 4, 5, 6]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 6), dtype=torch.long),
+            "sparse_target_token_ids": torch.tensor(
+                [[[1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7]]],
+                dtype=torch.long,
+            ),
+            "sparse_target_probabilities": torch.tensor(
+                [[[0.7, 0.3]] * 6], dtype=torch.float32
+            ),
+            "sparse_target_valid_mask": torch.ones((1, 6, 2), dtype=torch.bool),
+        }
+
+        oracle_hidden = oracle.model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            use_cache=False,
+        ).last_hidden_state
+        oracle_logits = oracle.lm_head(oracle_hidden) / oracle.config.logits_scaling
+        oracle_combined, oracle_supervised, oracle_distillation = (
+            selective_client_loss(
+                torch,
+                oracle_logits,
+                inputs,
+                sequence_chunk_size=2,
+            )
+        )
+        oracle_combined.backward()
+        oracle_gradient = oracle.model.adapter.weight.grad.detach().clone()
+
+        projection_widths: list[int] = []
+        original_forward = bounded.lm_head.forward
+
+        def bounded_forward(hidden_states):
+            projection_widths.append(int(hidden_states.shape[1]))
+            return original_forward(hidden_states)
+
+        bounded.lm_head.forward = bounded_forward
+        combined, supervised, distillation = selective_client_hidden_state_loss(
+            torch,
+            bounded_wrapper,
+            inputs,
+            sequence_chunk_size=2,
+        )
+        combined.backward()
+
+        self.assertTrue(torch.allclose(supervised, oracle_supervised, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(distillation, oracle_distillation, atol=1e-6)
+        )
+        self.assertTrue(torch.allclose(combined, oracle_combined, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(
+                bounded.model.adapter.weight.grad,
+                oracle_gradient,
+                atol=1e-6,
+            )
+        )
+        self.assertTrue(projection_widths)
+        self.assertLessEqual(max(projection_widths), 2)
+
+    def test_hidden_state_reverse_loss_rejects_unpinned_model_type(self) -> None:
+        import torch
+
+        model = mock.Mock()
+        model.get_base_model.return_value = SimpleNamespace(
+            config=SimpleNamespace(model_type="other")
+        )
+        inputs = {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "labels": torch.tensor([[-100, 2]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 2), dtype=torch.long),
+            "sparse_target_token_ids": torch.zeros((1, 2, 1), dtype=torch.long),
+            "sparse_target_probabilities": torch.ones(
+                (1, 2, 1), dtype=torch.float32
+            ),
+            "sparse_target_valid_mask": torch.ones(
+                (1, 2, 1), dtype=torch.bool
+            ),
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "only pinned Qwen3 and Granite"):
+            selective_client_hidden_state_loss(torch, model, inputs)
 
 
 class ClientReverseRuntimeTests(unittest.TestCase):

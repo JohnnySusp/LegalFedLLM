@@ -89,7 +89,7 @@ class DesktopClientDockerTests(unittest.TestCase):
         )
         compose_text = compose_path.read_text(encoding="utf-8")
         self.assertIn(
-            "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE: ${CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE:-0}",
+            "CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE: ${CLIENT_KNOWLEDGE_SEQUENCE_CHUNK_SIZE:-64}",
             compose_text,
         )
 

@@ -11,42 +11,36 @@ a common reference dataset: retained token IDs and logits, answer-token loss
 evidence, model/tokenizer identities, dataset identities, hashes, signatures,
 and related provenance.
 
-The real split-machine topology currently exercised by the repository is:
+The topology below shows the model combination used in the project's physical
+experiments. The same models are also used throughout this README as examples
+of a heterogeneous LegalFedLLM deployment:
 
 ```text
-local machine                                      remote NVIDIA A40 container
-
-private Client JSONL
-      ↓
-Qwen3 1.7B + PEFT LoRA
-      ↓
-D^P inference
-      ↓
-signed Client Knowledge Package
-      ───────────────────────────────────────────→ Coordinator
-                                                    ↓
-                                            verification + safety
-                                                    ↓
-                                         Qwen ↔ Nemo DTW alignment
-                                                    ↓
-                                           DualMinCE selection
-                                                    ↓
-                                         Mistral Nemo Host LoRA
-                                                    ↓
-                                         hidden D^V validation
-                                                    ↓
-                                        promote or roll back Host
-                                                    ↓
-                                      signed Host Knowledge Package
-      ←─────────────────────────────────────────────┘
-      ↓
-automatic Client sync
-      ↓
-Host → Qwen reverse alignment / selective distillation
-      ↓
-Qwen candidate held-out quality gate
-      ↓
-promote, reject, or discard stale candidate
+Windows Client                         Linux Client
+Qwen3 1.7B + PEFT LoRA                Granite 3.3 2B + PEFT LoRA
+private local data                     private local data
+        │                                      │
+        ├──── signed Client Knowledge Package ─┤
+        │                                      │
+        └──────────────────┬───────────────────┘
+                           ↓
+                     Coordinator
+                           ↓
+              verification + safety/trust
+                           ↓
+       Client-specific DTW tokenizer alignment
+                           ↓
+                  DualMinCE selection
+                           ↓
+             Mistral Nemo Host + PEFT LoRA
+                           ↓
+                  hidden D^V validation
+                           ↓
+                 promote or roll back
+                           ↓
+              signed Host Knowledge Package
+                     ↙             ↘
+          Client-owned reverse alignment/distillation
 ```
 
 No Client LoRA tensor is sent to the Coordinator or Host. Raw private Client
@@ -54,29 +48,37 @@ training examples remain on the Client machine.
 
 > **Research boundary:** LegalFedLLM is a thesis proof of concept, not a
 > production federated-learning platform. The repository contains real-model
-> training and heterogeneous knowledge-transfer paths, but it does not claim
-> formal differential privacy, production-calibrated poisoning detection,
-> production identity management, or encrypted transport/storage.
+> training, heterogeneous multi-Client knowledge transfer, desktop Clients and
+> Host/Coordinator orchestration, but it does not claim formal differential
+> privacy, production-calibrated poisoning detection, production identity
+> management, or encrypted transport/storage.
 
 ## Windows x64
 
-> **Windows release status:** the native portable Windows Client is still under
-> development. The requirements below describe the intended initial **Windows
-> x64** target and should be treated as provisional until the native Client is
-> implemented and accepted on real Windows hardware. The Installation, Using
-> LegalFedLLM, and Uninstallation subsections are intentionally left as
-> placeholders for that release.
+> **Windows release status:** the native portable Windows Client is implemented
+> as a thin `LegalFedLLM.exe` launcher with the application source/runtime beside
+> it. The Windows desktop path has been exercised on real x64 hardware with the
+> Qwen3 1.7B Client in the heterogeneous experimental topology described above.
 
-The intended Windows distribution is a portable `LegalFedLLM.exe` with
-persistent state stored in a sibling `LegalFedLLM-data\` directory. The current
-design direction does **not** require WSL, Docker Desktop, Docker Compose, or the
-Linux NVIDIA Container Toolkit for the Windows Client.
+The Windows release requires installed Python 3.14 x64 and bootstraps or reuses
+a release-local `.venv`. Persistent LegalFedLLM state remains in the sibling
+`LegalFedLLM-data\` directory. This supersedes the earlier self-contained EXE
+design. WSL, Docker Desktop, Docker Compose and the Linux NVIDIA Container
+Toolkit are not part of the Windows Client path.
+
+The final physical proof-of-concept topology uses **Qwen3 1.7B on the Windows
+Client** and **Granite 3.3 2B on the Linux Client**, with a Mistral Nemo Host and
+normal trusted quorum 2. Earlier Windows Granite stress runs exposed hard
+platform resets under reverse-training load; the final Client memory policy and
+model placement were chosen conservatively around the available VRAM rather than
+reusing incompatible model/adaptor state.
 
 ### Requirements
 
 | Requirement | Why LegalFedLLM needs it | Quick check | Official installation/help |
 | --- | --- | --- | --- |
 | NVIDIA GPU + working Windows driver | Required by the current real Qwen/Granite Client training path | `nvidia-smi` | [NVIDIA Drivers](https://www.nvidia.com/en-us/drivers/) |
+| Python 3.14 x64 | Required by the thin Windows launcher's local environment bootstrap | `py -3.14 --version` | [Python for Windows](https://www.python.org/downloads/windows/) |
 | OpenSSH Client | Used for the Client-to-Host SSH connection/tunnel | `ssh -V` | [Microsoft OpenSSH for Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) |
 | Ollama for Windows | Native local-AI/compatibility serving component | `ollama --version` | [Ollama for Windows](https://ollama.com/download/windows) |
 | AnythingLLM Desktop for Windows | Native user-facing local RAG/application layer | Check **Settings → Apps → Installed apps**, or launch AnythingLLM | [AnythingLLM Download](https://anythingllm.com/download) |
@@ -105,10 +107,10 @@ page:
 
 <https://www.nvidia.com/en-us/drivers/>
 
-The final Windows Client acceptance tests will determine whether any additional
-runtime component must be documented. Do not install the full CUDA Toolkit
-merely because LegalFedLLM uses CUDA-capable PyTorch unless the accepted Windows
-runtime later requires it explicitly.
+The accepted Windows runtime uses the CUDA-capable PyTorch environment verified
+by the release bootstrap. Do not install the full CUDA Toolkit merely because
+LegalFedLLM uses CUDA-capable PyTorch unless a later runtime explicitly requires
+it.
 
 #### OpenSSH Client
 
@@ -236,18 +238,306 @@ validation, and `LOCAL` inference.
 
 ### Installation
 
-*To be completed after the native portable Windows Client is implemented and
-accepted.*
+The Windows release is distributed as a **ZIP archive**, not as a standalone
+`LegalFedLLM.exe`. The executable is a thin launcher and must remain beside the
+release source/runtime files that it starts.
+
+A normal extracted release looks approximately like this:
+
+```text
+LegalFedLLM-Windows-x64\
+├── LegalFedLLM.exe
+├── client\
+├── desktop\
+├── legalfed-ai\
+├── scripts\
+├── shared\
+├── requirements.txt
+└── requirements-desktop.txt
+```
+
+The release archive does **not** include the machine-specific runtime
+environment or persistent Client state. They are created beside the release
+payload on first use:
+
+```text
+LegalFedLLM-Windows-x64\
+├── LegalFedLLM.exe
+├── .venv\                 ← release-local Python environment
+├── LegalFedLLM-data\      ← persistent profiles, adapters, caches and logs
+└── ...
+```
+
+#### Installing the portable release
+
+1. Install and verify the requirements listed above, especially Python 3.14 x64,
+   the NVIDIA driver, OpenSSH Client, Ollama for Windows, and AnythingLLM
+   Desktop.
+2. Download `LegalFedLLM-Windows-x64.zip` from the project's
+   [GitHub Releases](https://github.com/JohnnySusp/LegalFedLLM/releases) page.
+3. If the release publishes a SHA-256 checksum, verify the downloaded archive
+   against that checksum before extracting it.
+4. Extract the **entire archive** into a stable writable directory, for example:
+
+```text
+C:\Users\<you>\Applications\LegalFedLLM\
+```
+
+Do not run `LegalFedLLM.exe` from inside the ZIP, and do not copy the EXE by
+itself to another directory. The launcher expects the bundled LegalFedLLM source
+and setup files beside it.
+
+Start LegalFedLLM by double-clicking:
+
+```text
+LegalFedLLM.exe
+```
+
+On first start the launcher:
+
+```text
+checks for Python 3.14 x64
+        ↓
+creates or reuses .venv\
+        ↓
+installs/verifies the required CUDA-capable PyTorch and pinned dependencies
+        ↓
+verifies the Windows runtime
+        ↓
+starts the PySide6 desktop Client
+```
+
+The first start therefore needs Internet access for Python packages unless the
+required packages are already available in the local package cache. It can take
+substantially longer than later launches because the release-local environment
+contains the real Transformers/PEFT/PyTorch Client runtime.
+
+`LegalFedLLM-data\` is created beside the executable and is the persistent
+portable state directory. It contains saved profiles, Client identities,
+enrollment state, adapters/checkpoints, local-learning state, logs, reference
+data, and the release-local Hugging Face model/tokenizer cache.
+
+The native Ollama and AnythingLLM installations remain separate Windows
+applications. Their own application/model data is not stored inside
+`LegalFedLLM-data\`.
+
+#### Updating an existing Windows release
+
+Close LegalFedLLM before replacing release files.
+
+A release update may replace the launcher and bundled application payload, but
+normally preserve:
+
+```text
+.venv\
+LegalFedLLM-data\
+```
+
+`LegalFedLLM-data\` is the important durable state boundary. Back it up before a
+manual refresh if the saved Client identities, adapters, or downloaded models
+matter.
+
+Because the launcher verifies its release-local environment on startup, a newer
+release can update the dependency set in `.venv\` when required. Do not copy an
+old `.venv\` into an unrelated clean installation.
 
 ### Using LegalFedLLM
 
-*To be completed after the native portable Windows Client is implemented and
-accepted.*
+#### Starting the Windows Client
+
+Start the application by double-clicking `LegalFedLLM.exe` in the extracted
+release directory.
+
+LegalFedLLM opens a launch terminal as part of the Windows workflow. Keep that
+terminal open while the Client is running. OpenSSH asks for the Host SSH
+password in that terminal; LegalFedLLM does not collect or store the SSH
+password.
+
+A saved profile still needs the SSH password whenever a new tunnel is opened,
+but it does not need another enrollment token after successful registration.
+
+#### First profile and enrollment
+
+Create a Client profile from the GUI and provide:
+
+- a profile name;
+- the Qwen or Granite Client model profile;
+- the Host SSH target;
+- the Host SSH port;
+- the local Coordinator-forward port;
+- the local Client Agent port; and
+- a fresh one-time enrollment token issued by the Host/Coordinator.
+
+Each profile is an independent Client identity. It owns its own Client ID,
+Ed25519 identity, enrollment state, adapter/checkpoint state, local-learning
+queue, and logs.
+
+A successful registration consumes the enrollment token. Do not reuse an old
+profile's adapter state for a different model, and do not reuse one enrollment
+token for multiple profiles.
+
+Downloaded Transformers model/tokenizer files are shared between profiles
+through:
+
+```text
+LegalFedLLM-data\models\huggingface\
+```
+
+#### Ollama and AnythingLLM
+
+Windows uses the **native** Ollama and AnythingLLM Desktop applications; Docker
+Desktop and WSL are not part of the Windows Client path.
+
+When a profile becomes active, LegalFedLLM checks that its expected Ollama
+compatibility model is installed. LegalFedLLM does not silently download a
+missing Ollama model. Install the model explicitly if required:
+
+```powershell
+# Qwen Client profile
+ollama pull qwen3:1.7b
+
+# Granite Client profile
+ollama pull granite3.3:2b
+```
+
+The Ollama copy is separate from the pinned Transformers/PEFT model used for
+federated training and `LOCAL` inference.
+
+After the Client Agent is healthy, LegalFedLLM detects or launches AnythingLLM
+Desktop and configures its reserved Generic OpenAI connection for the active
+LegalFedLLM profile. AnythingLLM owns the user-facing chat/RAG experience;
+LegalFedLLM owns federation, model learning, Client identity, and the
+`legalfedllm-local` / `legalfedllm-host` model boundary.
+
+AnythingLLM can take additional time to initialize on first launch. Its local
+backend normally listens on:
+
+```text
+http://127.0.0.1:3001/
+```
+
+#### Normal federation use
+
+The main GUI action is **Participate in the current federated round**. It becomes
+available only when the active Client is connected, compatible, selected for a
+collecting round, and has not already participated.
+
+Before participating, verify that:
+
+- the GUI shows the intended saved profile and model;
+- the Coordinator connection is healthy;
+- the displayed round is the round you intend to join; and
+- the required Ollama compatibility model is installed.
+
+If queued local learning exists, LegalFedLLM applies it according to the active
+desktop settings before creating the Client Knowledge Package. When a completed
+round contains usable Host-to-Client teaching samples, reverse learning requires
+the Client-side consent/validation path before any candidate is adopted.
+
+The global Options menu includes:
+
+- **Constant Learning** — enabled by default; LOCAL interactions enter the
+  one-use local-learning queue automatically;
+- **Low VRAM Mode** — enabled by default. CUDA Clients always retain the baseline
+  memory protections; Low VRAM Mode further reduces reference/validation chunks
+  from 64 to 32 tokens and requests expandable CUDA allocator segments on Linux.
+  Changing the setting saves the next-launch value but keeps the current Client
+  running with its existing effective memory settings. Restart LegalFedLLM
+  manually when convenient to apply the change;
+- **Debug Mode** — opens additional Client/GPU diagnostic terminals; and
+- **Reset Defaults** — restores the default desktop settings.
+
+For constrained GPUs, Low VRAM Mode can reduce reference/validation memory
+pressure, but it does not turn unsupported hardware into a guaranteed-safe
+training target.
+
+#### Closing LegalFedLLM
+
+Close the GUI normally. LegalFedLLM stops its Client Agent and SSH tunnel while
+preserving the saved profile, adapter/model state, queues, logs, and caches
+under `LegalFedLLM-data\`.
+
+AnythingLLM Desktop and Ollama are native third-party applications. Keep the
+LegalFedLLM launch terminal open while the Windows Client is running. In the
+current Windows release, terminating that terminal can also terminate native
+AnythingLLM/Ollama processes launched from the same console session. Their
+persistent application/model data remains owned by those applications rather
+than by `LegalFedLLM-data\`.
 
 ### Uninstallation
 
-*To be completed after the native portable Windows Client is implemented and
-accepted.*
+The Windows release is portable: there is no separate LegalFedLLM installer to
+remove.
+
+First close LegalFedLLM and make sure its launch terminal and Client Agent have
+exited. If you may want to restore the same Client identities, adapters, or model
+cache later, back up:
+
+```text
+LegalFedLLM-data\
+```
+
+For a complete LegalFedLLM removal, delete the entire extracted release
+directory, including:
+
+```text
+LegalFedLLM.exe
+client\
+desktop\
+legalfed-ai\
+scripts\
+shared\
+requirements.txt
+requirements-desktop.txt
+.venv\
+LegalFedLLM-data\
+```
+
+Deleting `LegalFedLLM-data\` is destructive: it removes the saved Client
+profiles, private Client identities/keys, enrollment state, adapters/checkpoints,
+local-learning state, logs, and the LegalFedLLM Hugging Face cache.
+
+The following prerequisites are installed independently of LegalFedLLM and are
+**not** removed when the portable release directory is deleted:
+
+- the NVIDIA driver;
+- Python 3.14 x64;
+- Windows OpenSSH Client;
+- Ollama for Windows; and
+- AnythingLLM Desktop.
+
+Remove those separately through their normal Windows/official uninstall methods
+only if they are no longer needed by other applications.
+
+Ollama's model store is also outside `LegalFedLLM-data\`. If you want to remove
+only the compatibility models that were installed for LegalFedLLM, inspect the
+installed models first:
+
+```powershell
+ollama list
+```
+
+Then remove only the models you no longer want, for example:
+
+```powershell
+ollama rm qwen3:1.7b
+ollama rm granite3.3:2b
+```
+
+AnythingLLM owns its own application data and should be cleaned up through
+AnythingLLM's normal uninstall/data-management path rather than by deleting
+LegalFedLLM files.
+
+LegalFedLLM does not store the SSH password. Windows OpenSSH may retain the
+Host's public key in the user's normal `known_hosts` file. If you deliberately
+want to remove that record as well, use `ssh-keygen -R` with the Host name/IP
+and the appropriate `[host]:port` form for a non-default port.
+
+After the extracted release directory is deleted, and after any optional
+third-party model/application cleanup above, the current portable Windows path
+does not require another LegalFedLLM-specific OS-global application-data
+directory.
+
 
 ## Linux
 
@@ -765,14 +1055,18 @@ The global desktop settings are available from the Options menu:
 - **Constant Learning** is enabled by default. LOCAL interactions are added to
   the one-use local-learning queue automatically. Disable it to restore the
   explicit **Learn from this** / **Dismiss** decision.
-- **Low VRAM Mode** is disabled by default. When enabled, LegalFedLLM turns on
-  the lower-memory Client training policy and restarts the desktop after
-  confirmation. It trades memory use for additional computation.
+- **Low VRAM Mode** is enabled by default. CUDA Clients always use checkpointed
+  training and bounded reference/validation inference. Enabling this option
+  reduces reference/validation chunks from 64 to 32 tokens and requests expandable
+  allocator segments on Linux. Changing it saves the next-launch value while the
+  current Client stays open with its existing effective settings; restart
+  LegalFedLLM manually when convenient to apply the change.
 - **Debug Mode** is disabled by default. Enable it to open the additional Client
   state and NVIDIA/GPU diagnostic terminals.
 - **Reset Defaults** restores Constant Learning to on, Debug Mode to off, and
-  Low VRAM Mode to off. If that changes a restart-sensitive setting, the GUI
-  reports that a restart is needed.
+  Low VRAM Mode to on. If that changes the effective Low VRAM setting, the GUI
+  confirms that a manual restart is required but does not close the running
+  Client automatically.
 
 When a completed round contains useful Host-to-Client teaching samples,
 LegalFedLLM asks before applying reverse learning.
@@ -884,150 +1178,265 @@ intend to remove resources belonging to other projects too.
 
 ## Host
 
-The Host/Coordinator runs separately from the desktop Clients. The verified
-remote path uses a writable runtime root such as:
+The Host and Coordinator run separately from desktop Clients. Public source
+instructions deliberately use local variables rather than a deployment-specific
+SSH address, external port, username, provider, filesystem root or round ID.
 
-```text
-/scratch/legalfedllm-test
-```
-
-with the repository at:
-
-```text
-/scratch/legalfedllm-test/work/LegalFedLLM
-```
-
-and the Python environment at:
-
-```text
-/scratch/legalfedllm-test/.venv
-```
-
-The real Host and Coordinator run directly from that environment. In the
-verified topology the Host binds to `127.0.0.1:8002`, the Coordinator binds to
-`127.0.0.1:8000`, and Clients reach the Coordinator through SSH forwarding.
-
-### Starting the Host/Coordinator
-
-From the remote repository root:
+A typical source checkout can use any writable runtime root:
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM
-source /scratch/legalfedllm-test/.venv/bin/activate
+cd /path/to/LegalFedLLM
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
-set -a
-. ./.env.host
-set +a
+HOST_ENV=".env.host"
+HOST_RUNTIME_ROOT="/path/to/legalfedllm-runtime"
 
-python scripts/run_host_stack.py --env-file .env.host
+python scripts/bootstrap.py host   --output "$HOST_ENV"   --runtime-root "$HOST_RUNTIME_ROOT"
 ```
 
-Substitute the deployment's actual Host environment filename if it is not
-`.env.host`. Keep the process running while Clients are connected.
+Host bootstrap generates fresh `ADMIN_TOKEN` and `INTERNAL_API_TOKEN` values,
+writes them only to the private environment file, creates the configured runtime
+and cache directories, and refuses to silently replace an existing environment
+belonging to another role. The generated file should remain private and must not
+be committed or included in a public release.
 
-### Health and GPU checks
+The proof-of-concept GLD data is intentionally not distributed in the public
+repository. A Host operator who is authorized to use that corpus must provision
+D^P and D^V at the paths configured by `COORDINATOR_REFERENCE_DATASET_PATH` and
+`COORDINATOR_VALIDATION_DATASET_PATH`. Host bootstrap creates their parent
+directory but does not download, synthesize or publish the copyrighted source.
+D^V remains Host/Coordinator-only.
 
-From another Host shell:
+### Inspect the Host/Coordinator before changing it
+
+From the Host repository with the environment activated:
 
 ```bash
-source /scratch/legalfedllm-test/.venv/bin/activate
+cd /path/to/LegalFedLLM
+source .venv/bin/activate
 
-curl -fsS http://127.0.0.1:8002/health
-curl -fsS http://127.0.0.1:8000/health
+HOST_ENV=".env.host"
+
+echo "=== LegalFedLLM processes ==="
+ps -ef | grep -E   'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main'   | grep -v grep || true
+
+echo
+echo "=== Coordinator ==="
+curl -fsS --max-time 5 http://127.0.0.1:8000/health || true
+echo
+
+echo
+echo "=== Host ==="
+curl -fsS --max-time 5 http://127.0.0.1:8002/health || true
+echo
+
 nvidia-smi
 ```
 
-A healthy deployment should answer both HTTP checks. Do not infer Host health
-only from GPU activity or from an unsupported port-inspection utility.
+For the normal two-Client proof-of-concept policy, Coordinator health should
+report majority quorum with a minimum trusted quorum of 2 and no explicit
+one-Client override.
 
-### Issuing a Client enrollment token
-
-After the Host/Coordinator is healthy, issue one single-use enrollment token for
-each genuinely new Client profile:
+### Start the Host/Coordinator detached
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM
-source /scratch/legalfedllm-test/.venv/bin/activate
+cd /path/to/LegalFedLLM
+source .venv/bin/activate
 
-python scripts/issue_enrollment_token.py --env-file .env.host
+HOST_ENV=".env.host"
+HOST_RUNTIME_ROOT="/path/to/legalfedllm-runtime"
+RUN_LABEL="legalfedllm-host-$(date +%Y%m%d-%H%M%S)"
+LOG="$HOST_RUNTIME_ROOT/logs/${RUN_LABEL}.log"
+PIDFILE="$HOST_RUNTIME_ROOT/logs/${RUN_LABEL}.pid"
+
+mkdir -p "$HOST_RUNTIME_ROOT/logs"
+
+nohup python scripts/run_host_stack.py   --env-file "$HOST_ENV"   >"$LOG" 2>&1 < /dev/null &
+
+echo $! > "$PIDFILE"
+echo "Host stack parent PID: $(cat "$PIDFILE")"
+echo "Log: $LOG"
 ```
 
-Give the resulting token to exactly one new Client profile. Successful
-registration consumes it; saved profiles use their persisted Client identity on
-later launches and do not require a new enrollment token.
-
-### Stopping and restarting
-
-If `run_host_stack.py` is running in the foreground, stop it with `Ctrl+C`.
-Before restarting, verify that no stale Host/Coordinator processes remain:
+Then verify startup:
 
 ```bash
-ps -ef | grep -E \
-  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
-  | grep -v grep || true
+sleep 5
+tail -n 60 "$LOG"
+curl -fsS --max-time 5 http://127.0.0.1:8002/health
+echo
+curl -fsS --max-time 5 http://127.0.0.1:8000/health
+echo
 ```
 
-Then confirm that the loopback services are no longer answering:
+Do not use broad `pkill python` or `pkill uvicorn` commands. To stop the stack,
+identify the exact `run_host_stack.py` parent and signal only that process:
 
 ```bash
-curl -fsS --max-time 2 http://127.0.0.1:8000/health || true
-curl -fsS --max-time 2 http://127.0.0.1:8002/health || true
+mapfile -t STACK_PIDS < <(
+  ps -eo pid=,args= |
+  awk '/[r]un_host_stack.py/ {print $1}'
+)
+
+printf 'LegalFedLLM Host stack PIDs: %s\n' "${STACK_PIDS[*]:-none}"
+
+if [ "${#STACK_PIDS[@]}" -eq 1 ]; then
+  kill "${STACK_PIDS[0]}"
+elif [ "${#STACK_PIDS[@]}" -gt 1 ]; then
+  echo "ERROR: multiple Host stack parents found; inspect before stopping anything"
+fi
 ```
 
-If a stale `run_host_stack.py` parent remains, stop that parent first and
-re-check its children before using a stronger signal. Once the old processes are
-gone, restart with the normal **Starting the Host/Coordinator** command above.
+### Issue Client enrollment tokens
 
-### Remote container notes
+After the Coordinator is healthy, issue one single-use token for each genuinely
+new Client profile:
 
-The verified NVIDIA A40 environment is a constrained container rather than a
-normal workstation/server installation:
+```bash
+cd /path/to/LegalFedLLM
+source .venv/bin/activate
 
-- use the writable `/scratch` runtime tree rather than assuming ordinary home or
-  system paths are writable;
-- `ss` is not available/supported there, so use `ps` plus direct `/health`
-  requests for process/service checks;
-- `lsof` or `fuser` may be useful when installed, but they do not replace the
-  process/health checks; and
-- `nvidia-smi` is the normal GPU/VRAM monitoring command.
+python scripts/issue_enrollment_token.py   --env-file .env.host   --token-only
+```
 
-## Status at a glance
+A successful Client registration consumes the token. Existing enrolled profiles
+reuse their persisted Ed25519 identity and do not require another token.
 
-| Capability | Current status |
+### Create a normal two-Client Qwen + Granite round
+
+Use the already-registered Client IDs. Do not put real Client IDs in public
+documentation:
+
+```bash
+cd /path/to/LegalFedLLM
+source .venv/bin/activate
+
+HOST_ENV=".env.host"
+
+QWEN_CLIENT_ID="<enrolled-qwen-client-id>" GRANITE_CLIENT_ID="<enrolled-granite-client-id>" ROUND_CLIENT_SLOTS="client-1,client-2" COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="" python scripts/create_remote_round.py   --env-file "$HOST_ENV"
+```
+
+For the Mistral Nemo Host, the supported assignments are:
+
+```text
+Qwen3 1.7B
+    → dtw:qwen3-1.7b--mistral-nemo-instruct-2407-v1
+
+Granite 3.3 2B
+    → dtw:granite3.3-2b-client--mistral-nemo-instruct-2407-v1
+```
+
+Unknown or unsupported model pairs fail closed.
+
+### Verify or monitor a round
+
+Use the new round identifier printed by `create_remote_round.py`:
+
+```bash
+ROUND_ID="<round-id>"
+
+curl -fsS   "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/manifest" |
+python -c '
+import json, sys
+d=json.load(sys.stdin)
+print("round_id:", d["round_id"])
+print("selected_client_ids:", d["selected_client_ids"])
+print("quorum:", d["trusted_client_quorum"])
+print("alignment_profiles:")
+for cid, profile in d["selected_client_alignment_profiles"].items():
+    print(" ", cid, "->", profile)
+print("submission_deadline:", d["submission_deadline"])
+'
+```
+
+Then inspect the live state without dumping the full manifest:
+
+```bash
+curl -fsS   "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status" |
+python -c '
+import json, sys
+d=json.load(sys.stdin)
+print("round_id:", d["round_id"])
+print("state:", d["state"])
+print("accepted_client_ids:", d["accepted_client_ids"])
+print("accepted_count:", len(d["accepted_client_ids"]))
+print("message:", d.get("message"))
+'
+```
+
+A newly created normal two-Client round should begin as `COLLECTING` with zero
+accepted Clients and quorum 2. After the first accepted package it remains
+`COLLECTING` at 1/2. After the second trusted package reaches quorum, the
+Coordinator seals the accepted set and advances through Host integration and
+distillation.
+
+For a compact live monitor:
+
+```bash
+watch -n 5 "
+curl -fsS http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status |
+python -c '
+import json,sys
+d=json.load(sys.stdin)
+print("state:", d["state"])
+print("accepted:", d["accepted_client_ids"])
+print("count:", len(d["accepted_client_ids"]))
+print("message:", d.get("message"))
+'
+"
+```
+
+An expired collecting round is evaluated normally by its status endpoint. If it
+passes its submission deadline without trusted quorum, it becomes `SKIPPED`.
+Terminal `SKIPPED`, `COMPLETED` and `ABORTED` rounds no longer block creation of
+the next round. Do not edit or delete generated round state by hand.
+
+## Development record
+
+LegalFedLLM has progressed from deterministic protocol fixtures to real model
+training, heterogeneous tokenizer alignment, Host validation/rollback, reverse
+learning, portable desktop Clients, and a quorum-2 heterogeneous desktop round.
+The table below records the implementation and experimental milestones that
+have been exercised in the project.
+
+| Capability | Proof-of-concept result |
 | --- | --- |
 | Deterministic protocol/mock path | Implemented and regression-tested |
-| Canonical shared-reference dataset boundary | Implemented |
-| Signed Knowledge Package transport | Implemented |
-| Qwen3 1.7B real Client LoRA training | Implemented and real-tested |
-| Qwen real D^P Knowledge Package generation | Implemented and real-tested |
-| Qwen → Mistral Nemo heterogeneous DTW alignment | Implemented and real-tested |
-| SafeFed-inspired Knowledge Package screening/trust | Implemented as a PoC defense-in-depth layer |
-| Mistral Nemo real Host LoRA training | Implemented and real-tested on NVIDIA A40 |
-| Hidden D^V Host validation and promotion/rollback | Implemented and real-tested |
-| Automatic Host → Qwen reverse distillation | Implemented and real-tested |
-| Exact submission acknowledgement reconciliation | Implemented and regression-tested |
-| Unattended split-machine tmux orchestration/evidence | Implemented and real-tested |
-| Portable PySide6 desktop Client | Source path accepted on Linux/Bazzite and Windows; Linux x86_64 AppImage implemented and real-tested with the Qwen Client through startup/enrollment, AnythingLLM LOCAL use, a complete forward federated round, browser launch, and clean Client-Docker shutdown; Windows native Granite source GUI + Ollama + AnythingLLM Desktop LOCAL integration accepted, while portable EXE packaging remains pending |
-| LOCAL OpenAI-compatible inference through active Client PEFT state | Implemented; real Bazzite Qwen and Windows Granite AnythingLLM LOCAL paths accepted through the Client Agent |
-| HOST OpenAI-compatible forwarding through bounded Host queue | Implemented and model-free tested; real desktop/Host acceptance pending |
-| Configurable local learning queue | Implemented; Constant Learning is on by default, with Learn/Dismiss consent available when disabled; real Bazzite AnythingLLM queue behavior accepted |
-| Real multi-Client round | Not yet demonstrated |
-| Mixed Qwen + Granite per-Client alignment and Host integration | Implemented and model-free tested; real heterogeneous execution still pending |
-| Automatic promoted-PEFT → Ollama publication | Not required by the desktop path; active PEFT state is served directly with Transformers |
-| Production-calibrated malicious-package/LoRA classifier | Not complete |
-| Formal DP-SGD/privacy guarantee | Not claimed |
+| Canonical D^P/D^V dataset boundary | Implemented with stable IDs, ordering and semantic hashes |
+| Signed manifests and Knowledge Package transport | Implemented with Ed25519, hashes, nonces, replay controls and bounded artifacts |
+| Qwen3 1.7B real Client LoRA path | Implemented and real-tested, including a complete Host→Qwen reverse candidate acceptance path |
+| Granite 3.3 2B real Client LoRA path | Implemented and real-tested; Granite knowledge has been accepted in a real heterogeneous multi-Client round |
+| Qwen/Granite → Mistral Nemo DTW alignment | Both Client-specific Nemo alignment profiles exercised in real model federation |
+| SafeFed-inspired package screening/trust | Implemented as a proof-of-concept defense-in-depth layer |
+| Mistral Nemo real Host LoRA training | Implemented and real-tested on the proof-of-concept Host GPU |
+| Hidden D^V Host validation | Implemented; candidates can be promoted or rejected while retaining the active adapter |
+| Client reverse learning | Implemented with verified Host package intake, selective teaching, consent, stale-parent protection and held-out candidate validation |
+| Submission acknowledgement reconciliation | Implemented and regression-tested |
+| Portable desktop Client | Linux x86_64 AppImage and Windows x64 thin-launcher paths implemented and physically exercised |
+| Constrained-GPU safeguards | Implemented across Client training, reference inference and reverse validation, with `gpu-memory.jsonl` diagnostics |
+| LOCAL OpenAI-compatible inference | Implemented through the active Client Transformers/PEFT state with lazy resident-session reuse |
+| HOST OpenAI-compatible forwarding | Implemented through the authenticated Client→Coordinator→Host boundary |
+| Local-learning queue | Implemented; Constant Learning is enabled by default and explicit Learn/Dismiss remains available when disabled |
+| Real multi-Client federation | Demonstrated with Windows Qwen + Linux Granite under normal trusted quorum 2; both Client packages were accepted and Host validation completed |
+| Heterogeneous rollback behavior | Demonstrated: a completed multi-Client round can reject the candidate Host adapter and retain the previous accepted adapter |
+| Formal DP-SGD / production PKI / production-calibrated poisoning defense | Intentionally not claimed by this research proof of concept |
 
-The normal Coordinator quorum policy is **majority with a minimum trusted quorum
-of 2**. A one-Client quorum override exists only for controlled proof-of-concept
-testing.
+Across the acceptance history, the complete bidirectional Qwen↔Mistral-Nemo
+path and the true Qwen+Granite quorum-2 multi-Client path were both exercised.
+Those results did not need to occur in one identical hardware run for the
+README to record them as separate measured experiments; measured experiment
+claims remain separate from architecture claims.
 
-## Verified real cross-machine round
+## Verified bidirectional single-Client baseline
 
 A fresh unattended bidirectional run has been verified with:
 
 - a local **Qwen/Qwen3-1.7B** Client;
 - a remote **mistralai/Mistral-Nemo-Instruct-2407** Host;
-- the Coordinator colocated with the Host on an NVIDIA A40 container;
+- the Coordinator colocated with the remote NVIDIA GPU Host;
 - one private-data Client epoch;
 - five Host reference-data epochs;
 - one reverse Client reference-data epoch;
@@ -1158,31 +1567,26 @@ measurements.
 
 ## Portable desktop Client
 
-The repository contains both the source desktop Client and the lightweight Linux
-x86_64 AppImage path. The AppImage packages the PySide6 GUI/controller,
-OpenSSH-tunnel control, profile management, local-AI orchestration, and the
-release-specific Client runtime definition. The heavy Client
-PyTorch/Transformers/PEFT stack runs in Docker rather than being embedded in the
-AppImage.
+The repository contains a Linux x86_64 AppImage Client and a native Windows x64
+thin-launcher Client. Both use the same PySide6 desktop/controller and portable
+sibling `LegalFedLLM-data` state boundary, while their local-AI/runtime
+integration differs by platform.
 
-For AppImage mode, the GUI process owns the host OpenSSH tunnel. The Docker
-Client uses that already-established local forward as an external tunnel rather
-than spawning a second SSH process. The versioned Client runtime is materialized
-under `LegalFedLLM-data/client-runtime/<runtime-hash>/`, and its Docker image is
-named `legalfedllm-client:<runtime-hash-prefix>`. Closing the GUI stops the
-profile-specific Client Docker stack and tunnel while preserving profile data,
-model caches, checkpoints, and the Docker image.
+Linux AppImage mode keeps the GUI/controller on the host and runs the heavy
+Client Transformers/PEFT runtime in a versioned Docker image. The GUI owns the
+host OpenSSH tunnel and the Docker Client consumes that already-established
+forward through an explicit external-tunnel contract.
 
-The Linux AppImage path has been real-tested on Bazzite with the Qwen Client for
-profile creation/enrollment, SSH startup, Docker Client creation, direct LOCAL
-Transformers + PEFT serving through AnythingLLM, local-learning queue behavior,
-a complete forward federated round against the remote Mistral Nemo Host,
-AnythingLLM browser launch, and clean Client-Docker shutdown. Windows packaging
-and acceptance remain pending. The AppImage reverse-learning attempt with Low
-VRAM Mode disabled encountered CUDA out-of-memory pressure on the tested
-approximately 8 GB Client GPU; it failed without promoting a reverse candidate,
-so that attempt is not documented as a successful AppImage reverse-learning
-acceptance.
+Windows uses a thin `LegalFedLLM.exe` launcher with adjacent source/runtime files,
+a release-local `.venv`, native Ollama and native AnythingLLM Desktop. The final
+proof-of-concept model placement uses Qwen3 1.7B on the constrained Windows GPU
+and Granite 3.3 2B on the larger Linux Client GPU.
+
+Both desktop paths have been physically exercised for profile/enrollment,
+SSH/Agent startup, local-AI integration, real model participation and persistent
+portable state. The quorum-2 heterogeneous GUI round accepted both Windows Qwen
+and Linux Granite Knowledge Packages and proceeded through Host integration and
+D^V validation.
 
 The locked desktop behavior is:
 
@@ -1201,10 +1605,28 @@ The locked desktop behavior is:
 - the global `Debug Mode` option is off by default, leaving only the launch/SSH
   terminal; when enabled it additionally opens the state and NVIDIA/GPU
   diagnostic terminals;
-- the global `Low VRAM Mode` option is off by default. When enabled it sets
-  `CLIENT_GRADIENT_CHECKPOINTING=true` and
-  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the Client runtime and
-  restarts the desktop after confirmation;
+- Low VRAM Mode is on by default. Changing it persists the next-launch value but
+  does not close the running desktop; the current Agent keeps its effective
+  settings until the user manually restarts LegalFedLLM;
+- CUDA Client execution uses micro-batch 1, preserving the configured effective
+  batch through gradient accumulation, non-reentrant gradient checkpointing,
+  SDPA attention, and 64-token checkpointed loss projection. Saved decoder
+  activations are offloaded to pinned system RAM and restored for backward;
+  model computation and LoRA optimization stay on GPU. This trades RAM and
+  transfer/recomputation time for VRAM without changing signed sequence lengths;
+- CUDA reference inference and reverse validation use batch 1 and at most
+  64-token causal chunks. Low VRAM Mode uses 32-token inference chunks and,
+  on Linux, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. It no longer
+  disables the baseline protections when off;
+- Client GPU admission limits PyTorch's allocator, leaves display/driver
+  headroom, and checks actual frozen-model bytes before transferring the model.
+  A refused workload remains on its existing adapter; there is no automatic
+  CPU fallback, truncation, or retry. The minimum workspace check is a lower
+  bound, not a proof that all activations fit or that a platform reset is impossible;
+- `gpu-memory.jsonl` under the Client data directory records phase markers,
+  effective execution settings, and memory counters without prompts or answers.
+  CUDA operations are asynchronous: these markers narrow a failure interval,
+  rather than proving the exact GPU instruction that failed;
 - Ollama models are installed by the user. LegalFedLLM checks that the selected
   profile's expected Ollama model is installed, but federated training and LOCAL
   serving use the exact pinned Transformers + PEFT state;
@@ -1220,10 +1642,14 @@ The locked desktop behavior is:
   adapter is safely promoted; failed training restores the queue;
 - the main GUI action is `Participate in the current federated round`;
 - reverse Host learning requires a verified Host package, at least one selected
-  Host-teacher sample, and explicit user consent;
+  Host-teacher sample, and explicit user consent. A terminal first-receipt
+  freshness rejection is persisted per profile/round so the GUI does not spam
+  repeated stale-package dialogs; transient preview failures back off and remain
+  retryable;
 - the OpenAI-compatible provider exposes `legalfedllm-local` and
-  `legalfedllm-host` for the current milestone; collaborative inference remains
-  future work;
+  `legalfedllm-host`. LOCAL Transformers serving keeps a lazy resident model
+  session between prompts, releases it before exclusive training jobs, and
+  reloads the active checkpoint on the next LOCAL request;
 - on Linux/AppImage, the repository carries the `legalfed-ai/` Docker Ollama +
   AnythingLLM bundle. On profile activation the desktop seeds a writable copy
   under `LegalFedLLM-data/legalfed-ai/`, preserves compatible existing
@@ -1268,8 +1694,8 @@ respective operating systems; PyInstaller is not a cross-compiler.
 
 | Profile | Model | Revision | Current role/status |
 | --- | --- | --- | --- |
-| `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | Real Client path with private training, D^P package generation and reverse training verified |
-| `granite-3.3-2b-instruct-client-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Real Windows private training/D^P package and one-Client forward-federation path verified; reverse Granite training remains unaccepted on the tested 6 GiB Windows laptop |
+| `qwen3-1.7b-lora-v1` | `Qwen/Qwen3-1.7B` | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | Real Client path verified, including Windows quorum-2 participation and a complete bidirectional Qwen↔Nemo baseline |
+| `granite-3.3-2b-instruct-client-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Real Client path verified; Granite knowledge was accepted from the Linux desktop in the quorum-2 heterogeneous PoC round |
 
 The Qwen profile uses `Qwen3ForCausalLM`, `Qwen2TokenizerFast`, vocabulary size
 151,936 and the non-thinking Qwen chat-template mode. The Granite profile uses
@@ -1290,7 +1716,7 @@ task:             CAUSAL_LM
 
 | Profile | Model | Revision | Current role/status |
 | --- | --- | --- | --- |
-| `mistral-nemo-instruct-2407-host-lora-v1` | `mistralai/Mistral-Nemo-Instruct-2407` | `04d8a90549d23fc6bd7f642064003592df51e9b3` | Current remote Host with real A40 training/validation path verified |
+| `mistral-nemo-instruct-2407-host-lora-v1` | `mistralai/Mistral-Nemo-Instruct-2407` | `04d8a90549d23fc6bd7f642064003592df51e9b3` | Current remote Host profile with real GPU training/validation verified |
 | `granite-3.3-2b-instruct-host-lora-v1` | `ibm-granite/granite-3.3-2b-instruct` | `652c333dc5066f2a1764854a1bcd0ce67163d74f` | Retained compatibility Host profile |
 
 The pinned Mistral Nemo Host uses `MistralForCausalLM`,
@@ -1301,8 +1727,8 @@ PEFT adapter directly. Ollama is not used to pretend a promoted PEFT adapter has
 been published.
 
 `compose.host-ml.yaml` remains the local Granite ML Compose profile. The Mistral
-Nemo Host path runs directly from a Python virtual environment on the remote A40
-container.
+Nemo Host path runs directly from a Python virtual environment on the remote GPU
+Host.
 
 ## Pinned alignment profiles
 
@@ -1313,7 +1739,7 @@ LegalFedLLM recognizes four exact bidirectional tokenizer-alignment contracts:
 | Qwen3 1.7B | Granite 3.3 2B | `dtw:qwen3-1.7b--granite3.3-2b-v1` | Supported compatibility/validation profile |
 | Granite 3.3 2B | Granite 3.3 2B | `dtw:granite3.3-2b-client--granite3.3-2b-host-v1` | Supported compatibility/validation profile |
 | Qwen3 1.7B | Mistral Nemo | `dtw:qwen3-1.7b--mistral-nemo-instruct-2407-v1` | Real heterogeneous profile verified |
-| Granite 3.3 2B | Mistral Nemo | `dtw:granite3.3-2b-client--mistral-nemo-instruct-2407-v1` | Supported profile; no full real round yet |
+| Granite 3.3 2B | Mistral Nemo | `dtw:granite3.3-2b-client--mistral-nemo-instruct-2407-v1` | Real heterogeneous profile exercised in the quorum-2 desktop PoC round |
 
 These contracts pin model/tokenizer revisions, tokenizer artifact hashes,
 special-token state, vocabulary ranges, padding behavior, chat-template hashes,
@@ -1327,7 +1753,7 @@ representation into the signed manifest. Model-free regression coverage verifies
 mixed Qwen + Granite → Mistral Nemo manifest, Client-specific package enforcement,
 quorum sealing, duplicate rejection, canonical manifest hashing/signing, and Host
 training-input construction with an independent tokenizer/alignment contract for each
-accepted Client. Real Qwen + Granite model execution remains pending.
+accepted Client. Real Qwen + Granite model execution has been exercised in the quorum-2 desktop PoC round.
 
 ## Repository layout
 
@@ -1360,6 +1786,7 @@ LegalFedLLM/
 ├── compose.clients.yaml        role-separated Qwen/Granite Client stack
 ├── compose.host-ml.yaml        local Granite Host ML override
 ├── requirements.txt
+├── requirements-desktop.txt
 └── THIRD_PARTY_NOTICES.md
 ```
 
@@ -1390,7 +1817,7 @@ Host/Coordinator example:
 ```bash
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /scratch/legalfedllm-test
+  --runtime-root /path/to/legalfedllm-runtime
 ```
 
 After the Host/Coordinator is running, issue one single-use Client enrollment token:
@@ -1419,11 +1846,39 @@ supports:
 ```bash
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /scratch/legalfedllm-test \
+  --runtime-root /path/to/legalfedllm-runtime \
   --trusted-quorum-override 1
 ```
 
 Do not use the one-Client override as the normal federation configuration.
+
+### Source bootstrap, enrollment and D^P delivery
+
+The source tree is sufficient to create the private runtime credentials needed by
+LegalFedLLM; real secrets are not expected to be committed. Host bootstrap
+generates Host administrative/internal tokens. Client bootstrap requires one
+Host-issued enrollment token and generates the Client-local administrative
+secrets. The desktop path similarly generates a per-profile Client admin token
+and persists its Ed25519 identity under that profile's private state.
+
+The GLD corpus itself is not generated from GitHub source and is not embedded in
+the public release. The authorized Host/Coordinator must already have the real
+D^P and hidden D^V files at its configured dataset paths. When a registered
+Client is selected for a signed round, the Client automatically makes a signed
+request to:
+
+```text
+GET /v1/rounds/{round_id}/reference-dataset
+```
+
+The Coordinator authorizes the enrolled Client, serves the round-bound D^P
+snapshot, and the Client verifies its dataset ID, semantic hash and ordered
+sample IDs before caching it locally. D^V has no Client download endpoint and
+remains on the Host/Coordinator side.
+
+Therefore a source Client connected to an already-provisioned Host/Coordinator
+can enroll, generate its own local secrets/identity state, and obtain D^P through
+the protocol without receiving the copyrighted GLD source PDF or Host-only D^V.
 
 ## Private Client training data
 
@@ -1777,9 +2232,17 @@ consistently.
 
 ### Ordinary repository suite
 
-From the repository root:
+From the repository root, run the complete ordinary suite. On Linux, clear any
+inherited AppImage marker so source-mode browser tests do not accidentally take
+the AppImage `xdg-open` branch:
 
 ```bash
+env -u APPIMAGE python -m unittest discover -v
+```
+
+On Windows PowerShell:
+
+```powershell
 python -m unittest discover -v
 ```
 
@@ -2028,66 +2491,23 @@ See:
 The upstream FATE Context, Guest/Host/Arbiter channels, FATE-Flow, and parameter
 aggregation wrappers are not part of LegalFedLLM.
 
-## Current limitations
-
-The current repository does **not** establish:
-
-- forward Client-to-Host teaching in the verified real experiment: Qwen was
-  selected on `0 / 565` forward samples;
-- a real multi-Client federated round;
-- a real Qwen + Granite heterogeneous round and reverse synchronization on
-  separate physical Clients;
-- a production-calibrated malicious-Knowledge-Package detector;
-- formal DP-SGD or differential-privacy accounting;
-- HTTPS/mTLS, certificate provisioning, or encrypted artifact storage; the current
-  one-time enrollment-token + Ed25519 identity flow is a PoC authentication layer,
-  not a production PKI;
-- automatic PEFT-adapter publication into Ollama;
-- real Mistral Nemo serving through the current Host profile;
-- stable thesis measurements for end-to-end wall time, peak RAM/VRAM,
-  communication cost, and scaling across multiple real Clients; or
-- Windows desktop packaging and real Windows Client acceptance.
-
-D^V validation is a strong held-out outcome gate, but it is not a proof against
-all targeted/backdoor behavior outside D^V coverage. Likewise, a low or accepted
-PoC trust score is not a production security certification.
-
-## Next experimental work
-
-The main open experimental questions are:
-
-1. run the first real Qwen + Granite multi-Client round under the normal
-   majority/minimum-2 quorum and capture each Client's reverse synchronization;
-2. measure scenarios in which an eligible Client actually wins some forward
-   DualMinCE samples, and report teacher-selection counts explicitly;
-3. independently calibrate the Coordinator-side malicious-Knowledge-Package
-   detector and evaluate adversarial package cases rather than relying on protocol
-   fixtures;
-4. collect stable wall-time, RAM/VRAM, communication-volume, and adapter-size
-   measurements for thesis experiments; and
-5. decide whether automatic PEFT → serving-model publication belongs in the PoC
-   scope.
-
-These are experiment/deployment boundaries. They should not be documented as
-completed until measured in the agreed authoritative environment.
-
 ## Accurate project claim
 
-A defensible current summary is:
+A defensible project summary is:
 
-> LegalFedLLM implements a protocol-first heterogeneous federated language-model
-> proof of concept in which model-native LoRA weights and private Client examples
-> remain local while signed behavioral Knowledge Packages are exchanged over a
-> common reference dataset. A fresh real cross-machine Qwen3 1.7B → Mistral Nemo
-> → Qwen run completed package verification, Coordinator-side SafeFed-inspired
-> Knowledge Package screening, DTW
-> alignment, DualMinCE selection, Host candidate training, hidden D^V promotion,
-> signed Host publication, automatic Client synchronization, and reverse Qwen
-> candidate adoption without manual recovery. In that experiment the Host
-> self-teacher won all 565 forward samples, so the measured Host validation
-> improvement cannot be attributed to Qwen-to-Host knowledge transfer; the
-> reverse path did select the Host on 508 samples.
+> LegalFedLLM implements a research proof of concept for heterogeneous federated
+> language-model learning in which model-native LoRA weights and raw
+> private Client examples remain local while signed behavioral Knowledge Packages
+> move over a common reference dataset. The implementation includes real Qwen and
+> Granite Client LoRA paths, Mistral Nemo Host LoRA training, signed and replay-
+> protected federation, Client-specific DTW tokenizer alignment, SafeFed-inspired
+> package screening/trust, DualMinCE teacher selection, hidden D^V Host validation
+> with promotion/rollback, signed Host publication, Client-owned reverse
+> distillation/adoption, portable Linux and Windows desktop Clients, and a real
+> quorum-2 Windows-Qwen + Linux-Granite heterogeneous GUI round.
 
-The repository is beyond a mock protocol demonstration, but it remains a
-research proof of concept rather than a production federated-learning system.
-
+The earlier bidirectional Qwen↔Mistral-Nemo baseline demonstrated successful
+reverse candidate adoption. The later multi-Client round demonstrated real
+heterogeneous quorum, both Client Knowledge Packages being accepted, and a valid
+Host candidate rejection/rollback outcome. These are measured experimental results rather than claims of production
+security, formal differential privacy, or general model-quality improvement.

@@ -54,17 +54,31 @@ if (-not (Test-Path $VenvPython)) {
 Write-Host "+ $VenvPython -m pip install --upgrade pip"
 Invoke-Checked $VenvPython -m pip install --upgrade pip
 
-Write-Host "+ $VenvPython -m pip install -r $Requirements"
-Invoke-Checked $VenvPython -m pip install -r $Requirements
+$TorchProbe = @'
+try:
+    import torch
+except Exception:
+    raise SystemExit(1)
 
-$TorchProbe = 'import torch, sys; sys.exit(0 if torch.__version__ == "2.13.0+cu132" and torch.cuda.is_available() and torch.version.cuda == "13.2" and torch.cuda.is_bf16_supported() else 1)'
+ok = (
+    torch.__version__ == "2.13.0+cu132"
+    and torch.cuda.is_available()
+    and torch.version.cuda == "13.2"
+    and torch.cuda.is_bf16_supported()
+)
+raise SystemExit(0 if ok else 1)
+'@
+
 $TorchProbe | & $VenvPython -
 if ($LASTEXITCODE -eq 0) {
     Write-Host "+ pinned Windows CUDA Torch is already installed"
 } else {
-    Write-Host "+ replacing the default CPU Torch wheel with the pinned CUDA 13.2 wheel"
-    Invoke-Checked $VenvPython -m pip install --force-reinstall --no-deps torch==2.13.0 --index-url $TorchIndex
+    Write-Host "+ installing pinned Windows CUDA Torch 2.13.0+cu132"
+    Invoke-Checked $VenvPython -m pip install --no-deps torch==2.13.0+cu132 --index-url $TorchIndex
 }
+
+Write-Host "+ $VenvPython -m pip install -r $Requirements"
+Invoke-Checked $VenvPython -m pip install -r $Requirements
 
 if (-not (Test-Path $Verifier)) {
     throw "Windows runtime verifier is missing: $Verifier"

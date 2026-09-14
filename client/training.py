@@ -116,6 +116,22 @@ class TrainingExecutionProfile(TrainingContract):
         return sha256_hex(payload)
 
 
+def memory_efficient_execution_profile(
+    profile: TrainingExecutionProfile,
+) -> TrainingExecutionProfile:
+    if profile.backend != "transformers" or profile.device != "cuda":
+        return profile
+    values = profile.model_dump()
+    values.update(
+        micro_batch_size=1,
+        gradient_accumulation_steps=(
+            profile.micro_batch_size * profile.gradient_accumulation_steps
+        ),
+        gradient_checkpointing=True,
+    )
+    return TrainingExecutionProfile.model_validate(values)
+
+
 def execution_profile_from_environment(
     backend: Literal["mock", "transformers"],
 ) -> TrainingExecutionProfile:
@@ -125,7 +141,7 @@ def execution_profile_from_environment(
             device="cpu",
             precision="float32",
         )
-    return TrainingExecutionProfile(
+    return memory_efficient_execution_profile(TrainingExecutionProfile(
         backend="transformers",
         device=os.getenv("CLIENT_TRAINING_DEVICE", "cuda").strip().lower(),
         precision=os.getenv(
@@ -149,7 +165,7 @@ def execution_profile_from_environment(
             "CLIENT_VERIFY_FROZEN_BASE_CHECKSUM", "false"
         ).strip().lower()
         in {"1", "true", "yes"},
-    )
+    ))
 
 
 def encode_private_examples(

@@ -1001,3 +1001,192 @@ class RoundBoundTrainingApiTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedParticipationLossTests(unittest.TestCase):
+    @staticmethod
+    def _tiny_model(torch, *, model_type: str, logits_scaling: float = 1.0):
+        class TinyDecoder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding = torch.nn.Embedding(17, 6)
+                self.adapter = torch.nn.Linear(6, 6, bias=False)
+
+            def forward(self, input_ids, attention_mask, use_cache=False):
+                del attention_mask, use_cache
+                hidden = self.adapter(self.embedding(input_ids))
+                return type("DecoderOutput", (), {"last_hidden_state": hidden})()
+
+        class TinyCausalLM(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = type(
+                    "Config",
+                    (),
+                    {
+                        "model_type": model_type,
+                        "vocab_size": 17,
+                        "logits_scaling": logits_scaling,
+                    },
+                )()
+                self.model = TinyDecoder()
+                self.lm_head = torch.nn.Linear(6, 17, bias=False)
+                for parameter in self.model.embedding.parameters():
+                    parameter.requires_grad = False
+                for parameter in self.lm_head.parameters():
+                    parameter.requires_grad = False
+
+            def get_output_embeddings(self):
+                return self.lm_head
+
+        class TinyPeftWrapper(torch.nn.Module):
+            def __init__(self, base_model):
+                super().__init__()
+                self.base_model = base_model
+
+            def get_base_model(self):
+                return self.base_model
+
+            def forward(self, *args, **kwargs):
+                raise AssertionError(
+                    "participation training must not call full CausalLM forward"
+                )
+
+        return TinyCausalLM, TinyPeftWrapper
+
+    def test_bounded_participation_loss_matches_full_loss_and_gradient(self) -> None:
+        import torch
+
+        from shared.answer_only import bounded_answer_only_loss
+
+        inputs = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long),
+            "labels": torch.tensor([[-100, -100, 3, 4, 5, 6]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 6), dtype=torch.long),
+        }
+        for model_type, logits_scaling in (("qwen3", 1.0), ("granite", 2.0)):
+            with self.subTest(model_type=model_type):
+                TinyCausalLM, TinyPeftWrapper = self._tiny_model(
+                    torch,
+                    model_type=model_type,
+                    logits_scaling=logits_scaling,
+                )
+                torch.manual_seed(23)
+                oracle = TinyCausalLM()
+                bounded = TinyCausalLM()
+                bounded.load_state_dict(oracle.state_dict())
+
+                oracle_hidden = oracle.model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    use_cache=False,
+                ).last_hidden_state
+                oracle_logits = oracle.lm_head(oracle_hidden)
+                if logits_scaling != 1.0:
+                    oracle_logits = oracle_logits / logits_scaling
+                oracle_loss = torch.nn.functional.cross_entropy(
+                    oracle_logits[..., :-1, :].float().reshape(-1, 17),
+                    inputs["labels"][..., 1:].reshape(-1),
+                    ignore_index=-100,
+                )
+                oracle_loss.backward()
+                oracle_gradient = oracle.model.adapter.weight.grad.detach().clone()
+
+                projection_widths: list[int] = []
+                original_forward = bounded.lm_head.forward
+
+                def bounded_forward(hidden_states):
+                    projection_widths.append(int(hidden_states.shape[1]))
+                    return original_forward(hidden_states)
+
+                bounded.lm_head.forward = bounded_forward
+                bounded_loss = bounded_answer_only_loss(
+                    torch,
+                    TinyPeftWrapper(bounded),
+                    inputs,
+                    sequence_chunk_size=2,
+                )
+                bounded_loss.backward()
+
+                self.assertTrue(torch.allclose(bounded_loss, oracle_loss, atol=1e-6))
+                self.assertTrue(
+                    torch.allclose(
+                        bounded.model.adapter.weight.grad,
+                        oracle_gradient,
+                        atol=1e-6,
+                    )
+                )
+                self.assertTrue(projection_widths)
+                self.assertLessEqual(max(projection_widths), 2)
+
+    def test_bounded_participation_loss_preserves_trainer_denominator(self) -> None:
+        import torch
+
+        from shared.answer_only import bounded_answer_only_loss
+
+        TinyCausalLM, TinyPeftWrapper = self._tiny_model(
+            torch,
+            model_type="qwen3",
+        )
+        torch.manual_seed(29)
+        model = TinyCausalLM()
+        inputs = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long),
+            "labels": torch.tensor([[-100, 2, 3, 4, 5]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 5), dtype=torch.long),
+        }
+        hidden = model.model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            use_cache=False,
+        ).last_hidden_state
+        logits = model.lm_head(hidden)
+        expected = torch.nn.functional.cross_entropy(
+            logits[..., :-1, :].float().reshape(-1, 17),
+            inputs["labels"][..., 1:].reshape(-1),
+            ignore_index=-100,
+            reduction="sum",
+        ) / 7
+        actual = bounded_answer_only_loss(
+            torch,
+            TinyPeftWrapper(model),
+            inputs,
+            sequence_chunk_size=2,
+            num_items_in_batch=7,
+        )
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+    def test_participation_trainer_routes_loss_through_bounded_helper(self) -> None:
+        import torch
+
+        from client.peft_backend import _answer_only_trainer_class
+
+        class FakeTrainer:
+            pass
+
+        transformers = type("Transformers", (), {"Trainer": FakeTrainer})
+        trainer_class = _answer_only_trainer_class(transformers, torch)
+        trainer = trainer_class()
+        expected = torch.tensor(1.25, requires_grad=True)
+        model = object()
+        inputs = {"labels": object()}
+
+        with mock.patch(
+            "client.peft_backend.bounded_answer_only_loss",
+            return_value=expected,
+        ) as bounded:
+            loss, outputs = trainer.compute_loss(
+                model,
+                inputs,
+                return_outputs=True,
+                num_items_in_batch=9,
+            )
+
+        self.assertIs(loss, expected)
+        self.assertIs(outputs["loss"], expected)
+        bounded.assert_called_once_with(
+            torch,
+            model,
+            inputs,
+            num_items_in_batch=9,
+        )

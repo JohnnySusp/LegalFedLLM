@@ -370,7 +370,7 @@ class RealPackagePipelineTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(health.status_code, 200, health.text)
             self.assertEqual(concurrent.status_code, 409, concurrent.text)
-            self.assertIn("another local ML job", concurrent.text)
+            self.assertIn("already running", concurrent.text)
             self.assertEqual(submitted.status_code, 201, submitted.text)
             self.assertEqual(submitted.json()["state"], "COLLECTING")
             self.assertEqual(submitted.json()["accepted_count"], 1)

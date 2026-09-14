@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 import importlib
 import math
 import os
@@ -23,8 +24,14 @@ from client.training import (
     PrivateTrainingExample,
     TrainingExecutionProfile,
     encode_private_examples,
+    memory_efficient_execution_profile,
 )
-from shared.answer_only import AnswerOnlyCollator, encode_chat_prompt
+from client.gpu_memory import ClientGpuMemory
+from shared.answer_only import (
+    AnswerOnlyCollator,
+    bounded_answer_only_loss,
+    encode_chat_prompt,
+)
 from shared.adapter_checkpoint import AdapterCheckpointStore
 from shared.crypto import sha256_hex
 from shared.protocol import KnowledgeSample, ModelProfile, RoundManifest
@@ -82,6 +89,76 @@ def _configure_torch_native_bmm_compat(torch: Any) -> bool:
     return True
 
 
+def _client_trainer_class(transformers: Any, torch: Any) -> type:
+    class ClientTrainer(transformers.Trainer):
+        client_memory: ClientGpuMemory | None = None
+
+        def memory_phase(self, name: str, **details: Any) -> None:
+            if self.client_memory is not None:
+                self.client_memory.phase(name, step=int(self.state.global_step), **details)
+
+        def training_step(self, model: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+            if self.client_memory is not None:
+                self.client_memory.check_headroom()
+            self.memory_phase("forward_backward_begin",
+                              sequence_length=int(inputs["input_ids"].shape[-1]))
+            try:
+                result = super().training_step(model, inputs, *args, **kwargs)
+            except Exception as exc:
+                self.memory_phase("training_step_failed", error_type=type(exc).__name__)
+                raise
+            self.memory_phase("backward_complete")
+            return result
+
+    return ClientTrainer
+
+
+def _client_autocast(trainer: Any) -> Any:
+    # Direct decoder/head calls bypass Accelerate's model.forward AMP wrapper.
+    accelerator = getattr(trainer, "accelerator", None)
+    return accelerator.autocast() if accelerator is not None else nullcontext()
+
+
+def _attach_memory_callback(trainer: Any, transformers: Any, memory: ClientGpuMemory | None) -> None:
+    trainer.client_memory = memory
+    if memory is None:
+        return
+
+    class MemoryCallback(transformers.TrainerCallback):
+        def on_pre_optimizer_step(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            memory.check_headroom()
+            memory.phase("optimizer_begin", step=int(state.global_step))
+
+        def on_optimizer_step(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            memory.phase("optimizer_complete", step=int(state.global_step))
+
+    trainer.add_callback(MemoryCallback())
+
+
+def _answer_only_trainer_class(transformers: Any, torch: Any) -> type:
+    class BoundedAnswerOnlyTrainer(_client_trainer_class(transformers, torch)):
+        def compute_loss(
+            self,
+            model: Any,
+            inputs: dict[str, Any],
+            return_outputs: bool = False,
+            num_items_in_batch: Any | None = None,
+        ) -> Any:
+            with _client_autocast(self):
+                loss = bounded_answer_only_loss(
+                    torch,
+                    model,
+                    inputs,
+                    num_items_in_batch=num_items_in_batch,
+                )
+            self.memory_phase("loss_ready")
+            if return_outputs:
+                return loss, {"loss": loss}
+            return loss
+
+    return BoundedAnswerOnlyTrainer
+
+
 class TransformersPeftTrainingBackend:
     def __init__(
         self,
@@ -97,7 +174,12 @@ class TransformersPeftTrainingBackend:
             raise ValueError("PEFT backend requires a Transformers execution profile")
         self.data_dir = Path(data_dir).resolve()
         self.model_profile = model_profile
-        self.execution_profile = execution_profile
+        self.execution_profile = (
+            memory_efficient_execution_profile(execution_profile)
+            if isinstance(execution_profile, TrainingExecutionProfile)
+            else execution_profile
+        )
+        self.gpu_memory: ClientGpuMemory | None = None
         self.knowledge_batch_size = (
             int(os.getenv("CLIENT_KNOWLEDGE_BATCH_SIZE", "1"))
             if knowledge_batch_size is None
@@ -110,6 +192,12 @@ class TransformersPeftTrainingBackend:
         )
         if self.knowledge_sequence_chunk_size < 0:
             raise ValueError("knowledge sequence chunk size must be non-negative")
+        if getattr(self.execution_profile, "device", None) == "cuda":
+            self.knowledge_batch_size = 1
+            self.knowledge_sequence_chunk_size = (
+                min(self.knowledge_sequence_chunk_size, 64)
+                if self.knowledge_sequence_chunk_size else 64
+            )
         if (
             self.knowledge_sequence_chunk_size > 0
             and self.knowledge_batch_size != 1
@@ -133,54 +221,55 @@ class TransformersPeftTrainingBackend:
         torch, transformers, peft, safetensors = self._dependencies()
         self._validate_device(torch)
         transformers.set_seed(self.execution_profile.seed)
-        tokenizer = self._load_tokenizer(transformers)
-        base_model = self._load_base_model(torch, transformers)
-        current = self.checkpoints.current()
-
-        if current is None:
-            if base_parent_hash is None:
-                raise ValueError("base-only Client training requires its state hash")
-            model = self._create_adapter(peft, base_model)
-            self._assert_trainable_parameters(model)
-            parent_metadata = None
-            parent_path = None
-            parent_version = 0
-            parent_hash = base_parent_hash
-        else:
-            if base_parent_hash is not None:
-                raise ValueError(
-                    "base state hash must not be supplied for an active PEFT Client"
-                )
-            metadata, checkpoint_path = current
-            model = peft.PeftModel.from_pretrained(
-                base_model,
-                checkpoint_path,
-                is_trainable=True,
-            )
-            self._verify_loaded_adapter(model)
-            parent_metadata = metadata
-            parent_path = checkpoint_path
-            parent_version = metadata.version
-            parent_hash = metadata.checkpoint_hash
-        self._assert_trainable_parameters(model)
-        base_checksum = None
-        if self.execution_profile.verify_frozen_base_checksum:
-            base_checksum = self._frozen_parameter_checksum(torch, model)
-        encoded = encode_private_examples(
-            examples,
-            tokenizer=tokenizer,
-            model_profile=self.model_profile,
-            maximum_sequence_length=manifest.maximum_sequence_length,
-        )
-        dataset = _ListDataset(encoded)
-        collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
         job_id = f"train-{secrets.token_hex(8)}"
         output_dir = self.data_dir / "training_jobs" / job_id
         output_dir.mkdir(parents=True, exist_ok=False)
         candidate_path: Path | None = None
         transient_parent_path: Path | None = None
+        base_model = model = trainer = reloaded_base = reloaded = None
 
         try:
+            tokenizer = self._load_tokenizer(transformers)
+            base_model = self._load_base_model(torch, transformers)
+            current = self.checkpoints.current()
+
+            if current is None:
+                if base_parent_hash is None:
+                    raise ValueError("base-only Client training requires its state hash")
+                model = self._create_adapter(peft, base_model)
+                self._assert_trainable_parameters(model)
+                parent_metadata = None
+                parent_path = None
+                parent_version = 0
+                parent_hash = base_parent_hash
+            else:
+                if base_parent_hash is not None:
+                    raise ValueError(
+                        "base state hash must not be supplied for an active PEFT Client"
+                    )
+                metadata, checkpoint_path = current
+                model = peft.PeftModel.from_pretrained(
+                    base_model,
+                    checkpoint_path,
+                    is_trainable=True,
+                )
+                self._verify_loaded_adapter(model)
+                parent_metadata = metadata
+                parent_path = checkpoint_path
+                parent_version = metadata.version
+                parent_hash = metadata.checkpoint_hash
+            self._assert_trainable_parameters(model)
+            base_checksum = None
+            if self.execution_profile.verify_frozen_base_checksum:
+                base_checksum = self._frozen_parameter_checksum(torch, model)
+            encoded = encode_private_examples(
+                examples,
+                tokenizer=tokenizer,
+                model_profile=self.model_profile,
+                maximum_sequence_length=manifest.maximum_sequence_length,
+            )
+            dataset = _ListDataset(encoded)
+            collator = AnswerOnlyCollator(torch, tokenizer.pad_token_id)
             if parent_metadata is None:
                 transient_parent_path = output_dir / "base_parent_adapter"
                 model.save_pretrained(
@@ -200,7 +289,6 @@ class TransformersPeftTrainingBackend:
 
             if self.execution_profile.gradient_checkpointing:
                 model.config.use_cache = False
-                model.enable_input_require_grads()
 
             arguments = transformers.TrainingArguments(
                 output_dir=str(output_dir),
@@ -224,6 +312,7 @@ class TransformersPeftTrainingBackend:
                 gradient_checkpointing=(
                     self.execution_profile.gradient_checkpointing
                 ),
+                gradient_checkpointing_kwargs={"use_reentrant": False},
                 save_strategy="no",
                 eval_strategy="no",
                 logging_strategy="steps",
@@ -232,14 +321,18 @@ class TransformersPeftTrainingBackend:
                 remove_unused_columns=False,
                 dataloader_pin_memory=self.execution_profile.device == "cuda",
             )
-            trainer = transformers.Trainer(
+            trainer_class = _answer_only_trainer_class(transformers, torch)
+            trainer = trainer_class(
                 model=model,
                 args=arguments,
                 train_dataset=dataset,
                 data_collator=collator,
             )
+            _attach_memory_callback(trainer, transformers, self.gpu_memory)
 
             train_output = trainer.train()
+            if self.gpu_memory is not None:
+                self.gpu_memory.phase("private_training_complete")
             optimizer_step_count = int(trainer.state.global_step)
             training_loss = float(train_output.training_loss)
             if optimizer_step_count < 1:
@@ -369,6 +462,7 @@ class TransformersPeftTrainingBackend:
                 self.checkpoints.discard_staging(candidate_path)
             raise
         finally:
+            reloaded = reloaded_base = trainer = model = base_model = None
             shutil.rmtree(output_dir, ignore_errors=True)
             gc.collect()
             if torch.cuda.is_available():
@@ -504,8 +598,17 @@ class TransformersPeftTrainingBackend:
         max_new_tokens: int,
     ) -> str:
         torch, transformers, peft, _ = self._dependencies()
-        self._validate_device(torch)
-        tokenizer = self._load_tokenizer(transformers)
+        current = self.checkpoints.current()
+        session_key = str(current)
+        session = getattr(self, "_serving_session", None)
+        if session is not None and session[0] != session_key:
+            session = None
+            self.release_serving_session()
+        if session is None:
+            self._validate_device(torch)
+        elif getattr(self, "gpu_memory", None) is not None:
+            self.gpu_memory.check_headroom()
+        tokenizer = session[1] if session else self._load_tokenizer(transformers)
         prompt_ids = encode_chat_prompt(
             tokenizer=tokenizer,
             model_profile=self.model_profile,
@@ -517,21 +620,22 @@ class TransformersPeftTrainingBackend:
         base_model = None
         model = None
         try:
-            base_model = self._load_base_model(torch, transformers)
-            current = self.checkpoints.current()
-            if current is None:
-                model = base_model
+            if session is None:
+                base_model = self._load_base_model(torch, transformers)
+                if current is None:
+                    model = base_model
+                else:
+                    _, checkpoint_path = current
+                    model = peft.PeftModel.from_pretrained(
+                        base_model, checkpoint_path, is_trainable=False,
+                    )
+                    self._verify_loaded_adapter(model)
+                for parameter in model.parameters():
+                    parameter.requires_grad = False
+                model.eval()
+                self._serving_session = (session_key, tokenizer, model)
             else:
-                _, checkpoint_path = current
-                model = peft.PeftModel.from_pretrained(
-                    base_model,
-                    checkpoint_path,
-                    is_trainable=False,
-                )
-                self._verify_loaded_adapter(model)
-            for parameter in model.parameters():
-                parameter.requires_grad = False
-            model.eval()
+                model = session[2]
             input_ids = torch.tensor(
                 [prompt_ids],
                 dtype=torch.long,
@@ -554,11 +658,22 @@ class TransformersPeftTrainingBackend:
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             ).strip()
+        except BaseException:
+            session = None
+            self._serving_session = None
+            raise
         finally:
             del model, base_model
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def release_serving_session(self) -> None:
+        self._serving_session = None
+        gc.collect()
+        torch, _, _, _ = self._dependencies()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _dependencies() -> tuple[Any, Any, Any, Any]:
@@ -583,6 +698,19 @@ class TransformersPeftTrainingBackend:
             )
         if profile.device == "cuda":
             _configure_torch_native_bmm_compat(torch)
+            self.gpu_memory = ClientGpuMemory(torch, self.data_dir)
+            self.gpu_memory.prepare()
+            self.gpu_memory.phase(
+                "execution_profile", profile_hash=profile.profile_hash(),
+                micro_batch_size=profile.micro_batch_size,
+                gradient_accumulation_steps=profile.gradient_accumulation_steps,
+                gradient_checkpointing=profile.gradient_checkpointing,
+                checkpoint_use_reentrant=False,
+                saved_activations="cpu_pinned",
+                precision=profile.precision, attention="sdpa",
+                knowledge_batch_size=self.knowledge_batch_size,
+                knowledge_sequence_chunk_size=self.knowledge_sequence_chunk_size,
+            )
 
     def _load_tokenizer(self, transformers: Any) -> Any:
         profile = self.model_profile
@@ -614,6 +742,8 @@ class TransformersPeftTrainingBackend:
 
     def _load_base_model(self, torch: Any, transformers: Any) -> Any:
         profile = self.model_profile
+        if self.gpu_memory is not None:
+            self.gpu_memory.phase("model_load_begin")
         dtype = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -626,6 +756,7 @@ class TransformersPeftTrainingBackend:
             use_safetensors=True,
             trust_remote_code=False,
             low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
             cache_dir=os.getenv("HF_HOME"),
             token=os.getenv("HF_TOKEN") or None,
         )
@@ -656,7 +787,12 @@ class TransformersPeftTrainingBackend:
             )
         for parameter in model.parameters():
             parameter.requires_grad = False
-        return model.to(self.execution_profile.device)
+        if self.gpu_memory is not None:
+            self.gpu_memory.admit_model(model)
+        model = model.to(self.execution_profile.device)
+        if self.gpu_memory is not None:
+            self.gpu_memory.phase("model_gpu_loaded")
+        return model
 
     def _create_adapter(self, peft: Any, base_model: Any) -> Any:
         lora = self.model_profile.lora

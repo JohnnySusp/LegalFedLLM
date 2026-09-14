@@ -13,15 +13,24 @@ class WindowsDesktopSetupTests(unittest.TestCase):
     def test_setup_pins_cuda_torch_and_calls_runtime_verifier(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("requirements-desktop.txt", source)
-        self.assertIn("torch==2.13.0", source)
+        self.assertIn("torch==2.13.0+cu132", source)
         self.assertIn("https://download.pytorch.org/whl/cu132", source)
-        self.assertIn("--force-reinstall --no-deps", source)
+        self.assertIn("--no-deps", source)
+        self.assertNotIn("--force-reinstall", source)
         self.assertIn("2.13.0+cu132", source)
         self.assertIn("torch.cuda.is_available()", source)
         self.assertIn('torch.version.cuda == "13.2"', source)
         self.assertIn("torch.cuda.is_bf16_supported()", source)
         self.assertIn("verify_windows_desktop.py", source)
         self.assertIn("Invoke-Checked $VenvPython $Verifier", source)
+
+    def test_setup_checks_cuda_torch_before_installing_general_requirements(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        torch_probe = source.index("$TorchProbe | & $VenvPython -")
+        torch_install = source.index("torch==2.13.0+cu132 --index-url $TorchIndex")
+        requirements_install = source.index("-m pip install -r $Requirements")
+        self.assertLess(torch_probe, requirements_install)
+        self.assertLess(torch_install, requirements_install)
 
     def test_setup_uses_repo_local_venv_and_requires_python_314_x64(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
