@@ -1205,148 +1205,579 @@ intend to remove resources belonging to other projects too.
 
 ## Host
 
-The Host and Coordinator run separately from desktop Clients. Public source
-instructions deliberately use local variables rather than a deployment-specific
-SSH address, external port, username, provider, filesystem root or round ID.
+The Host and Coordinator run separately from desktop Clients. The commands in
+this section are written for the established A40 container deployment and are
+intended to be copied directly into the Host shell. They intentionally omit the
+external SSH address, username and provider-specific connection details.
 
-A typical source checkout can use any writable runtime root:
+> **Host deployment boundary:** `/scratch/legalfedllm-test/` and everything
+> beneath it are deployment-specific, private Host state. The public source
+> archive does **not** contain or recreate the deployed checkout, shared virtual
+> environment, `.env.host`, private datasets, downloaded models/caches,
+> artifacts, logs or prior round state stored there. Do not copy, publish,
+> delete, regenerate or replace the contents of `/scratch/legalfedllm-test/`
+> merely because this README documents the paths. These commands apply to the
+> established Host installation only; a different Host must first be provisioned
+> with an equivalent deployment layout.
 
-```bash
-cd /path/to/LegalFedLLM
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+The documented Host layout is:
 
-HOST_ENV=".env.host"
-HOST_RUNTIME_ROOT="/path/to/legalfedllm-runtime"
-
-python scripts/bootstrap.py host   --output "$HOST_ENV"   --runtime-root "$HOST_RUNTIME_ROOT"
+```text
+/scratch/legalfedllm-test/
+├── .venv/                       shared Host Python environment
+├── work/
+│   └── LegalFedLLM/             deployed source checkout
+│       ├── .env.host            private Host/Coordinator environment
+│       ├── host/
+│       ├── coordinator/
+│       ├── shared/
+│       └── scripts/
+│           ├── run_host_stack.py
+│           ├── issue_enrollment_token.py
+│           └── create_remote_round.py
+├── datasets/
+│   └── gld2012/
+│       ├── reference.jsonl      private D^P reference data
+│       └── validation.jsonl     private Host-only D^V validation data
+├── cache/                       Hugging Face, pip, Torch, Triton, XDG, CUDA
+├── tmp/
+├── logs/
+├── artifacts/                   Host and Coordinator runtime state
+└── incoming/                    deployment staging
 ```
 
-Host bootstrap generates fresh `ADMIN_TOKEN` and `INTERNAL_API_TOKEN` values,
-writes them only to the private environment file, creates the configured runtime
-and cache directories, and refuses to silently replace an existing environment
-belonging to another role. The generated file should remain private and must not
-be committed or included in a public release.
+### Enter the existing Host installation
 
-The proof-of-concept GLD data is intentionally not distributed in the public
-repository. A Host operator who is authorized to use that corpus must provision
-D^P and D^V at the paths configured by `COORDINATOR_REFERENCE_DATASET_PATH` and
-`COORDINATOR_VALIDATION_DATASET_PATH`. Host bootstrap creates their parent
-directory but does not download, synthesize or publish the copyrighted source.
-D^V remains Host/Coordinator-only.
-
-### Inspect the Host/Coordinator before changing it
-
-From the Host repository with the environment activated:
+Run this at the beginning of a fresh Host shell. It fails immediately if the
+expected deployed repository, virtual environment or private Host environment is
+missing, preventing later commands from accidentally running in `/home/iosider`
+or against the system Python installation.
 
 ```bash
-cd /path/to/LegalFedLLM
-source .venv/bin/activate
+export LEGALFEDLLM_TEST_ROOT=/scratch/legalfedllm-test
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
 
-HOST_ENV=".env.host"
+test -f /scratch/legalfedllm-test/.venv/bin/activate || {
+  echo 'ERROR: /scratch/legalfedllm-test/.venv is missing'
+  exit 1
+}
+source /scratch/legalfedllm-test/.venv/bin/activate
 
-echo "=== LegalFedLLM processes ==="
-ps -ef | grep -E   'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main'   | grep -v grep || true
+export HF_HOME=/scratch/legalfedllm-test/cache/huggingface
+export PIP_CACHE_DIR=/scratch/legalfedllm-test/cache/pip
+export TORCH_HOME=/scratch/legalfedllm-test/cache/torch
+export TORCH_EXTENSIONS_DIR=/scratch/legalfedllm-test/cache/torch-extensions
+export TRITON_HOME=/scratch/legalfedllm-test/cache/triton
+export XDG_CACHE_HOME=/scratch/legalfedllm-test/cache/xdg
+export CUDA_CACHE_PATH=/scratch/legalfedllm-test/cache/cuda
+export TMPDIR=/scratch/legalfedllm-test/tmp
+export TOKENIZERS_PARALLELISM=false
 
-echo
-echo "=== Coordinator ==="
-curl -fsS --max-time 5 http://127.0.0.1:8000/health || true
-echo
+mkdir -p \
+  /scratch/legalfedllm-test/cache/huggingface \
+  /scratch/legalfedllm-test/cache/pip \
+  /scratch/legalfedllm-test/cache/torch \
+  /scratch/legalfedllm-test/cache/torch-extensions \
+  /scratch/legalfedllm-test/cache/triton \
+  /scratch/legalfedllm-test/cache/xdg \
+  /scratch/legalfedllm-test/cache/cuda \
+  /scratch/legalfedllm-test/tmp \
+  /scratch/legalfedllm-test/logs
 
-echo
-echo "=== Host ==="
-curl -fsS --max-time 5 http://127.0.0.1:8002/health || true
-echo
+test -f requirements.txt || { echo 'ERROR: requirements.txt is missing'; exit 1; }
+test -f scripts/run_host_stack.py || { echo 'ERROR: scripts/run_host_stack.py is missing'; exit 1; }
+test -f scripts/issue_enrollment_token.py || { echo 'ERROR: scripts/issue_enrollment_token.py is missing'; exit 1; }
+test -f scripts/create_remote_round.py || { echo 'ERROR: scripts/create_remote_round.py is missing'; exit 1; }
+test -f .env.host || { echo 'ERROR: .env.host is missing'; exit 1; }
 
+printf 'repo=%s\npython=%s\n' "$PWD" "$(command -v python)"
+python --version
 nvidia-smi
 ```
 
-For the normal two-Client proof-of-concept policy, Coordinator health should
-report majority quorum with a minimum trusted quorum of 2 and no explicit
-one-Client override.
+The normal Host installation uses the existing shared environment at
+`/scratch/legalfedllm-test/.venv`. Do not create another `.venv` inside the
+repository as part of routine Host startup.
 
-### Start the Host/Coordinator detached
+### Fresh Host bootstrap only
+
+Use this only when the source tree and shared venv have already been provisioned
+but `.env.host` has not yet been created. It is **not** a normal startup command
+for an existing Host.
 
 ```bash
-cd /path/to/LegalFedLLM
-source .venv/bin/activate
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
 
-HOST_ENV=".env.host"
-HOST_RUNTIME_ROOT="/path/to/legalfedllm-runtime"
-RUN_LABEL="legalfedllm-host-$(date +%Y%m%d-%H%M%S)"
-LOG="$HOST_RUNTIME_ROOT/logs/${RUN_LABEL}.log"
-PIDFILE="$HOST_RUNTIME_ROOT/logs/${RUN_LABEL}.pid"
+export PIP_CACHE_DIR=/scratch/legalfedllm-test/cache/pip
+export TMPDIR=/scratch/legalfedllm-test/tmp
+mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
 
-mkdir -p "$HOST_RUNTIME_ROOT/logs"
+python -m pip install -r requirements.txt
 
-nohup python scripts/run_host_stack.py   --env-file "$HOST_ENV"   >"$LOG" 2>&1 < /dev/null &
+test ! -e .env.host || {
+  echo 'ERROR: .env.host already exists; inspect and reuse it instead of replacing it'
+  exit 1
+}
 
-echo $! > "$PIDFILE"
-echo "Host stack parent PID: $(cat "$PIDFILE")"
-echo "Log: $LOG"
+python scripts/bootstrap.py host \
+  --output .env.host \
+  --runtime-root /scratch/legalfedllm-test
 ```
 
-Then verify startup:
+Host bootstrap creates private administrative/internal tokens and Host runtime
+paths. It does not download or synthesize the private GLD-derived D^P/D^V files.
+Those datasets must already be available at the paths configured in `.env.host`.
+D^V remains Host/Coordinator-only.
+
+### Check whether Host and Coordinator are running
+
+The Host API is expected on `127.0.0.1:8002` and the Coordinator on
+`127.0.0.1:8000`.
 
 ```bash
-sleep 5
-tail -n 60 "$LOG"
-curl -fsS --max-time 5 http://127.0.0.1:8002/health
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+echo '=== LegalFedLLM processes ==='
+ps -ef | grep -E \
+  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+  | grep -v grep || true
+
 echo
-curl -fsS --max-time 5 http://127.0.0.1:8000/health
+echo '=== Host health :8002 ==='
+if curl -fsS --max-time 5 http://127.0.0.1:8002/health; then
+  echo
+  echo 'Host is healthy'
+else
+  echo
+  echo 'Host is not reachable'
+fi
+
 echo
+echo '=== Coordinator health :8000 ==='
+if curl -fsS --max-time 5 http://127.0.0.1:8000/health; then
+  echo
+  echo 'Coordinator is healthy'
+else
+  echo
+  echo 'Coordinator is not reachable'
+fi
+
+echo
+nvidia-smi
 ```
 
-Do not use broad `pkill python` or `pkill uvicorn` commands. To stop the stack,
-identify the exact `run_host_stack.py` parent and signal only that process:
+Do not infer service state from `ss`, `lsof` or `fuser` alone. Process inspection
+plus the direct health probes above are the normal checks for this deployment.
+
+### Ensure the normal two-Client Host/Coordinator stack is running
+
+This is the normal federation mode. It requires majority quorum with minimum
+trusted quorum `2` and no one-Client override.
+
+The block below is safe to run when the stack is already healthy: it reports the
+current Coordinator quorum configuration and does not start a duplicate stack.
+If neither service is healthy, it starts the stack detached and waits for both
+health endpoints. If only one of the two services is healthy, it stops rather
+than guessing about a partial stack.
 
 ```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+HOST_OK=0
+COORD_OK=0
+curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
+curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+
+if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+  echo 'Host and Coordinator are already healthy.'
+  COORD_HEALTH="$(curl -fsS http://127.0.0.1:8000/health)"
+  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
+  printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+if h.get("quorum_policy") != "majority":
+    raise SystemExit("ERROR: Coordinator is not using majority quorum")
+if str(h.get("minimum_trusted_client_quorum")) != "2":
+    raise SystemExit("ERROR: Coordinator minimum trusted quorum is not 2")
+if str(h.get("trusted_client_quorum_override")) not in {"none", "", "None"}:
+    raise SystemExit("ERROR: Coordinator is running with a one-Client override; stop it before normal two-Client use")
+print("Normal two-Client quorum configuration is active.")
+'
+elif [ "$HOST_OK" -eq 0 ] && [ "$COORD_OK" -eq 0 ]; then
+  export COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM=2
+  export COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE=""
+
+  LOG=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
+  PIDFILE=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
+  mkdir -p /scratch/legalfedllm-test/logs
+
+  nohup python scripts/run_host_stack.py \
+    --env-file .env.host \
+    >"$LOG" 2>&1 < /dev/null &
+
+  echo $! > "$PIDFILE"
+  echo "Started Host stack parent PID $(cat "$PIDFILE")"
+  echo "Log: $LOG"
+
+  for i in $(seq 1 180); do
+    HOST_OK=0
+    COORD_OK=0
+    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
+    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+    if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+      break
+    fi
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo 'ERROR: Host stack exited during startup'
+      tail -n 120 "$LOG"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health || {
+    echo 'ERROR: Host did not become healthy'
+    tail -n 120 "$LOG"
+    exit 1
+  }
+  echo
+
+  COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+    echo 'ERROR: Coordinator did not become healthy'
+    tail -n 120 "$LOG"
+    exit 1
+  }
+  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
+  printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+assert h.get("quorum_policy") == "majority", h
+assert str(h.get("minimum_trusted_client_quorum")) == "2", h
+assert str(h.get("trusted_client_quorum_override")) in {"none", "", "None"}, h
+print("Normal two-Client Host/Coordinator stack is ready.")
+'
+else
+  echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
+  ps -ef | grep -E \
+    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+    | grep -v grep || true
+  exit 1
+fi
+```
+
+### Ensure the one-Client test Host/Coordinator stack is running
+
+A one-Client round is a controlled proof-of-concept/testing mode. The running
+Coordinator must itself be started with trusted quorum override `1`; setting the
+override only on `create_remote_round.py` is insufficient because the
+Coordinator resolves quorum using its own startup configuration.
+
+Do not use this override for normal two-Client federation.
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+HOST_OK=0
+COORD_OK=0
+curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
+curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+
+if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+  echo 'Host and Coordinator are already healthy.'
+  COORD_HEALTH="$(curl -fsS http://127.0.0.1:8000/health)"
+  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
+  printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+if h.get("quorum_policy") != "majority":
+    raise SystemExit("ERROR: Coordinator is not using majority quorum")
+if str(h.get("minimum_trusted_client_quorum")) != "2":
+    raise SystemExit("ERROR: Coordinator minimum trusted quorum is not 2")
+if str(h.get("trusted_client_quorum_override")) != "1":
+    raise SystemExit("ERROR: Coordinator is not in one-Client test mode; stop the current stack before switching modes")
+print("One-Client quorum override is active.")
+'
+elif [ "$HOST_OK" -eq 0 ] && [ "$COORD_OK" -eq 0 ]; then
+  export COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM=2
+  export COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE=1
+
+  LOG=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
+  PIDFILE=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
+  mkdir -p /scratch/legalfedllm-test/logs
+
+  nohup python scripts/run_host_stack.py \
+    --env-file .env.host \
+    >"$LOG" 2>&1 < /dev/null &
+
+  echo $! > "$PIDFILE"
+  echo "Started Host stack parent PID $(cat "$PIDFILE")"
+  echo "Log: $LOG"
+
+  for i in $(seq 1 180); do
+    HOST_OK=0
+    COORD_OK=0
+    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
+    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+    if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+      break
+    fi
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo 'ERROR: Host stack exited during startup'
+      tail -n 120 "$LOG"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health || {
+    echo 'ERROR: Host did not become healthy'
+    tail -n 120 "$LOG"
+    exit 1
+  }
+  echo
+
+  COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+    echo 'ERROR: Coordinator did not become healthy'
+    tail -n 120 "$LOG"
+    exit 1
+  }
+  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
+  printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+assert h.get("quorum_policy") == "majority", h
+assert str(h.get("minimum_trusted_client_quorum")) == "2", h
+assert str(h.get("trusted_client_quorum_override")) == "1", h
+print("One-Client Host/Coordinator stack is ready.")
+'
+else
+  echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
+  ps -ef | grep -E \
+    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+    | grep -v grep || true
+  exit 1
+fi
+```
+
+### Stop the Host/Coordinator stack safely
+
+Use this when the stack must be stopped or when switching between normal
+two-Client mode and one-Client test mode. Do not use broad commands such as
+`pkill python` or `pkill uvicorn`.
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+
 mapfile -t STACK_PIDS < <(
   ps -eo pid=,args= |
   awk '/[r]un_host_stack.py/ {print $1}'
 )
 
-printf 'LegalFedLLM Host stack PIDs: %s\n' "${STACK_PIDS[*]:-none}"
+printf 'LegalFedLLM Host stack parent PIDs: %s\n' "${STACK_PIDS[*]:-none}"
 
-if [ "${#STACK_PIDS[@]}" -eq 1 ]; then
+if [ "${#STACK_PIDS[@]}" -eq 0 ]; then
+  echo 'No run_host_stack.py parent is running.'
+elif [ "${#STACK_PIDS[@]}" -eq 1 ]; then
   kill "${STACK_PIDS[0]}"
-elif [ "${#STACK_PIDS[@]}" -gt 1 ]; then
-  echo "ERROR: multiple Host stack parents found; inspect before stopping anything"
+  for i in $(seq 1 15); do
+    if ! kill -0 "${STACK_PIDS[0]}" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  echo 'Remaining LegalFedLLM processes:'
+  ps -ef | grep -E \
+    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+    | grep -v grep || true
+else
+  echo 'ERROR: multiple run_host_stack.py parents found; inspect them before stopping anything.'
+  exit 1
 fi
 ```
 
-### Issue Client enrollment tokens
+If the stack is being used by an active round, inspect that round before stopping
+the Host. A selected Client disconnect does not shrink the signed round quorum.
 
-After the Coordinator is healthy, issue one single-use token for each genuinely
-new Client profile:
+### Issue enrollment tokens
 
-```bash
-cd /path/to/LegalFedLLM
-source .venv/bin/activate
+Enrollment tokens are single-use. An already-enrolled saved Client profile keeps
+its persisted Ed25519 identity and does not need a new token on every restart.
+Do not paste enrollment tokens into public logs, commits or documentation.
 
-python scripts/issue_enrollment_token.py   --env-file .env.host   --token-only
-```
+#### One new Client
 
-A successful Client registration consumes the token. Existing enrolled profiles
-reuse their persisted Ed25519 identity and do not require another token.
-
-### Create a normal two-Client Qwen + Granite round
-
-Use the already-registered Client IDs. Do not put real Client IDs in public
-documentation:
+Make sure the Host/Coordinator stack is healthy first, then run:
 
 ```bash
-cd /path/to/LegalFedLLM
-source .venv/bin/activate
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
 
-HOST_ENV=".env.host"
+curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
+  echo 'ERROR: Host is not healthy'
+  exit 1
+}
+curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
+  echo 'ERROR: Coordinator is not healthy'
+  exit 1
+}
 
-QWEN_CLIENT_ID="<enrolled-qwen-client-id>" GRANITE_CLIENT_ID="<enrolled-granite-client-id>" ROUND_CLIENT_SLOTS="client-1,client-2" COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="" python scripts/create_remote_round.py   --env-file "$HOST_ENV"
+python scripts/issue_enrollment_token.py \
+  --env-file .env.host \
+  --token-only
 ```
 
-For the Mistral Nemo Host, the supported assignments are:
+Copy the printed token directly into exactly one new Client profile. Successful
+enrollment consumes it.
+
+#### Two new Clients
+
+Issue the two tokens separately so each Client receives a different single-use
+token:
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
+  echo 'ERROR: Host is not healthy'
+  exit 1
+}
+curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
+  echo 'ERROR: Coordinator is not healthy'
+  exit 1
+}
+
+echo '=== Token for Client 1 ==='
+python scripts/issue_enrollment_token.py \
+  --env-file .env.host \
+  --token-only
+
+echo
+echo '=== Token for Client 2 ==='
+python scripts/issue_enrollment_token.py \
+  --env-file .env.host \
+  --token-only
+```
+
+Use the first token for the first new profile and the second token for the second
+new profile. Do not reuse either token.
+
+### Create a one-Client round
+
+A one-Client round requires the Coordinator to be running in the one-Client test
+mode described above, with `trusted_client_quorum_override` reported as `1` by
+`/health`.
+
+The repository defines two round slots:
+
+```text
+client-1 = Qwen3 1.7B
+client-2 = Granite 3.3 2B
+```
+
+Use one of the two complete command blocks below.
+
+#### One Qwen Client
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+  echo 'ERROR: Coordinator is not healthy'
+  exit 1
+}
+printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+if str(h.get("trusted_client_quorum_override")) != "1":
+    raise SystemExit("ERROR: start the Host/Coordinator in one-Client test mode first")
+'
+
+read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
+test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; exit 1; }
+export QWEN_CLIENT_ID
+
+ROUND_CLIENT_SLOTS="client-1" \
+COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
+python scripts/create_remote_round.py --env-file .env.host
+```
+
+#### One Granite Client
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+  echo 'ERROR: Coordinator is not healthy'
+  exit 1
+}
+printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+if str(h.get("trusted_client_quorum_override")) != "1":
+    raise SystemExit("ERROR: start the Host/Coordinator in one-Client test mode first")
+'
+
+read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
+test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; exit 1; }
+export GRANITE_CLIENT_ID
+
+ROUND_CLIENT_SLOTS="client-2" \
+COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
+python scripts/create_remote_round.py --env-file .env.host
+```
+
+The one-Client override is test-only. Return the Host to normal two-Client mode
+before running the normal federation topology.
+
+### Create the normal two-Client Qwen + Granite round
+
+The Coordinator must be running in normal two-Client mode: majority policy,
+minimum trusted quorum `2`, and no override.
+
+```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
+
+COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+  echo 'ERROR: Coordinator is not healthy'
+  exit 1
+}
+printf '%s\n' "$COORD_HEALTH" | python -c '
+import json, sys
+h=json.load(sys.stdin)
+if h.get("quorum_policy") != "majority":
+    raise SystemExit("ERROR: Coordinator is not using majority quorum")
+if str(h.get("minimum_trusted_client_quorum")) != "2":
+    raise SystemExit("ERROR: Coordinator minimum trusted quorum is not 2")
+if str(h.get("trusted_client_quorum_override")) not in {"none", "", "None"}:
+    raise SystemExit("ERROR: stop the one-Client test stack and restart normal two-Client mode")
+'
+
+read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
+read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
+
+test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; exit 1; }
+test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; exit 1; }
+
+export QWEN_CLIENT_ID GRANITE_CLIENT_ID
+
+ROUND_CLIENT_SLOTS="client-1,client-2" \
+COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="" \
+python scripts/create_remote_round.py --env-file .env.host
+```
+
+For the Mistral Nemo Host, the supported alignment assignments are:
 
 ```text
 Qwen3 1.7B
@@ -1358,14 +1789,18 @@ Granite 3.3 2B
 
 Unknown or unsupported model pairs fail closed.
 
-### Verify or monitor a round
+### Verify and monitor a round
 
-Use the new round identifier printed by `create_remote_round.py`:
+`create_remote_round.py` prints the newly created `round_id`. Enter that value
+when prompted below; this is runtime input, not a filesystem or deployment
+placeholder.
 
 ```bash
-ROUND_ID="<round-id>"
+read -r -p 'Round ID printed by create_remote_round.py: ' ROUND_ID
+test -n "$ROUND_ID" || { echo 'ERROR: Round ID is required'; exit 1; }
 
-curl -fsS   "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/manifest" |
+curl -fsS \
+  "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/manifest" |
 python -c '
 import json, sys
 d=json.load(sys.stdin)
@@ -1379,10 +1814,11 @@ print("submission_deadline:", d["submission_deadline"])
 '
 ```
 
-Then inspect the live state without dumping the full manifest:
+Then inspect the current state:
 
 ```bash
-curl -fsS   "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status" |
+curl -fsS \
+  "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status" |
 python -c '
 import json, sys
 d=json.load(sys.stdin)
@@ -1394,13 +1830,7 @@ print("message:", d.get("message"))
 '
 ```
 
-A newly created normal two-Client round should begin as `COLLECTING` with zero
-accepted Clients and quorum 2. After the first accepted package it remains
-`COLLECTING` at 1/2. After the second trusted package reaches quorum, the
-Coordinator seals the accepted set and advances through Host integration and
-distillation.
-
-For a compact live monitor:
+For continuous compact monitoring:
 
 ```bash
 watch -n 5 "
@@ -1408,18 +1838,46 @@ curl -fsS http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status |
 python -c '
 import json,sys
 d=json.load(sys.stdin)
-print("state:", d["state"])
-print("accepted:", d["accepted_client_ids"])
-print("count:", len(d["accepted_client_ids"]))
-print("message:", d.get("message"))
+print(\"state:\", d[\"state\"])
+print(\"accepted:\", d[\"accepted_client_ids\"])
+print(\"count:\", len(d[\"accepted_client_ids\"]))
+print(\"message:\", d.get(\"message\"))
 '
 "
 ```
 
+In a one-Client test round, quorum `1` permits the accepted Client package to
+advance the round. In the normal two-Client topology, a new round begins as
+`COLLECTING` with quorum `2`; after the first accepted package it remains
+`COLLECTING` at `1/2`, and after the second trusted package reaches quorum the
+Coordinator seals the accepted set and proceeds through Host integration and
+distillation.
+
 An expired collecting round is evaluated normally by its status endpoint. If it
-passes its submission deadline without trusted quorum, it becomes `SKIPPED`.
-Terminal `SKIPPED`, `COMPLETED` and `ABORTED` rounds no longer block creation of
-the next round. Do not edit or delete generated round state by hand.
+passes its submission deadline without reaching trusted quorum, it becomes
+`SKIPPED`. Terminal `SKIPPED`, `COMPLETED` and `ABORTED` rounds no longer block
+creation of the next round. Do not hand-edit or delete generated round state.
+
+### Normal Host workflow summary
+
+For routine operation on this A40 installation:
+
+```text
+1. Enter /scratch/legalfedllm-test/work/LegalFedLLM and activate
+   /scratch/legalfedllm-test/.venv.
+2. Check the A40 with nvidia-smi.
+3. Check Host :8002 and Coordinator :8000.
+4. Start the appropriate stack mode only if both services are stopped:
+   - normal two-Client mode for Qwen + Granite federation;
+   - one-Client override mode only for controlled single-Client testing.
+5. Verify Coordinator quorum mode from /health.
+6. Issue one unique enrollment token for each genuinely new Client profile.
+7. Create either the one-Client or two-Client round with the corresponding
+   command block above.
+8. Monitor the signed round through the Coordinator status endpoint.
+9. Leave the detached Host stack running while the round is active unless there
+   is an explicit reason to stop it.
+```
 
 ## Development record
 
@@ -1842,10 +2300,18 @@ overwriting it.
 Host/Coordinator example:
 
 ```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /path/to/legalfedllm-runtime
+  --runtime-root /scratch/legalfedllm-test
 ```
+
+This example applies only after that Host source tree and shared venv have been
+provisioned. Bootstrap creates missing private configuration and runtime
+directories; it does not install the source checkout or supply private datasets.
+On an existing Host, inspect and reuse `.env.host` instead of treating bootstrap
+as a routine startup command.
 
 After the Host/Coordinator is running, issue one single-use Client enrollment token:
 
@@ -1871,9 +2337,11 @@ For controlled one-Client proof-of-concept testing only, the Host bootstrap
 supports:
 
 ```bash
+cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+source /scratch/legalfedllm-test/.venv/bin/activate
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /path/to/legalfedllm-runtime \
+  --runtime-root /scratch/legalfedllm-test \
   --trusted-quorum-override 1
 ```
 
