@@ -32,7 +32,7 @@ class DesktopProfile(BaseModel):
     display_name: str = Field(min_length=1, max_length=128)
     client_id: str = Field(min_length=1, max_length=128)
     model_profile_id: str = Field(min_length=1, max_length=256)
-    ssh_target: str = Field(min_length=1, max_length=512)
+    ssh_target: str = Field(default="", max_length=512)
     ssh_port: int = Field(default=22, ge=1, le=65535)
     coordinator_local_port: int = Field(default=8000, ge=1, le=65535)
     coordinator_remote_host: str = Field(default="127.0.0.1", min_length=1, max_length=253)
@@ -125,7 +125,7 @@ class PortableProfileManager:
         *,
         display_name: str,
         model_profile_id: str,
-        ssh_target: str,
+        ssh_target: str = "",
         ssh_port: int,
         coordinator_local_port: int = 8000,
         coordinator_remote_host: str = "127.0.0.1",
@@ -158,6 +158,29 @@ class PortableProfileManager:
         )
         self.set_active(profile.profile_id)
         return profile
+
+    def update_connection(
+        self,
+        profile_id: str,
+        *,
+        display_name: str,
+        ssh_target: str,
+        ssh_port: int,
+    ) -> DesktopProfile:
+        profile = self.load(profile_id)
+        updated = profile.model_copy(
+            update={
+                "display_name": display_name.strip(),
+                "ssh_target": ssh_target.strip(),
+                "ssh_port": ssh_port,
+            }
+        )
+        updated = DesktopProfile.model_validate(updated.model_dump(mode="json"))
+        self._write_json(
+            self.profile_paths(profile_id).profile_json,
+            updated.model_dump(mode="json"),
+        )
+        return updated
 
     def _read_state(self) -> dict[str, Any]:
         if not self.state_path.is_file():
@@ -245,6 +268,8 @@ class PortableProfileManager:
         enrollment_token: str | None = None,
     ) -> dict[str, str]:
         paths = self.profile_paths(profile.profile_id)
+        registered = (paths.client_data / "identity" / "registration.json").is_file()
+        federation_enabled = bool(profile.ssh_target and (enrollment_token or registered))
         env = dict(os.environ)
         env.update(
             {
@@ -261,7 +286,7 @@ class PortableProfileManager:
                 "OLLAMA_BASE_URL": env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
                 "HF_HOME": str(self.models_root),
                 "COORDINATOR_URL": f"http://127.0.0.1:{profile.coordinator_local_port}",
-                "CLIENT_SSH_TUNNEL_ENABLED": "true",
+                "CLIENT_SSH_TUNNEL_ENABLED": "true" if federation_enabled else "false",
                 "CLIENT_SSH_TARGET": profile.ssh_target,
                 "CLIENT_SSH_PORT": str(profile.ssh_port),
                 "CLIENT_COORDINATOR_LOCAL_PORT": str(profile.coordinator_local_port),

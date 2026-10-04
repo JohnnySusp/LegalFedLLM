@@ -157,8 +157,8 @@ class LocalAiStackTests(unittest.TestCase):
                     "GenericOpenAiMaxTokens": None,
                 }
             }
-            onboarding = mock.Mock(status_code=200)
-            onboarding.json.return_value = {"onboardingComplete": True}
+            onboarding_before = mock.Mock(status_code=200)
+            onboarding_before.json.return_value = {"onboardingComplete": True}
             configured = mock.Mock(status_code=200)
             configured.json.return_value = {
                 "newValues": {
@@ -170,6 +170,8 @@ class LocalAiStackTests(unittest.TestCase):
                 },
                 "error": False,
             }
+            onboarding_after = mock.Mock(status_code=200)
+            onboarding_after.json.return_value = {"onboardingComplete": True}
             setup_after = mock.Mock(status_code=200)
             setup_after.json.return_value = {
                 "results": {
@@ -200,7 +202,7 @@ class LocalAiStackTests(unittest.TestCase):
                 ) as ensure_anythingllm,
                 mock.patch(
                     "desktop.local_ai.httpx.get",
-                    side_effect=[setup_before, onboarding, setup_after],
+                    side_effect=[setup_before, onboarding_before, onboarding_after, setup_after],
                 ) as get,
                 mock.patch("desktop.local_ai.httpx.post", return_value=configured) as post,
             ):
@@ -219,14 +221,18 @@ class LocalAiStackTests(unittest.TestCase):
             self.assertTrue(result["anythingllm_configured"])
             self.assertFalse(result["anythingllm_managed"])
             self.assertEqual(result["anythingllm_executable"], str(anythingllm_executable))
-            self.assertEqual(result["anythingllm_settings"]["context_window"], "4096")
-            self.assertEqual(result["anythingllm_settings"]["max_tokens"], "1024")
-            self.assertEqual(result["anythingllm_settings"]["default_provider"], "ollama")
-            self.assertTrue(result["anythingllm_settings"]["onboarding_complete"])
+            settings = result["anythingllm_settings"]
+            self.assertEqual(settings["context_window"], "4096")
+            self.assertEqual(settings["max_tokens"], "1024")
+            self.assertEqual(settings["default_provider"], "ollama")
+            self.assertEqual(settings["active_provider"], "ollama")
+            self.assertTrue(settings["onboarding_complete"])
+            self.assertFalse(settings["onboarding_completed_by_legalfedllm"])
             self.assertEqual(
                 get.call_args_list,
                 [
                     mock.call("http://127.0.0.1:3001/api/setup-complete", timeout=3.0),
+                    mock.call("http://127.0.0.1:3001/api/onboarding", timeout=3.0),
                     mock.call("http://127.0.0.1:3001/api/onboarding", timeout=3.0),
                     mock.call("http://127.0.0.1:3001/api/setup-complete", timeout=3.0),
                 ],
@@ -243,7 +249,7 @@ class LocalAiStackTests(unittest.TestCase):
                 timeout=10.0,
             )
 
-    def test_windows_prepare_preconfigures_generic_openai_without_completing_onboarding(self) -> None:
+    def test_windows_prepare_bootstraps_fresh_anythingllm_and_completes_onboarding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stack = LocalAiStack(
@@ -254,8 +260,8 @@ class LocalAiStackTests(unittest.TestCase):
             )
             setup_before = mock.Mock(status_code=200)
             setup_before.json.return_value = {"results": {"LLMProvider": None}}
-            onboarding = mock.Mock(status_code=200)
-            onboarding.json.return_value = {"onboardingComplete": False}
+            onboarding_before = mock.Mock(status_code=200)
+            onboarding_before.json.return_value = {"onboardingComplete": False}
             configured = mock.Mock(status_code=200)
             configured.json.return_value = {
                 "newValues": {
@@ -264,13 +270,17 @@ class LocalAiStackTests(unittest.TestCase):
                     "GenericOpenAiModelPref": "legalfedllm-local",
                     "GenericOpenAiTokenLimit": "4096",
                     "GenericOpenAiMaxTokens": "1024",
+                    "LLMProvider": "generic-openai",
                 },
                 "error": False,
             }
+            onboarding_complete = mock.Mock(status_code=200)
+            onboarding_after = mock.Mock(status_code=200)
+            onboarding_after.json.return_value = {"onboardingComplete": True}
             setup_after = mock.Mock(status_code=200)
             setup_after.json.return_value = {
                 "results": {
-                    "LLMProvider": None,
+                    "LLMProvider": "generic-openai",
                     "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
                     "GenericOpenAiModelPref": "legalfedllm-local",
                     "GenericOpenAiTokenLimit": "4096",
@@ -292,17 +302,89 @@ class LocalAiStackTests(unittest.TestCase):
                 ),
                 mock.patch(
                     "desktop.local_ai.httpx.get",
-                    side_effect=[setup_before, onboarding, setup_after],
+                    side_effect=[setup_before, onboarding_before, onboarding_after, setup_after],
                 ),
-                mock.patch("desktop.local_ai.httpx.post", return_value=configured) as post,
+                mock.patch(
+                    "desktop.local_ai.httpx.post",
+                    side_effect=[configured, onboarding_complete],
+                ) as post,
             ):
                 result = stack.prepare(self._profile(), "client-admin-secret")
 
-            self.assertFalse(result["anythingllm_settings"]["onboarding_complete"])
-            self.assertIsNone(result["anythingllm_settings"]["default_provider"])
+            settings = result["anythingllm_settings"]
+            self.assertTrue(settings["onboarding_complete"])
+            self.assertTrue(settings["onboarding_completed_by_legalfedllm"])
+            self.assertIsNone(settings["default_provider"])
+            self.assertEqual(settings["active_provider"], "generic-openai")
+            self.assertEqual(settings["model"], "legalfedllm-local")
+            self.assertEqual(post.call_count, 2)
+            self.assertEqual(
+                post.call_args_list[0],
+                mock.call(
+                    "http://127.0.0.1:3001/api/system/update-env",
+                    json={
+                        "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
+                        "GenericOpenAiKey": "client-admin-secret",
+                        "GenericOpenAiModelPref": "legalfedllm-local",
+                        "GenericOpenAiTokenLimit": "4096",
+                        "GenericOpenAiMaxTokens": "1024",
+                        "LLMProvider": "generic-openai",
+                    },
+                    timeout=10.0,
+                ),
+            )
+            self.assertEqual(
+                post.call_args_list[1],
+                mock.call("http://127.0.0.1:3001/api/onboarding", timeout=10.0),
+            )
+
+    def test_windows_model_selection_explicitly_switches_to_legalfedllm_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stack = LocalAiStack(
+                root / "data",
+                bundle_root=self._bundle(root),
+                legacy_root=root / "missing-legacy",
+                platform="win32",
+            )
+            configured = mock.Mock(status_code=200)
+            configured.json.return_value = {
+                "newValues": {
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
+                    "GenericOpenAiKey": "client-admin-secret",
+                    "GenericOpenAiModelPref": "legalfedllm-host",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiMaxTokens": "1024",
+                    "LLMProvider": "generic-openai",
+                },
+                "error": False,
+            }
+            setup_after = mock.Mock(status_code=200)
+            setup_after.json.return_value = {
+                "results": {
+                    "LLMProvider": "generic-openai",
+                    "GenericOpenAiBasePath": "http://127.0.0.1:8001/v1",
+                    "GenericOpenAiModelPref": "legalfedllm-host",
+                    "GenericOpenAiTokenLimit": "4096",
+                    "GenericOpenAiKey": True,
+                    "GenericOpenAiMaxTokens": "1024",
+                }
+            }
+            with (
+                mock.patch("desktop.local_ai.httpx.post", return_value=configured) as post,
+                mock.patch("desktop.local_ai.httpx.get", return_value=setup_after),
+            ):
+                result = stack.select_windows_anythingllm_model(
+                    self._profile(),
+                    "client-admin-secret",
+                    "legalfedllm-host",
+                )
+
+            self.assertEqual(result["active_provider"], "generic-openai")
+            self.assertEqual(result["model"], "legalfedllm-host")
             sent = post.call_args.kwargs["json"]
-            self.assertNotIn("LLMProvider", sent)
-            self.assertEqual(sent["GenericOpenAiModelPref"], "legalfedllm-local")
+            self.assertEqual(sent["LLMProvider"], "generic-openai")
+            self.assertEqual(sent["GenericOpenAiModelPref"], "legalfedllm-host")
 
     def test_windows_prepare_fails_closed_when_anythingllm_requires_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

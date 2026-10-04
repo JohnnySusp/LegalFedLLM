@@ -106,10 +106,9 @@ VRAM rather than reusing incompatible model/adaptor state.
 | --- | --- | --- | --- |
 | NVIDIA GPU + working Windows driver | Required by the current real Qwen/Granite Client training path | `nvidia-smi` | [NVIDIA Drivers](https://www.nvidia.com/en-us/drivers/) |
 | Python 3.14 x64 | Required by the thin Windows launcher's local environment bootstrap | `py -3.14 --version` | [Python for Windows](https://www.python.org/downloads/windows/) |
-| OpenSSH Client | Used for the Client-to-Host SSH connection/tunnel | `ssh -V` | [Microsoft OpenSSH for Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) |
+| OpenSSH Client | Required only when a profile joins the federation through the Client-to-Host SSH tunnel | `ssh -V` | [Microsoft OpenSSH for Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) |
 | Ollama for Windows | Native local-AI/compatibility serving component | `ollama --version` | [Ollama for Windows](https://ollama.com/download/windows) |
 | AnythingLLM Desktop for Windows | Native user-facing local RAG/application layer | Check **Settings → Apps → Installed apps**, or launch AnythingLLM | [AnythingLLM Download](https://anythingllm.com/download) |
-| Host SSH target and one-time enrollment token | Required to enroll and connect a new Client profile | Supplied by the Host/Coordinator operator | Not a separately installed component |
 
 You will also need enough free disk space for the LegalFedLLM portable data
 directory, downloaded model/tokenizer files, Ollama models, and AnythingLLM
@@ -160,8 +159,9 @@ If it is missing, follow Microsoft's official OpenSSH installation instructions:
 <https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse>
 
 Microsoft documents both the **Optional Features** interface and the elevated
-PowerShell installation method. LegalFedLLM needs the OpenSSH **Client**, not the
-OpenSSH Server.
+PowerShell installation method. Federation connectivity needs the OpenSSH
+**Client**, not the OpenSSH Server. A local-only profile can start without
+OpenSSH connectivity.
 
 #### Ollama
 
@@ -298,7 +298,7 @@ LegalFedLLM-Windows-x64\
 #### Installing the portable release
 
 1. Install and verify the requirements listed above, especially Python 3.14 x64,
-   the NVIDIA driver, OpenSSH Client, Ollama for Windows, and AnythingLLM
+   the NVIDIA driver, Ollama for Windows, and AnythingLLM
    Desktop.
 2. Download `LegalFedLLM-Windows-x64.zip` from the project's
    [GitHub Releases](https://github.com/JohnnySusp/LegalFedLLM/releases) page.
@@ -376,24 +376,34 @@ Start the application by double-clicking `LegalFedLLM.exe` in the extracted
 release directory.
 
 LegalFedLLM opens a launch terminal as part of the Windows workflow. Keep that
-terminal open while the Client is running. OpenSSH asks for the Host SSH
-password in that terminal; LegalFedLLM does not collect or store the SSH
-password.
+terminal open while the Client is running. A fresh profile does **not** open an
+SSH connection unless federation enrollment has been requested. When an
+enrolled profile connects to the Host, OpenSSH asks for the Host SSH password in
+that terminal; LegalFedLLM does not collect or store the SSH password.
 
-A saved profile still needs the SSH password whenever a new tunnel is opened,
-but it does not need another enrollment token after successful registration.
+A saved enrolled profile still needs the SSH password whenever a new tunnel is
+opened, but it does not need another enrollment token after successful
+registration.
 
-#### First profile and enrollment
+#### First profile: local use first, optional federation enrollment
 
 Create a Client profile from the GUI and provide:
 
 - a profile name;
 - the Qwen or Granite Client model profile;
-- the Host SSH target;
-- the Host SSH port;
-- the local Coordinator-forward port;
-- the local Client Agent port; and
-- a fresh one-time enrollment token issued by the Host/Coordinator.
+- the local Coordinator-forward port; and
+- the local Client Agent port.
+
+The Host SSH target, SSH port and one-time enrollment token are federation
+settings. They may be left blank/unused when the profile is created. In that
+state LegalFedLLM starts the Client Agent, local model path and AnythingLLM
+integration without opening an SSH tunnel or registering with a Coordinator.
+
+When the user later wants to join a federation, open **Edit current profile…**,
+enter the Host SSH target and a fresh one-time enrollment token issued by the
+Host/Coordinator, and save the profile. LegalFedLLM then restarts the Client
+Agent with the SSH tunnel enabled and performs the existing one-time enrollment
+flow.
 
 Each profile is an independent Client identity. It owns its own Client ID,
 Ed25519 identity, enrollment state, adapter/checkpoint state, local-learning
@@ -432,9 +442,28 @@ federated training and `LOCAL` inference.
 
 After the Client Agent is healthy, LegalFedLLM detects or launches AnythingLLM
 Desktop and configures its reserved Generic OpenAI connection for the active
-LegalFedLLM profile. AnythingLLM owns the user-facing chat/RAG experience;
-LegalFedLLM owns federation, model learning, Client identity, and the
+LegalFedLLM profile. On a fresh AnythingLLM Desktop installation whose onboarding
+has not yet been completed, LegalFedLLM selects **Generic OpenAI**, configures the
+active profile's loopback base URL and API key, selects `legalfedllm-local`, and
+marks AnythingLLM's one-time onboarding complete before bringing the AnythingLLM
+Desktop UI forward. The user therefore does not need to open AnythingLLM first or
+complete its provider setup manually.
+
+For an already-onboarded AnythingLLM installation, LegalFedLLM refreshes the
+reserved Generic OpenAI connection but preserves the existing default provider.
+The Windows LegalFedLLM GUI exposes an **AnythingLLM model** control with
+**Local** and **Host** choices. Selecting either choice is an explicit user action
+that switches AnythingLLM to LegalFedLLM's Generic OpenAI provider and the
+corresponding model. **Host** is accepted only while the profile is enrolled and
+the Coordinator connection is active. AnythingLLM owns the user-facing chat/RAG
+experience; LegalFedLLM owns federation, model learning, Client identity, and the
 `legalfedllm-local` / `legalfedllm-host` model boundary.
+
+The desktop's **AnythingLLM integration details** dialog remains a diagnostic and
+manual-fallback view. It shows the provider, base URL, API key, one `Model` value
+(defaulting to `legalfedllm-local`), context/max-token settings, and required
+Ollama compatibility model as individually copyable read-only fields. Internal
+runtime-directory paths are not shown in this user-facing dialog.
 
 AnythingLLM can take additional time to initialize on first launch. Its local
 backend normally listens on:
@@ -582,12 +611,11 @@ such as Docker, OpenSSH, or the NVIDIA runtime.
 | Linux x86_64 | Required by the current published AppImage | Current tested desktop platform | `uname -m` |
 | Docker Engine | Required | Required for the managed local-AI stack | `docker --version` |
 | Docker Compose | Required | Required for the managed local-AI stack | `docker compose version` |
-| OpenSSH client | Required | Required | `ssh -V` |
+| OpenSSH client | Required only for federation | Required only for federation | `ssh -V` |
 | NVIDIA GPU + working Linux driver | Required by the current real Qwen/Granite Client path | Required by the current real Qwen/Granite Client path | `nvidia-smi` |
 | NVIDIA Container Toolkit / Docker GPU runtime | Required by the Dockerized real-model path | Required when the managed Docker services use the GPU | `docker run --rm --gpus all ubuntu nvidia-smi` |
 | Git | Not required | Required to clone/update the source checkout | `git --version` |
 | Python 3 with `venv` and `pip` | Not required | Required | `python3 --version` |
-| Host SSH target and one-time enrollment token | Required | Required | Supplied by the Host/Coordinator operator |
 
 You also need enough free disk space for Docker images and downloaded
 model/tokenizer data. The first AppImage launch builds a versioned
@@ -658,6 +686,9 @@ docker run --rm hello-world
 > before enabling it on a shared machine.
 
 ##### OpenSSH client
+
+This section is only needed when the Client will join a federation. Local-only
+profiles do not require an SSH tunnel.
 
 On Ubuntu/Debian:
 
@@ -961,9 +992,10 @@ source .venv/bin/activate
 python -m desktop.app
 ```
 
-Keep that terminal open. LegalFedLLM leaves SSH password entry to OpenSSH, so
-the Host SSH password is entered in the launch terminal and is not handled or
-stored by LegalFedLLM.
+Keep that terminal open. Local-only profiles do not open an SSH connection.
+When federation connectivity is enabled for a profile, LegalFedLLM leaves SSH
+password entry to OpenSSH, so the Host SSH password is entered in the launch
+terminal and is not handled or stored by LegalFedLLM.
 
 For an AppImage installation, double-click the AppImage in a file manager or
 launch it from a terminal:
@@ -973,24 +1005,25 @@ launch it from a terminal:
 ```
 
 When launched graphically on Linux, the AppImage opens a terminal and starts the
-GUI from that terminal so OpenSSH can ask for the Host password there. If the
-desktop environment cannot provide one of the supported terminal launchers,
-start the AppImage from an existing terminal.
+GUI from that terminal. A local-only profile does not invoke OpenSSH; the same
+terminal is used for Host password entry only after federation connectivity is
+enabled. If the desktop environment cannot provide one of the supported
+terminal launchers, start the AppImage from an existing terminal.
 
-#### First profile and enrollment
+#### First profile: local use first, optional federation enrollment
 
-On first launch, create a Client profile in the GUI and provide:
+On first launch, create a Client profile in the GUI and provide a profile name,
+the Qwen or Granite Client model profile, and the local Coordinator-forward and
+Client Agent ports. The Host SSH target and one-time enrollment token are
+optional at creation time.
 
-- a profile name;
-- the Qwen or Granite Client model profile;
-- the Host SSH target, such as `user@host.example`;
-- the Host SSH port;
-- the local Coordinator-forward port and Client Agent port; and
-- a fresh one-time enrollment token issued by the Host/Coordinator.
-
-The enrollment token is consumed by successful registration. Later launches of
-the same saved profile use its persisted Client identity and do not require a
-new enrollment token. A genuinely new profile requires a new one-time token.
+With no enrollment token, the profile starts in **local-only mode**: the Client
+Agent and local AI stack start without an SSH tunnel, Coordinator registration,
+or federated-round participation. To join a federation later, use **Edit current
+profile…** to add the Host SSH target and a fresh one-time enrollment token.
+Successful registration consumes that token. Later launches of the same
+enrolled profile use its persisted Client identity and do not require a new
+enrollment token.
 
 Each profile owns an independent Client ID, Ed25519 identity, adapter/checkpoint
 state, private-learning queue, and logs. Downloaded Hugging Face model/tokenizer
@@ -998,10 +1031,15 @@ data is shared through `LegalFedLLM-data/models/huggingface/`.
 
 #### Ollama and AnythingLLM on first use
 
-After the Client Agent establishes the SSH tunnel and becomes healthy,
-LegalFedLLM prepares the managed Docker Ollama and AnythingLLM stack. Docker may
-pull those service images if they are not already available. When the local AI
-stack is ready, the desktop opens AnythingLLM in the default browser.
+After the Client Agent becomes healthy, LegalFedLLM prepares the managed Docker
+Ollama and AnythingLLM stack. In local-only mode this happens without an SSH
+tunnel; enrolled profiles may establish their Host tunnel in parallel with the
+federation path. Docker may pull those service images if they are not already
+available. When the local AI
+stack is ready, the desktop opens AnythingLLM in the default browser. The
+**AnythingLLM integration details** dialog exposes the provider connection as
+individual read-only fields with **Copy** buttons for manual setup or inspection;
+it does not expose the internal runtime-files directory.
 
 LegalFedLLM does **not** silently pull the selected Ollama compatibility model.
 If the GUI reports that the required model is missing after Ollama starts,
@@ -1063,9 +1101,10 @@ also populate the same cache as needed.
 On later launches, start LegalFedLLM using the same source or AppImage command
 from **Starting LegalFedLLM**, then select the saved profile.
 
-A previously enrolled profile still needs the SSH password for the new tunnel
-connection, but it does not need another enrollment token. After the Client
-Agent and local AI services are ready, AnythingLLM opens automatically.
+A local-only profile starts directly without SSH. A previously enrolled profile
+still needs the SSH password for the new tunnel connection, but it does not need
+another enrollment token. After the Client Agent and local AI services are
+ready, AnythingLLM opens automatically.
 
 The OpenAI-compatible Client endpoint exposes the `legalfedllm-local` and
 `legalfedllm-host` routes used by the desktop integration. `LOCAL` stays on the
@@ -1210,6 +1249,11 @@ this section are written for the established A40 container deployment and are
 intended to be copied directly into the Host shell. They intentionally omit the
 external SSH address, username and provider-specific connection details.
 
+All operational blocks below are Bash functions that are defined and then called in
+the same copy-paste block. Errors use `return 1` rather than `exit 1`, so a failed
+check returns control to the current SSH prompt instead of terminating the login
+shell. The functions deliberately do not enable `set -e`.
+
 > **Host deployment boundary:** `/scratch/legalfedllm-test/` and everything
 > beneath it are deployment-specific, private Host state. The public source
 > archive does **not** contain or recreate the deployed checkout, shared virtual
@@ -1254,45 +1298,74 @@ missing, preventing later commands from accidentally running in `/home/iosider`
 or against the system Python installation.
 
 ```bash
-export LEGALFEDLLM_TEST_ROOT=/scratch/legalfedllm-test
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+legalfed_host_enter() {
+  local root=/scratch/legalfedllm-test
+  local repo="$root/work/LegalFedLLM"
+  local activate="$root/.venv/bin/activate"
 
-test -f /scratch/legalfedllm-test/.venv/bin/activate || {
-  echo 'ERROR: /scratch/legalfedllm-test/.venv is missing'
-  exit 1
+  test -d "$repo" || {
+    echo "ERROR: $repo is missing"
+    return 1
+  }
+  test -f "$activate" || {
+    echo "ERROR: $root/.venv is missing"
+    return 1
+  }
+
+  cd "$repo" || {
+    echo "ERROR: could not enter $repo"
+    return 1
+  }
+  source "$activate" || {
+    echo "ERROR: could not activate $root/.venv"
+    return 1
+  }
+
+  export LEGALFEDLLM_TEST_ROOT="$root"
+  export HF_HOME="$root/cache/huggingface"
+  export PIP_CACHE_DIR="$root/cache/pip"
+  export TORCH_HOME="$root/cache/torch"
+  export TORCH_EXTENSIONS_DIR="$root/cache/torch-extensions"
+  export TRITON_HOME="$root/cache/triton"
+  export XDG_CACHE_HOME="$root/cache/xdg"
+  export CUDA_CACHE_PATH="$root/cache/cuda"
+  export TMPDIR="$root/tmp"
+  export TOKENIZERS_PARALLELISM=false
+
+  mkdir -p \
+    "$HF_HOME" \
+    "$PIP_CACHE_DIR" \
+    "$TORCH_HOME" \
+    "$TORCH_EXTENSIONS_DIR" \
+    "$TRITON_HOME" \
+    "$XDG_CACHE_HOME" \
+    "$CUDA_CACHE_PATH" \
+    "$TMPDIR" \
+    "$root/logs" || {
+      echo 'ERROR: could not create one or more Host cache/runtime directories'
+      return 1
+    }
+
+  local required
+  for required in \
+    requirements.txt \
+    scripts/run_host_stack.py \
+    scripts/issue_enrollment_token.py \
+    scripts/create_remote_round.py \
+    .env.host
+  do
+    test -f "$required" || {
+      echo "ERROR: $required is missing"
+      return 1
+    }
+  done
+
+  printf 'repo=%s\npython=%s\n' "$PWD" "$(command -v python)"
+  python --version || return 1
+  nvidia-smi || return 1
 }
-source /scratch/legalfedllm-test/.venv/bin/activate
 
-export HF_HOME=/scratch/legalfedllm-test/cache/huggingface
-export PIP_CACHE_DIR=/scratch/legalfedllm-test/cache/pip
-export TORCH_HOME=/scratch/legalfedllm-test/cache/torch
-export TORCH_EXTENSIONS_DIR=/scratch/legalfedllm-test/cache/torch-extensions
-export TRITON_HOME=/scratch/legalfedllm-test/cache/triton
-export XDG_CACHE_HOME=/scratch/legalfedllm-test/cache/xdg
-export CUDA_CACHE_PATH=/scratch/legalfedllm-test/cache/cuda
-export TMPDIR=/scratch/legalfedllm-test/tmp
-export TOKENIZERS_PARALLELISM=false
-
-mkdir -p \
-  /scratch/legalfedllm-test/cache/huggingface \
-  /scratch/legalfedllm-test/cache/pip \
-  /scratch/legalfedllm-test/cache/torch \
-  /scratch/legalfedllm-test/cache/torch-extensions \
-  /scratch/legalfedllm-test/cache/triton \
-  /scratch/legalfedllm-test/cache/xdg \
-  /scratch/legalfedllm-test/cache/cuda \
-  /scratch/legalfedllm-test/tmp \
-  /scratch/legalfedllm-test/logs
-
-test -f requirements.txt || { echo 'ERROR: requirements.txt is missing'; exit 1; }
-test -f scripts/run_host_stack.py || { echo 'ERROR: scripts/run_host_stack.py is missing'; exit 1; }
-test -f scripts/issue_enrollment_token.py || { echo 'ERROR: scripts/issue_enrollment_token.py is missing'; exit 1; }
-test -f scripts/create_remote_round.py || { echo 'ERROR: scripts/create_remote_round.py is missing'; exit 1; }
-test -f .env.host || { echo 'ERROR: .env.host is missing'; exit 1; }
-
-printf 'repo=%s\npython=%s\n' "$PWD" "$(command -v python)"
-python --version
-nvidia-smi
+legalfed_host_enter
 ```
 
 The normal Host installation uses the existing shared environment at
@@ -1306,23 +1379,39 @@ but `.env.host` has not yet been created. It is **not** a normal startup command
 for an existing Host.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_bootstrap() {
+  local root=/scratch/legalfedllm-test
+  local repo="$root/work/LegalFedLLM"
+  local activate="$root/.venv/bin/activate"
 
-export PIP_CACHE_DIR=/scratch/legalfedllm-test/cache/pip
-export TMPDIR=/scratch/legalfedllm-test/tmp
-mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo "ERROR: $root/.venv is missing"; return 1; }
+  cd "$repo" || { echo "ERROR: could not enter $repo"; return 1; }
+  source "$activate" || { echo "ERROR: could not activate $root/.venv"; return 1; }
 
-python -m pip install -r requirements.txt
+  export PIP_CACHE_DIR="$root/cache/pip"
+  export TMPDIR="$root/tmp"
+  mkdir -p "$PIP_CACHE_DIR" "$TMPDIR" || return 1
 
-test ! -e .env.host || {
-  echo 'ERROR: .env.host already exists; inspect and reuse it instead of replacing it'
-  exit 1
+  python -m pip install -r requirements.txt || {
+    echo 'ERROR: dependency installation failed'
+    return 1
+  }
+
+  test ! -e .env.host || {
+    echo 'ERROR: .env.host already exists; inspect and reuse it instead of replacing it'
+    return 1
+  }
+
+  python scripts/bootstrap.py host \
+    --output .env.host \
+    --runtime-root "$root" || {
+      echo 'ERROR: Host bootstrap failed'
+      return 1
+    }
 }
 
-python scripts/bootstrap.py host \
-  --output .env.host \
-  --runtime-root /scratch/legalfedllm-test
+legalfed_host_bootstrap
 ```
 
 Host bootstrap creates private administrative/internal tokens and Host runtime
@@ -1336,36 +1425,45 @@ The Host API is expected on `127.0.0.1:8002` and the Coordinator on
 `127.0.0.1:8000`.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_status() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
 
-echo '=== LegalFedLLM processes ==='
-ps -ef | grep -E \
-  'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
-  | grep -v grep || true
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
 
-echo
-echo '=== Host health :8002 ==='
-if curl -fsS --max-time 5 http://127.0.0.1:8002/health; then
-  echo
-  echo 'Host is healthy'
-else
-  echo
-  echo 'Host is not reachable'
-fi
+  echo '=== LegalFedLLM processes ==='
+  ps -ef | grep -E \
+    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+    | grep -v grep || true
 
-echo
-echo '=== Coordinator health :8000 ==='
-if curl -fsS --max-time 5 http://127.0.0.1:8000/health; then
   echo
-  echo 'Coordinator is healthy'
-else
-  echo
-  echo 'Coordinator is not reachable'
-fi
+  echo '=== Host health :8002 ==='
+  if curl -fsS --max-time 5 http://127.0.0.1:8002/health; then
+    echo
+    echo 'Host is healthy'
+  else
+    echo
+    echo 'Host is not reachable'
+  fi
 
-echo
-nvidia-smi
+  echo
+  echo '=== Coordinator health :8000 ==='
+  if curl -fsS --max-time 5 http://127.0.0.1:8000/health; then
+    echo
+    echo 'Coordinator is healthy'
+  else
+    echo
+    echo 'Coordinator is not reachable'
+  fi
+
+  echo
+  nvidia-smi || return 1
+}
+
+legalfed_host_status
 ```
 
 Do not infer service state from `ss`, `lsof` or `fuser` alone. Process inspection
@@ -1383,19 +1481,26 @@ health endpoints. If only one of the two services is healthy, it stops rather
 than guessing about a partial stack.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_start_normal() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
+  local log=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
+  local pidfile=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
+  local host_ok=0 coord_ok=0 coord_health i
 
-HOST_OK=0
-COORD_OK=0
-curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
-curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
 
-if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
-  echo 'Host and Coordinator are already healthy.'
-  COORD_HEALTH="$(curl -fsS http://127.0.0.1:8000/health)"
-  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
-  printf '%s\n' "$COORD_HEALTH" | python -c '
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && host_ok=1
+  curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && coord_ok=1
+
+  if [ "$host_ok" -eq 1 ] && [ "$coord_ok" -eq 1 ]; then
+    echo 'Host and Coordinator are already healthy.'
+    coord_health="$(curl -fsS http://127.0.0.1:8000/health)" || return 1
+    printf '%s\n' "$coord_health" | python -m json.tool || return 1
+    printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 if h.get("quorum_policy") != "majority":
@@ -1405,67 +1510,70 @@ if str(h.get("minimum_trusted_client_quorum")) != "2":
 if str(h.get("trusted_client_quorum_override")) not in {"none", "", "None"}:
     raise SystemExit("ERROR: Coordinator is running with a one-Client override; stop it before normal two-Client use")
 print("Normal two-Client quorum configuration is active.")
-'
-elif [ "$HOST_OK" -eq 0 ] && [ "$COORD_OK" -eq 0 ]; then
+' || return 1
+    return 0
+  fi
+
+  if [ "$host_ok" -eq 1 ] || [ "$coord_ok" -eq 1 ]; then
+    echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
+    ps -ef | grep -E \
+      'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+      | grep -v grep || true
+    return 1
+  fi
+
   export COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM=2
   export COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE=""
-
-  LOG=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
-  PIDFILE=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
-  mkdir -p /scratch/legalfedllm-test/logs
+  mkdir -p /scratch/legalfedllm-test/logs || return 1
 
   nohup python scripts/run_host_stack.py \
     --env-file .env.host \
-    >"$LOG" 2>&1 < /dev/null &
+    >"$log" 2>&1 < /dev/null &
 
-  echo $! > "$PIDFILE"
-  echo "Started Host stack parent PID $(cat "$PIDFILE")"
-  echo "Log: $LOG"
+  echo $! > "$pidfile"
+  echo "Started Host stack parent PID $(cat "$pidfile")"
+  echo "Log: $log"
 
   for i in $(seq 1 180); do
-    HOST_OK=0
-    COORD_OK=0
-    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
-    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
-    if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+    host_ok=0
+    coord_ok=0
+    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && host_ok=1
+    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && coord_ok=1
+    if [ "$host_ok" -eq 1 ] && [ "$coord_ok" -eq 1 ]; then
       break
     fi
-    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
       echo 'ERROR: Host stack exited during startup'
-      tail -n 120 "$LOG"
-      exit 1
+      tail -n 120 "$log"
+      return 1
     fi
     sleep 5
   done
 
   curl -fsS --max-time 5 http://127.0.0.1:8002/health || {
     echo 'ERROR: Host did not become healthy'
-    tail -n 120 "$LOG"
-    exit 1
+    tail -n 120 "$log"
+    return 1
   }
   echo
 
-  COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+  coord_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
     echo 'ERROR: Coordinator did not become healthy'
-    tail -n 120 "$LOG"
-    exit 1
+    tail -n 120 "$log"
+    return 1
   }
-  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
-  printf '%s\n' "$COORD_HEALTH" | python -c '
+  printf '%s\n' "$coord_health" | python -m json.tool || return 1
+  printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 assert h.get("quorum_policy") == "majority", h
 assert str(h.get("minimum_trusted_client_quorum")) == "2", h
 assert str(h.get("trusted_client_quorum_override")) in {"none", "", "None"}, h
 print("Normal two-Client Host/Coordinator stack is ready.")
-'
-else
-  echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
-  ps -ef | grep -E \
-    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
-    | grep -v grep || true
-  exit 1
-fi
+' || return 1
+}
+
+legalfed_host_start_normal
 ```
 
 ### Ensure the one-Client test Host/Coordinator stack is running
@@ -1478,19 +1586,26 @@ Coordinator resolves quorum using its own startup configuration.
 Do not use this override for normal two-Client federation.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_start_single_client() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
+  local log=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
+  local pidfile=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
+  local host_ok=0 coord_ok=0 coord_health i
 
-HOST_OK=0
-COORD_OK=0
-curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
-curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
 
-if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
-  echo 'Host and Coordinator are already healthy.'
-  COORD_HEALTH="$(curl -fsS http://127.0.0.1:8000/health)"
-  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
-  printf '%s\n' "$COORD_HEALTH" | python -c '
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null 2>&1 && host_ok=1
+  curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null 2>&1 && coord_ok=1
+
+  if [ "$host_ok" -eq 1 ] && [ "$coord_ok" -eq 1 ]; then
+    echo 'Host and Coordinator are already healthy.'
+    coord_health="$(curl -fsS http://127.0.0.1:8000/health)" || return 1
+    printf '%s\n' "$coord_health" | python -m json.tool || return 1
+    printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 if h.get("quorum_policy") != "majority":
@@ -1500,67 +1615,70 @@ if str(h.get("minimum_trusted_client_quorum")) != "2":
 if str(h.get("trusted_client_quorum_override")) != "1":
     raise SystemExit("ERROR: Coordinator is not in one-Client test mode; stop the current stack before switching modes")
 print("One-Client quorum override is active.")
-'
-elif [ "$HOST_OK" -eq 0 ] && [ "$COORD_OK" -eq 0 ]; then
+' || return 1
+    return 0
+  fi
+
+  if [ "$host_ok" -eq 1 ] || [ "$coord_ok" -eq 1 ]; then
+    echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
+    ps -ef | grep -E \
+      'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
+      | grep -v grep || true
+    return 1
+  fi
+
   export COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM=2
   export COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE=1
-
-  LOG=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.log
-  PIDFILE=/scratch/legalfedllm-test/logs/legalfedllm-host-stack.pid
-  mkdir -p /scratch/legalfedllm-test/logs
+  mkdir -p /scratch/legalfedllm-test/logs || return 1
 
   nohup python scripts/run_host_stack.py \
     --env-file .env.host \
-    >"$LOG" 2>&1 < /dev/null &
+    >"$log" 2>&1 < /dev/null &
 
-  echo $! > "$PIDFILE"
-  echo "Started Host stack parent PID $(cat "$PIDFILE")"
-  echo "Log: $LOG"
+  echo $! > "$pidfile"
+  echo "Started Host stack parent PID $(cat "$pidfile")"
+  echo "Log: $log"
 
   for i in $(seq 1 180); do
-    HOST_OK=0
-    COORD_OK=0
-    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && HOST_OK=1
-    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && COORD_OK=1
-    if [ "$HOST_OK" -eq 1 ] && [ "$COORD_OK" -eq 1 ]; then
+    host_ok=0
+    coord_ok=0
+    curl -fsS --max-time 2 http://127.0.0.1:8002/health >/dev/null 2>&1 && host_ok=1
+    curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1 && coord_ok=1
+    if [ "$host_ok" -eq 1 ] && [ "$coord_ok" -eq 1 ]; then
       break
     fi
-    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
       echo 'ERROR: Host stack exited during startup'
-      tail -n 120 "$LOG"
-      exit 1
+      tail -n 120 "$log"
+      return 1
     fi
     sleep 5
   done
 
   curl -fsS --max-time 5 http://127.0.0.1:8002/health || {
     echo 'ERROR: Host did not become healthy'
-    tail -n 120 "$LOG"
-    exit 1
+    tail -n 120 "$log"
+    return 1
   }
   echo
 
-  COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+  coord_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
     echo 'ERROR: Coordinator did not become healthy'
-    tail -n 120 "$LOG"
-    exit 1
+    tail -n 120 "$log"
+    return 1
   }
-  printf '%s\n' "$COORD_HEALTH" | python -m json.tool
-  printf '%s\n' "$COORD_HEALTH" | python -c '
+  printf '%s\n' "$coord_health" | python -m json.tool || return 1
+  printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 assert h.get("quorum_policy") == "majority", h
 assert str(h.get("minimum_trusted_client_quorum")) == "2", h
 assert str(h.get("trusted_client_quorum_override")) == "1", h
 print("One-Client Host/Coordinator stack is ready.")
-'
-else
-  echo 'ERROR: only one of Host/Coordinator is healthy. Inspect the partial stack before starting anything else.'
-  ps -ef | grep -E \
-    'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
-    | grep -v grep || true
-  exit 1
-fi
+' || return 1
+}
+
+legalfed_host_start_single_client
 ```
 
 ### Stop the Host/Coordinator stack safely
@@ -1570,21 +1688,38 @@ two-Client mode and one-Client test mode. Do not use broad commands such as
 `pkill python` or `pkill uvicorn`.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
+legalfed_host_stop() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local -a stack_pids
+  local i
 
-mapfile -t STACK_PIDS < <(
-  ps -eo pid=,args= |
-  awk '/[r]un_host_stack.py/ {print $1}'
-)
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  cd "$repo" || return 1
 
-printf 'LegalFedLLM Host stack parent PIDs: %s\n' "${STACK_PIDS[*]:-none}"
+  mapfile -t stack_pids < <(
+    ps -eo pid=,args= |
+    awk '/[r]un_host_stack.py/ {print $1}'
+  )
 
-if [ "${#STACK_PIDS[@]}" -eq 0 ]; then
-  echo 'No run_host_stack.py parent is running.'
-elif [ "${#STACK_PIDS[@]}" -eq 1 ]; then
-  kill "${STACK_PIDS[0]}"
+  printf 'LegalFedLLM Host stack parent PIDs: %s\n' "${stack_pids[*]:-none}"
+
+  if [ "${#stack_pids[@]}" -eq 0 ]; then
+    echo 'No run_host_stack.py parent is running.'
+    return 0
+  fi
+
+  if [ "${#stack_pids[@]}" -ne 1 ]; then
+    echo 'ERROR: multiple run_host_stack.py parents found; inspect them before stopping anything.'
+    return 1
+  fi
+
+  kill "${stack_pids[0]}" || {
+    echo 'ERROR: failed to send SIGTERM to the Host stack parent'
+    return 1
+  }
+
   for i in $(seq 1 15); do
-    if ! kill -0 "${STACK_PIDS[0]}" 2>/dev/null; then
+    if ! kill -0 "${stack_pids[0]}" 2>/dev/null; then
       break
     fi
     sleep 1
@@ -1594,10 +1729,9 @@ elif [ "${#STACK_PIDS[@]}" -eq 1 ]; then
   ps -ef | grep -E \
     'run_host_stack.py|uvicorn.*host.main|uvicorn.*coordinator.main' \
     | grep -v grep || true
-else
-  echo 'ERROR: multiple run_host_stack.py parents found; inspect them before stopping anything.'
-  exit 1
-fi
+}
+
+legalfed_host_stop
 ```
 
 If the stack is being used by an active round, inspect that round before stopping
@@ -1614,21 +1748,30 @@ Do not paste enrollment tokens into public logs, commits or documentation.
 Make sure the Host/Coordinator stack is healthy first, then run:
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_issue_token() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
 
-curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
-  echo 'ERROR: Host is not healthy'
-  exit 1
-}
-curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
-  echo 'ERROR: Coordinator is not healthy'
-  exit 1
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
+
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
+    echo 'ERROR: Host is not healthy'
+    return 1
+  }
+  curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
+    echo 'ERROR: Coordinator is not healthy'
+    return 1
+  }
+
+  python scripts/issue_enrollment_token.py \
+    --env-file .env.host \
+    --token-only || return 1
 }
 
-python scripts/issue_enrollment_token.py \
-  --env-file .env.host \
-  --token-only
+legalfed_host_issue_token
 ```
 
 Copy the printed token directly into exactly one new Client profile. Successful
@@ -1640,28 +1783,37 @@ Issue the two tokens separately so each Client receives a different single-use
 token:
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_issue_two_tokens() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
 
-curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
-  echo 'ERROR: Host is not healthy'
-  exit 1
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
+
+  curl -fsS --max-time 5 http://127.0.0.1:8002/health >/dev/null || {
+    echo 'ERROR: Host is not healthy'
+    return 1
+  }
+  curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
+    echo 'ERROR: Coordinator is not healthy'
+    return 1
+  }
+
+  echo '=== Token for Client 1 ==='
+  python scripts/issue_enrollment_token.py \
+    --env-file .env.host \
+    --token-only || return 1
+
+  echo
+  echo '=== Token for Client 2 ==='
+  python scripts/issue_enrollment_token.py \
+    --env-file .env.host \
+    --token-only || return 1
 }
-curl -fsS --max-time 5 http://127.0.0.1:8000/health >/dev/null || {
-  echo 'ERROR: Coordinator is not healthy'
-  exit 1
-}
 
-echo '=== Token for Client 1 ==='
-python scripts/issue_enrollment_token.py \
-  --env-file .env.host \
-  --token-only
-
-echo
-echo '=== Token for Client 2 ==='
-python scripts/issue_enrollment_token.py \
-  --env-file .env.host \
-  --token-only
+legalfed_host_issue_two_tokens
 ```
 
 Use the first token for the first new profile and the second token for the second
@@ -1685,55 +1837,75 @@ Use one of the two complete command blocks below.
 #### One Qwen Client
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_create_qwen_round() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
+  local coord_health
 
-COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
-  echo 'ERROR: Coordinator is not healthy'
-  exit 1
-}
-printf '%s\n' "$COORD_HEALTH" | python -c '
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
+
+  coord_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+    echo 'ERROR: Coordinator is not healthy'
+    return 1
+  }
+  printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 if str(h.get("trusted_client_quorum_override")) != "1":
     raise SystemExit("ERROR: start the Host/Coordinator in one-Client test mode first")
-'
+' || return 1
 
-read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
-test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; exit 1; }
-export QWEN_CLIENT_ID
+  read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
+  test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; return 1; }
+  export QWEN_CLIENT_ID
 
-ROUND_CLIENT_SLOTS="client-1" \
-COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
-COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
-python scripts/create_remote_round.py --env-file .env.host
+  ROUND_CLIENT_SLOTS="client-1" \
+  COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+  COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
+  python scripts/create_remote_round.py --env-file .env.host || return 1
+}
+
+legalfed_host_create_qwen_round
 ```
 
 #### One Granite Client
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_create_granite_round() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
+  local coord_health
 
-COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
-  echo 'ERROR: Coordinator is not healthy'
-  exit 1
-}
-printf '%s\n' "$COORD_HEALTH" | python -c '
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
+
+  coord_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+    echo 'ERROR: Coordinator is not healthy'
+    return 1
+  }
+  printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 if str(h.get("trusted_client_quorum_override")) != "1":
     raise SystemExit("ERROR: start the Host/Coordinator in one-Client test mode first")
-'
+' || return 1
 
-read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
-test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; exit 1; }
-export GRANITE_CLIENT_ID
+  read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
+  test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; return 1; }
+  export GRANITE_CLIENT_ID
 
-ROUND_CLIENT_SLOTS="client-2" \
-COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
-COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
-python scripts/create_remote_round.py --env-file .env.host
+  ROUND_CLIENT_SLOTS="client-2" \
+  COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+  COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="1" \
+  python scripts/create_remote_round.py --env-file .env.host || return 1
+}
+
+legalfed_host_create_granite_round
 ```
 
 The one-Client override is test-only. Return the Host to normal two-Client mode
@@ -1745,14 +1917,21 @@ The Coordinator must be running in normal two-Client mode: majority policy,
 minimum trusted quorum `2`, and no override.
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
+legalfed_host_create_two_client_round() {
+  local repo=/scratch/legalfedllm-test/work/LegalFedLLM
+  local activate=/scratch/legalfedllm-test/.venv/bin/activate
+  local coord_health
 
-COORD_HEALTH="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
-  echo 'ERROR: Coordinator is not healthy'
-  exit 1
-}
-printf '%s\n' "$COORD_HEALTH" | python -c '
+  test -d "$repo" || { echo "ERROR: $repo is missing"; return 1; }
+  test -f "$activate" || { echo 'ERROR: Host virtual environment is missing'; return 1; }
+  cd "$repo" || return 1
+  source "$activate" || return 1
+
+  coord_health="$(curl -fsS --max-time 5 http://127.0.0.1:8000/health)" || {
+    echo 'ERROR: Coordinator is not healthy'
+    return 1
+  }
+  printf '%s\n' "$coord_health" | python -c '
 import json, sys
 h=json.load(sys.stdin)
 if h.get("quorum_policy") != "majority":
@@ -1761,20 +1940,23 @@ if str(h.get("minimum_trusted_client_quorum")) != "2":
     raise SystemExit("ERROR: Coordinator minimum trusted quorum is not 2")
 if str(h.get("trusted_client_quorum_override")) not in {"none", "", "None"}:
     raise SystemExit("ERROR: stop the one-Client test stack and restart normal two-Client mode")
-'
+' || return 1
 
-read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
-read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
+  read -r -p 'Enrolled Qwen Client ID: ' QWEN_CLIENT_ID
+  read -r -p 'Enrolled Granite Client ID: ' GRANITE_CLIENT_ID
 
-test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; exit 1; }
-test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; exit 1; }
+  test -n "$QWEN_CLIENT_ID" || { echo 'ERROR: Qwen Client ID is required'; return 1; }
+  test -n "$GRANITE_CLIENT_ID" || { echo 'ERROR: Granite Client ID is required'; return 1; }
 
-export QWEN_CLIENT_ID GRANITE_CLIENT_ID
+  export QWEN_CLIENT_ID GRANITE_CLIENT_ID
 
-ROUND_CLIENT_SLOTS="client-1,client-2" \
-COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
-COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="" \
-python scripts/create_remote_round.py --env-file .env.host
+  ROUND_CLIENT_SLOTS="client-1,client-2" \
+  COORDINATOR_MINIMUM_TRUSTED_CLIENT_QUORUM="2" \
+  COORDINATOR_TRUSTED_CLIENT_QUORUM_OVERRIDE="" \
+  python scripts/create_remote_round.py --env-file .env.host || return 1
+}
+
+legalfed_host_create_two_client_round
 ```
 
 For the Mistral Nemo Host, the supported alignment assignments are:
@@ -1796,12 +1978,14 @@ when prompted below; this is runtime input, not a filesystem or deployment
 placeholder.
 
 ```bash
-read -r -p 'Round ID printed by create_remote_round.py: ' ROUND_ID
-test -n "$ROUND_ID" || { echo 'ERROR: Round ID is required'; exit 1; }
+legalfed_host_show_manifest() {
+  read -r -p 'Round ID printed by create_remote_round.py: ' ROUND_ID
+  test -n "$ROUND_ID" || { echo 'ERROR: Round ID is required'; return 1; }
+  export ROUND_ID
 
-curl -fsS \
-  "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/manifest" |
-python -c '
+  curl -fsS \
+    "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/manifest" |
+  python -c '
 import json, sys
 d=json.load(sys.stdin)
 print("round_id:", d["round_id"])
@@ -1811,15 +1995,24 @@ print("alignment_profiles:")
 for cid, profile in d["selected_client_alignment_profiles"].items():
     print(" ", cid, "->", profile)
 print("submission_deadline:", d["submission_deadline"])
-'
+' || return 1
+}
+
+legalfed_host_show_manifest
 ```
 
 Then inspect the current state:
 
 ```bash
-curl -fsS \
-  "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status" |
-python -c '
+legalfed_host_round_status() {
+  test -n "${ROUND_ID:-}" || {
+    echo 'ERROR: ROUND_ID is not set; run legalfed_host_show_manifest first or set ROUND_ID manually.'
+    return 1
+  }
+
+  curl -fsS \
+    "http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status" |
+  python -c '
 import json, sys
 d=json.load(sys.stdin)
 print("round_id:", d["round_id"])
@@ -1827,13 +2020,22 @@ print("state:", d["state"])
 print("accepted_client_ids:", d["accepted_client_ids"])
 print("accepted_count:", len(d["accepted_client_ids"]))
 print("message:", d.get("message"))
-'
+' || return 1
+}
+
+legalfed_host_round_status
 ```
 
 For continuous compact monitoring:
 
 ```bash
-watch -n 5 "
+legalfed_host_watch_round() {
+  test -n "${ROUND_ID:-}" || {
+    echo 'ERROR: ROUND_ID is not set; run legalfed_host_show_manifest first or set ROUND_ID manually.'
+    return 1
+  }
+
+  watch -n 5 "
 curl -fsS http://127.0.0.1:8000/v1/rounds/${ROUND_ID}/status |
 python -c '
 import json,sys
@@ -1844,6 +2046,9 @@ print(\"count:\", len(d[\"accepted_client_ids\"]))
 print(\"message:\", d.get(\"message\"))
 '
 "
+}
+
+legalfed_host_watch_round
 ```
 
 In a one-Client test round, quorum `1` permits the accepted Client package to
@@ -2140,18 +2345,24 @@ The locked desktop behavior is:
   under `LegalFedLLM-data/legalfed-ai/`, preserves compatible existing
   AnythingLLM configuration when migrating from `~/legalfed-ai`, and rewrites
   the Generic OpenAI provider to the active profile's loopback Client Agent;
-- on Linux/AppImage, Docker local-AI services are not started while OpenSSH is
-  still waiting for authentication. After the Client Agent becomes healthy,
-  LegalFedLLM starts Ollama, verifies the required compatibility model without
-  pulling it, starts AnythingLLM, and opens `http://127.0.0.1:3001/` in the host
-  default browser;
+- on Linux/AppImage, a fresh local-only profile starts its Client Agent and
+  Docker local-AI services without OpenSSH. Enrolled profiles still use the
+  managed SSH tunnel for federation connectivity. After the Client Agent becomes
+  healthy, LegalFedLLM starts Ollama, verifies the required compatibility model
+  without pulling it, starts AnythingLLM, and opens `http://127.0.0.1:3001/` in
+  the host default browser;
 - on Windows, LegalFedLLM uses native Ollama and AnythingLLM Desktop rather than
   Docker. It verifies the required Ollama model without pulling it, detects or
-  launches AnythingLLM Desktop, configures the single reserved Generic OpenAI
-  connection through AnythingLLM's local backend API without taking over
-  AnythingLLM onboarding/default-provider choice, and brings the Desktop UI
-  forward. The active profile's `legalfedllm-local` and `legalfedllm-host`
-  models remain behind the authenticated loopback Client Agent;
+  launches AnythingLLM Desktop, and configures the single reserved Generic OpenAI
+  connection through AnythingLLM's local backend API. For a fresh, not-yet-onboarded
+  AnythingLLM installation, LegalFedLLM selects Generic OpenAI with
+  `legalfedllm-local` and completes the one-time onboarding automatically. For an
+  already-onboarded installation, its existing default provider is preserved until
+  the user explicitly selects **Local** or **Host** from LegalFedLLM's Windows
+  **AnythingLLM model** control. That explicit switch selects Generic OpenAI and
+  the chosen LegalFedLLM model; Host selection requires an enrolled profile and a
+  live Coordinator connection. The active profile's `legalfedllm-local` and
+  `legalfedllm-host` models remain behind the authenticated loopback Client Agent;
 - on GUI exit, the profile-specific AppImage Client Docker stack is brought down
   automatically. The user separately chooses whether managed
   Ollama/AnythingLLM services should stop or remain running; stopping them
@@ -2300,18 +2511,10 @@ overwriting it.
 Host/Coordinator example:
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /scratch/legalfedllm-test
+  --runtime-root /path/to/legalfedllm-runtime
 ```
-
-This example applies only after that Host source tree and shared venv have been
-provisioned. Bootstrap creates missing private configuration and runtime
-directories; it does not install the source checkout or supply private datasets.
-On an existing Host, inspect and reuse `.env.host` instead of treating bootstrap
-as a routine startup command.
 
 After the Host/Coordinator is running, issue one single-use Client enrollment token:
 
@@ -2337,11 +2540,9 @@ For controlled one-Client proof-of-concept testing only, the Host bootstrap
 supports:
 
 ```bash
-cd /scratch/legalfedllm-test/work/LegalFedLLM || exit 1
-source /scratch/legalfedllm-test/.venv/bin/activate
 python scripts/bootstrap.py host \
   --output .env.host \
-  --runtime-root /scratch/legalfedllm-test \
+  --runtime-root /path/to/legalfedllm-runtime \
   --trusted-quorum-override 1
 ```
 

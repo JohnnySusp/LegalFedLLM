@@ -93,6 +93,25 @@ class DesktopClientDockerTests(unittest.TestCase):
             compose_text,
         )
 
+    def test_appimage_client_runtime_inherits_federation_tunnel_state(self) -> None:
+        compose_path = (
+            Path(__file__).resolve().parents[1]
+            / "desktop"
+            / "client-runtime"
+            / "compose.yaml"
+        )
+        compose_text = compose_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "CLIENT_SSH_TUNNEL_ENABLED: ${CLIENT_SSH_TUNNEL_ENABLED:-true}",
+            compose_text,
+        )
+        self.assertIn(
+            "CLIENT_SSH_TUNNEL_EXTERNAL: ${CLIENT_SSH_TUNNEL_ENABLED:-true}",
+            compose_text,
+        )
+        self.assertNotIn('CLIENT_SSH_TUNNEL_ENABLED: "true"', compose_text)
+        self.assertNotIn('CLIENT_SSH_TUNNEL_EXTERNAL: "true"', compose_text)
+
     def test_appimage_private_learning_directory_is_writable(self) -> None:
         compose_path = (
             Path(__file__).resolve().parents[1]

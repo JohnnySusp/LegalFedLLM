@@ -11,12 +11,14 @@ from client.model_profiles import QWEN_PROFILE_ID, pinned_client_profile
 from client.runtime import ClientRuntime
 from desktop.app import (
     _anythingllm_browser_url,
+    _anythingllm_host_available,
     _browser_launch_ready,
     _desktop_restart_command,
     _desktop_restart_environment,
     _diagnostics_ready,
     _local_ai_ready_message,
     _local_ai_start_ready,
+    _provider_detail_fields,
     _provider_details_text,
     open_default_browser,
     _enrollment_ready,
@@ -75,6 +77,57 @@ class PortableDesktopProfileTests(unittest.TestCase):
                 first_runtime.identity.public_key_b64,
                 second_runtime.identity.public_key_b64,
             )
+
+    def test_fresh_profile_starts_local_only_without_enrollment_token_or_ssh_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = manager.create(
+                display_name="Local only",
+                model_profile_id=QWEN_PROFILE_ID,
+                ssh_target="",
+                ssh_port=22,
+            )
+
+            env = manager.agent_environment(profile)
+
+            self.assertEqual(env["CLIENT_SSH_TUNNEL_ENABLED"], "false")
+            self.assertEqual(env["CLIENT_SSH_TARGET"], "")
+            self.assertNotIn("REGISTRATION_TOKEN", env)
+
+    def test_persisted_registration_reenables_federation_on_later_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "Enrolled")
+            registration = manager.profile_paths(profile.profile_id).client_data / "identity" / "registration.json"
+            registration.parent.mkdir(parents=True, exist_ok=True)
+            registration.write_text("{}", encoding="utf-8")
+
+            env = manager.agent_environment(profile)
+
+            self.assertEqual(env["CLIENT_SSH_TUNNEL_ENABLED"], "true")
+            self.assertNotIn("REGISTRATION_TOKEN", env)
+
+    def test_profile_connection_settings_can_be_added_after_local_only_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = manager.create(
+                display_name="Local only",
+                model_profile_id=QWEN_PROFILE_ID,
+                ssh_target="",
+                ssh_port=22,
+            )
+
+            updated = manager.update_connection(
+                profile.profile_id,
+                display_name="Local then federated",
+                ssh_target="user@example-host",
+                ssh_port=2222,
+            )
+
+            self.assertEqual(updated.display_name, "Local then federated")
+            self.assertEqual(updated.ssh_target, "user@example-host")
+            self.assertEqual(updated.ssh_port, 2222)
+            self.assertEqual(manager.load(profile.profile_id), updated)
 
     def test_desktop_settings_default_and_persist_globally(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +274,16 @@ class PortableDesktopProfileTests(unittest.TestCase):
         self.assertEqual(connection, "Waiting for SSH authentication")
         self.assertIn("Enter the Host SSH password", message)
 
+    def test_initial_local_only_poll_failure_does_not_request_ssh_password(self) -> None:
+        connection, message = _poll_failure_state(
+            controller_running=True,
+            agent_has_been_healthy=False,
+            waiting_for_ssh=False,
+        )
+        self.assertEqual(connection, "Starting local Client Agent")
+        self.assertIn("Federation is not connected", message)
+        self.assertNotIn("SSH password", message)
+
 
     def test_host_preview_is_retryable_after_failure_but_not_duplicated_inflight(self) -> None:
         previewed: set[str] = set()
@@ -267,7 +330,7 @@ class PortableDesktopProfileTests(unittest.TestCase):
             "http://127.0.0.1:3001",
         )
 
-    def test_windows_native_ready_message_preserves_anythingllm_default_provider(self) -> None:
+    def test_windows_native_ready_message_preserves_existing_anythingllm_provider(self) -> None:
         message = _local_ai_ready_message(
             {
                 "mode": "windows-native",
@@ -275,29 +338,36 @@ class PortableDesktopProfileTests(unittest.TestCase):
                 "anythingllm_settings": {
                     "onboarding_complete": True,
                     "default_provider": "ollama",
+                    "active_provider": "ollama",
+                    "model": "legalfedllm-local",
+                    "onboarding_completed_by_legalfedllm": False,
                 },
             }
         )
         self.assertIn("Native Ollama", message)
         self.assertIn("Generic OpenAI connection is configured", message)
-        self.assertIn("default LLM provider was left unchanged", message)
+        self.assertIn("existing provider was preserved", message)
+        self.assertIn("choose Local or Host in LegalFedLLM", message)
         self.assertNotIn("http://127.0.0.1:3001", message)
 
-    def test_windows_native_ready_message_leaves_fresh_anythingllm_onboarding_to_user(self) -> None:
+    def test_windows_native_ready_message_reports_automatic_fresh_onboarding(self) -> None:
         message = _local_ai_ready_message(
             {
                 "mode": "windows-native",
                 "anythingllm_settings": {
-                    "onboarding_complete": False,
+                    "onboarding_complete": True,
                     "default_provider": None,
+                    "active_provider": "generic-openai",
+                    "model": "legalfedllm-local",
+                    "onboarding_completed_by_legalfedllm": True,
                 },
             }
         )
-        self.assertIn("Generic OpenAI connection is preconfigured", message)
-        self.assertIn("Complete AnythingLLM Desktop's one-time setup", message)
-        self.assertIn("default LLM provider remains your choice", message)
+        self.assertIn("AnythingLLM Desktop was initialized", message)
+        self.assertIn("legalfedllm-local selected", message)
+        self.assertNotIn("Complete AnythingLLM", message)
 
-    def test_windows_provider_details_expose_only_local_profile_connection_contract(self) -> None:
+    def test_windows_provider_details_are_manual_fallback_for_automatic_setup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = PortableProfileManager(directory)
             profile = self._create(manager, "Windows")
@@ -308,19 +378,84 @@ class PortableDesktopProfileTests(unittest.TestCase):
                 local_ai=stack,
             )
 
-        self.assertIn("AnythingLLM Desktop is external", text)
-        self.assertIn("reserves", text)
-        self.assertIn("does not change AnythingLLM's default LLM provider", text)
-        self.assertIn("choose Generic OpenAI", text)
+        self.assertIn("configures a fresh AnythingLLM Desktop installation automatically", text)
+        self.assertIn("selects legalfedllm-local", text)
+        self.assertIn("Existing AnythingLLM installations keep their current provider", text)
         self.assertIn("manual fallback", text)
         self.assertIn(f"http://127.0.0.1:{profile.agent_port}/v1", text)
         self.assertIn("local-profile-secret", text)
-        self.assertIn("legalfedllm-local", text)
-        self.assertIn("legalfedllm-host", text)
+        self.assertIn("Model:\nlegalfedllm-local", text)
         self.assertIn("4096", text)
         self.assertIn("1024", text)
         self.assertIn("not a Host credential", text)
         self.assertNotIn("Runtime files", text)
+
+    def test_anythingllm_integration_fields_match_single_model_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "Windows")
+            stack = LocalAiStack(manager.data_root, platform="win32")
+            fields = dict(
+                _provider_detail_fields(
+                    profile,
+                    admin_token="local-profile-secret",
+                    local_ai=stack,
+                )
+            )
+
+        self.assertEqual(fields["Provider"], "Generic OpenAI")
+        self.assertEqual(
+            fields["OpenAI-compatible base URL"],
+            f"http://127.0.0.1:{profile.agent_port}/v1",
+        )
+        self.assertEqual(fields["API key for this local profile"], "local-profile-secret")
+        self.assertEqual(fields["Model"], "legalfedllm-local")
+        self.assertNotIn("Local model", fields)
+        self.assertNotIn("Host model", fields)
+        self.assertNotIn("Runtime files", fields)
+
+    def test_linux_anythingllm_integration_details_do_not_expose_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PortableProfileManager(directory)
+            profile = self._create(manager, "Linux")
+            stack = LocalAiStack(manager.data_root, platform="linux")
+            fields = dict(
+                _provider_detail_fields(
+                    profile,
+                    admin_token="local-profile-secret",
+                    local_ai=stack,
+                )
+            )
+            text = _provider_details_text(
+                profile,
+                admin_token="local-profile-secret",
+                local_ai=stack,
+            )
+
+        self.assertNotIn("Runtime files", fields)
+        self.assertNotIn("Runtime files", text)
+        self.assertEqual(fields["Model"], "legalfedllm-local")
+
+    def test_anythingllm_host_selection_requires_enrollment_and_live_coordinator(self) -> None:
+        self.assertFalse(_anythingllm_host_available({}, {}))
+        self.assertFalse(
+            _anythingllm_host_available(
+                {"enrolled": True},
+                {"coordinator_connected": False},
+            )
+        )
+        self.assertFalse(
+            _anythingllm_host_available(
+                {"enrolled": False},
+                {"coordinator_connected": True},
+            )
+        )
+        self.assertTrue(
+            _anythingllm_host_available(
+                {"enrolled": True},
+                {"coordinator_connected": True},
+            )
+        )
 
     def test_anythingllm_browser_launch_waits_for_agent_and_local_stack(self) -> None:
         self.assertFalse(

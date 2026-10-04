@@ -25,6 +25,9 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 ANYTHINGLLM_URL = "http://127.0.0.1:3001"
 ANYTHINGLLM_CONTEXT_WINDOW = "4096"
 ANYTHINGLLM_MAX_TOKENS = "1024"
+LEGALFEDLLM_LOCAL_MODEL = "legalfedllm-local"
+LEGALFEDLLM_HOST_MODEL = "legalfedllm-host"
+LEGALFEDLLM_ANYTHINGLLM_MODELS = {LEGALFEDLLM_LOCAL_MODEL, LEGALFEDLLM_HOST_MODEL}
 ANYTHINGLLM_WINDOWS_RELATIVE_EXE = Path("Programs") / "AnythingLLM" / "AnythingLLM.exe"
 _PLACEHOLDER_SECRETS = {
     "",
@@ -148,7 +151,7 @@ class LocalAiStack:
             "JWT_SECRET": jwt_secret,
             "LLM_PROVIDER": "generic-openai",
             "GENERIC_OPEN_AI_BASE_PATH": f"http://127.0.0.1:{profile.agent_port}/v1",
-            "GENERIC_OPEN_AI_MODEL_PREF": "legalfedllm-local",
+            "GENERIC_OPEN_AI_MODEL_PREF": LEGALFEDLLM_LOCAL_MODEL,
             "GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT": "8192",
             "GENERIC_OPEN_AI_MAX_TOKENS": "1024",
             "GENERIC_OPEN_AI_API_KEY": admin_token,
@@ -289,56 +292,31 @@ class LocalAiStack:
         self._launch_windows_anythingllm(executable)
         return True
 
-    def _configure_windows_anythingllm(
+    def _windows_anythingllm_settings(
         self,
         profile: DesktopProfile,
         admin_token: str,
-    ) -> dict[str, Any]:
-        try:
-            setup_response = httpx.get(
-                f"{ANYTHINGLLM_URL}/api/setup-complete",
-                timeout=3.0,
-            )
-            onboarding_response = httpx.get(
-                f"{ANYTHINGLLM_URL}/api/onboarding",
-                timeout=3.0,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "AnythingLLM Desktop local API is not reachable at http://127.0.0.1:3001."
-            ) from exc
-        if setup_response.status_code != 200:
-            raise RuntimeError(
-                "AnythingLLM Desktop did not answer its local setup API "
-                f"(HTTP {setup_response.status_code})."
-            )
-        if onboarding_response.status_code != 200:
-            raise RuntimeError(
-                "AnythingLLM Desktop did not answer its onboarding status API "
-                f"(HTTP {onboarding_response.status_code})."
-            )
-        try:
-            setup_payload: Any = setup_response.json()
-            onboarding_payload: Any = onboarding_response.json()
-        except Exception as exc:
-            raise RuntimeError(
-                "AnythingLLM Desktop returned an invalid setup response."
-            ) from exc
-        setup_values = setup_payload.get("results") if isinstance(setup_payload, dict) else None
-        if not isinstance(setup_values, dict):
-            raise RuntimeError("AnythingLLM Desktop returned an invalid setup response.")
-        if not isinstance(onboarding_payload, dict):
-            raise RuntimeError("AnythingLLM Desktop returned an invalid onboarding response.")
-        onboarding_complete = bool(onboarding_payload.get("onboardingComplete"))
-        default_provider = setup_values.get("LLMProvider")
-
+        *,
+        model: str = LEGALFEDLLM_LOCAL_MODEL,
+        select_provider: bool = False,
+    ) -> dict[str, str]:
+        if model not in LEGALFEDLLM_ANYTHINGLLM_MODELS:
+            raise ValueError(f"Unsupported LegalFedLLM AnythingLLM model: {model}")
         settings = {
             "GenericOpenAiBasePath": f"http://127.0.0.1:{profile.agent_port}/v1",
             "GenericOpenAiKey": admin_token,
-            "GenericOpenAiModelPref": "legalfedllm-local",
+            "GenericOpenAiModelPref": model,
             "GenericOpenAiTokenLimit": ANYTHINGLLM_CONTEXT_WINDOW,
             "GenericOpenAiMaxTokens": ANYTHINGLLM_MAX_TOKENS,
         }
+        if select_provider:
+            settings["LLMProvider"] = "generic-openai"
+        return settings
+
+    def _apply_windows_anythingllm_settings(
+        self,
+        settings: dict[str, str],
+    ) -> dict[str, Any]:
         try:
             response = httpx.post(
                 f"{ANYTHINGLLM_URL}/api/system/update-env",
@@ -381,54 +359,137 @@ class LocalAiStack:
                     "AnythingLLM Desktop did not confirm the expected setting "
                     f"'{key}'."
                 )
+        return new_values
 
+    def _windows_anythingllm_setup_values(self) -> dict[str, Any]:
         try:
-            verified = httpx.get(
+            response = httpx.get(
                 f"{ANYTHINGLLM_URL}/api/setup-complete",
                 timeout=3.0,
             )
         except Exception as exc:
             raise RuntimeError(
-                "AnythingLLM Desktop was configured, but its settings could not be verified."
+                "AnythingLLM Desktop local API is not reachable at http://127.0.0.1:3001."
             ) from exc
-        if verified.status_code != 200:
+        if response.status_code != 200:
             raise RuntimeError(
-                "AnythingLLM Desktop was configured, but its settings verification failed "
-                f"(HTTP {verified.status_code})."
+                "AnythingLLM Desktop did not answer its local setup API "
+                f"(HTTP {response.status_code})."
             )
         try:
-            verified_payload: Any = verified.json()
+            payload: Any = response.json()
         except Exception as exc:
             raise RuntimeError(
-                "AnythingLLM Desktop returned an invalid settings verification response."
+                "AnythingLLM Desktop returned an invalid setup response."
             ) from exc
-        verified_values = (
-            verified_payload.get("results") if isinstance(verified_payload, dict) else None
-        )
-        if not isinstance(verified_values, dict):
-            raise RuntimeError(
-                "AnythingLLM Desktop returned an invalid settings verification response."
+        values = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(values, dict):
+            raise RuntimeError("AnythingLLM Desktop returned an invalid setup response.")
+        return values
+
+    def _windows_anythingllm_onboarding_complete(self) -> bool:
+        try:
+            response = httpx.get(
+                f"{ANYTHINGLLM_URL}/api/onboarding",
+                timeout=3.0,
             )
-        if verified_values.get("LLMProvider") != default_provider:
+        except Exception as exc:
             raise RuntimeError(
-                "AnythingLLM Desktop changed its default LLM provider unexpectedly while "
+                "AnythingLLM Desktop local API is not reachable at http://127.0.0.1:3001."
+            ) from exc
+        if response.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop did not answer its onboarding status API "
+                f"(HTTP {response.status_code})."
+            )
+        try:
+            payload: Any = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop returned an invalid onboarding response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("AnythingLLM Desktop returned an invalid onboarding response.")
+        return bool(payload.get("onboardingComplete"))
+
+    def _complete_windows_anythingllm_onboarding(self) -> None:
+        try:
+            response = httpx.post(
+                f"{ANYTHINGLLM_URL}/api/onboarding",
+                timeout=10.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "AnythingLLM Desktop could not complete its one-time local onboarding."
+            ) from exc
+        if response.status_code in {401, 403}:
+            raise RuntimeError(
+                "AnythingLLM Desktop requires its own authentication, so LegalFedLLM will not "
+                "complete onboarding automatically."
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                "AnythingLLM Desktop rejected automatic onboarding "
+                f"(HTTP {response.status_code})."
+            )
+
+    def _verify_windows_anythingllm_settings(
+        self,
+        expected: dict[str, str],
+        *,
+        expected_provider: str | None,
+    ) -> dict[str, Any]:
+        verified_values = self._windows_anythingllm_setup_values()
+        if verified_values.get("LLMProvider") != expected_provider:
+            raise RuntimeError(
+                "AnythingLLM Desktop did not retain the expected default LLM provider while "
                 "LegalFedLLM configured Generic OpenAI."
             )
         verification = {
-            "GenericOpenAiBasePath": settings["GenericOpenAiBasePath"],
-            "GenericOpenAiModelPref": settings["GenericOpenAiModelPref"],
-            "GenericOpenAiTokenLimit": settings["GenericOpenAiTokenLimit"],
-            "GenericOpenAiMaxTokens": settings["GenericOpenAiMaxTokens"],
+            "GenericOpenAiBasePath": expected["GenericOpenAiBasePath"],
+            "GenericOpenAiModelPref": expected["GenericOpenAiModelPref"],
+            "GenericOpenAiTokenLimit": expected["GenericOpenAiTokenLimit"],
+            "GenericOpenAiMaxTokens": expected["GenericOpenAiMaxTokens"],
         }
-        for key, expected in verification.items():
-            if str(verified_values.get(key, "")) != expected:
+        for key, value in verification.items():
+            if str(verified_values.get(key, "")) != value:
                 raise RuntimeError(
                     "AnythingLLM Desktop did not persist the expected setting "
                     f"'{key}'."
                 )
         if not verified_values.get("GenericOpenAiKey"):
             raise RuntimeError("AnythingLLM Desktop did not persist the Generic OpenAI API key.")
+        return verified_values
 
+    def _configure_windows_anythingllm(
+        self,
+        profile: DesktopProfile,
+        admin_token: str,
+    ) -> dict[str, Any]:
+        setup_values = self._windows_anythingllm_setup_values()
+        onboarding_complete = self._windows_anythingllm_onboarding_complete()
+        default_provider = setup_values.get("LLMProvider")
+        fresh_install = not onboarding_complete
+        settings = self._windows_anythingllm_settings(
+            profile,
+            admin_token,
+            model=LEGALFEDLLM_LOCAL_MODEL,
+            select_provider=fresh_install,
+        )
+        self._apply_windows_anythingllm_settings(settings)
+        if fresh_install:
+            self._complete_windows_anythingllm_onboarding()
+
+        final_onboarding = self._windows_anythingllm_onboarding_complete()
+        if not final_onboarding:
+            raise RuntimeError(
+                "AnythingLLM Desktop did not confirm completion of its one-time onboarding."
+            )
+        expected_provider = "generic-openai" if fresh_install else default_provider
+        verified_values = self._verify_windows_anythingllm_settings(
+            settings,
+            expected_provider=expected_provider,
+        )
         return {
             "provider": "generic-openai",
             "base_url": settings["GenericOpenAiBasePath"],
@@ -436,7 +497,38 @@ class LocalAiStack:
             "context_window": settings["GenericOpenAiTokenLimit"],
             "max_tokens": settings["GenericOpenAiMaxTokens"],
             "default_provider": default_provider,
-            "onboarding_complete": onboarding_complete,
+            "active_provider": verified_values.get("LLMProvider"),
+            "onboarding_complete": final_onboarding,
+            "onboarding_completed_by_legalfedllm": fresh_install,
+        }
+
+    def select_windows_anythingllm_model(
+        self,
+        profile: DesktopProfile,
+        admin_token: str,
+        model: str,
+    ) -> dict[str, Any]:
+        if not self.is_windows:
+            raise RuntimeError("AnythingLLM model switching is currently supported only on Windows.")
+        settings = self._windows_anythingllm_settings(
+            profile,
+            admin_token,
+            model=model,
+            select_provider=True,
+        )
+        self._apply_windows_anythingllm_settings(settings)
+        verified_values = self._verify_windows_anythingllm_settings(
+            settings,
+            expected_provider="generic-openai",
+        )
+        return {
+            "provider": "generic-openai",
+            "active_provider": verified_values.get("LLMProvider"),
+            "base_url": settings["GenericOpenAiBasePath"],
+            "model": settings["GenericOpenAiModelPref"],
+            "context_window": settings["GenericOpenAiTokenLimit"],
+            "max_tokens": settings["GenericOpenAiMaxTokens"],
+            "onboarding_complete": True,
         }
 
     def running_services(self) -> set[str]:

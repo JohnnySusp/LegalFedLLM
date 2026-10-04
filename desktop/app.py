@@ -22,14 +22,16 @@ from client.model_profiles import (
 from desktop.local_ai import (
     ANYTHINGLLM_CONTEXT_WINDOW,
     ANYTHINGLLM_MAX_TOKENS,
+    LEGALFEDLLM_HOST_MODEL,
+    LEGALFEDLLM_LOCAL_MODEL,
     LocalAiStack,
 )
 from desktop.profiles import DEFAULT_DESKTOP_SETTINGS, DesktopProfile, PortableProfileManager
 
 
 APP_TITLE = "LegalFedLLM Client"
-LOCAL_MODEL = "legalfedllm-local"
-HOST_MODEL = "legalfedllm-host"
+LOCAL_MODEL = LEGALFEDLLM_LOCAL_MODEL
+HOST_MODEL = LEGALFEDLLM_HOST_MODEL
 DIAGNOSTIC_MODES = ("state", "gpu")
 
 
@@ -271,8 +273,14 @@ def _poll_failure_state(
     *,
     controller_running: bool,
     agent_has_been_healthy: bool,
+    waiting_for_ssh: bool = True,
 ) -> tuple[str, str]:
     if controller_running and not agent_has_been_healthy:
+        if not waiting_for_ssh:
+            return (
+                "Starting local Client Agent",
+                "LegalFedLLM is starting the local Client Agent. Federation is not connected for this profile.",
+            )
         return (
             "Waiting for SSH authentication",
             "Enter the Host SSH password in the launch terminal. "
@@ -353,18 +361,30 @@ def _anythingllm_browser_url(payload: dict[str, Any] | None) -> str | None:
     return value or None
 
 
+def _anythingllm_host_available(
+    health: dict[str, Any],
+    status: dict[str, Any],
+) -> bool:
+    return bool(health.get("enrolled") and status.get("coordinator_connected"))
+
+
 def _local_ai_ready_message(payload: dict[str, Any]) -> str:
     if payload.get("mode") == "windows-native":
         settings = payload.get("anythingllm_settings") or {}
-        if not settings.get("onboarding_complete", False):
+        if settings.get("onboarding_completed_by_legalfedllm"):
             return (
-                "Ready. Native Ollama is available and LegalFedLLM's Generic OpenAI connection "
-                "is preconfigured. Complete AnythingLLM Desktop's one-time setup; its default "
-                "LLM provider remains your choice."
+                "Ready. Native Ollama is available and AnythingLLM Desktop was initialized "
+                "for LegalFedLLM with legalfedllm-local selected."
+            )
+        if settings.get("active_provider") == "generic-openai":
+            return (
+                "Ready. Native Ollama is available and AnythingLLM Desktop is using "
+                f"{settings.get('model', LOCAL_MODEL)} through LegalFedLLM."
             )
         return (
             "Ready. Native Ollama is available and LegalFedLLM's Generic OpenAI connection is "
-            "configured. AnythingLLM's default LLM provider was left unchanged."
+            "configured. AnythingLLM's existing provider was preserved; choose Local or Host "
+            "in LegalFedLLM to switch AnythingLLM to the LegalFedLLM provider."
         )
     return (
         "Ready. AnythingLLM is available at "
@@ -381,31 +401,52 @@ def _provider_details_text(
     base_url = f"http://127.0.0.1:{profile.agent_port}/v1"
     if local_ai.is_windows:
         return (
-            "AnythingLLM Desktop is external to LegalFedLLM on Windows. LegalFedLLM reserves "
-            "AnythingLLM's Generic OpenAI connection for the active LegalFedLLM profile, but it "
-            "does not change AnythingLLM's default LLM provider or complete AnythingLLM onboarding. "
-            "In an AnythingLLM workspace, choose Generic OpenAI and select legalfedllm-local or "
-            "legalfedllm-host. These values are the manual fallback if automatic configuration is "
-            "unavailable.\n\n"
+            "LegalFedLLM configures a fresh AnythingLLM Desktop installation automatically "
+            "and selects legalfedllm-local. Existing AnythingLLM installations keep their "
+            "current provider until you explicitly choose Local or Host in LegalFedLLM. "
+            "These values are the manual fallback if automatic configuration is unavailable.\n\n"
             "Provider: Generic OpenAI\n"
             f"OpenAI-compatible base URL:\n{base_url}\n\n"
             f"API key for this local profile:\n{admin_token}\n\n"
-            f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
+            f"Model:\n{LOCAL_MODEL}\n\n"
             f"Model context window:\n{ANYTHINGLLM_CONTEXT_WINDOW}\n\n"
             f"Max tokens:\n{ANYTHINGLLM_MAX_TOKENS}\n\n"
             f"Required native Ollama model:\n{profile.ollama_model}\n\n"
             "The API key is the local per-profile Client Agent token, not a Host credential. "
-            "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue."
+            "LOCAL stays on the Client. HOST requires an active federation connection."
         )
     return (
         "AnythingLLM is configured automatically when this profile is activated.\n\n"
         "AnythingLLM UI:\nhttp://127.0.0.1:3001\n\n"
         f"OpenAI-compatible base URL:\n{base_url}\n\n"
-        f"Models:\n- {LOCAL_MODEL}\n- {HOST_MODEL}\n\n"
-        f"Runtime files:\n{local_ai.runtime_root}\n\n"
+        f"Model:\n{LOCAL_MODEL}\n\n"
         "LOCAL stays on the Client. HOST explicitly forwards the prompt to the Host queue. "
         "AnythingLLM native Generic OpenAI tool calling is disabled for the current 1.0 scope."
     )
+
+
+def _provider_detail_fields(
+    profile: DesktopProfile,
+    *,
+    admin_token: str,
+    local_ai: LocalAiStack,
+) -> list[tuple[str, str]]:
+    base_url = f"http://127.0.0.1:{profile.agent_port}/v1"
+    fields: list[tuple[str, str]] = []
+    if not local_ai.is_windows:
+        fields.append(("AnythingLLM UI", "http://127.0.0.1:3001"))
+    fields.extend(
+        [
+            ("Provider", "Generic OpenAI"),
+            ("OpenAI-compatible base URL", base_url),
+            ("API key for this local profile", admin_token),
+            ("Model", LOCAL_MODEL),
+            ("Model context window", ANYTHINGLLM_CONTEXT_WINDOW),
+            ("Max tokens", ANYTHINGLLM_MAX_TOKENS),
+            ("Required Ollama model", profile.ollama_model),
+        ]
+    )
+    return fields
 
 
 def _appimage_host_environment() -> dict[str, str]:
@@ -649,7 +690,7 @@ def run_gui(data_root: Path | None = None) -> int:
                     profile_id,
                 )
             self.ssh_target = QLineEdit()
-            self.ssh_target.setPlaceholderText("user@host.example")
+            self.ssh_target.setPlaceholderText("user@host.example (optional until enrollment)")
             self.ssh_port = QSpinBox()
             self.ssh_port.setRange(1, 65535)
             self.ssh_port.setValue(22)
@@ -661,14 +702,14 @@ def run_gui(data_root: Path | None = None) -> int:
             self.agent_port.setValue(8001)
             self.token = QLineEdit()
             self.token.setEchoMode(QLineEdit.EchoMode.Password)
-            self.token.setPlaceholderText("one-time Host enrollment token")
+            self.token.setPlaceholderText("one-time Host enrollment token (optional)")
             form.addRow("Profile name", self.name)
             form.addRow("Client model", self.model)
-            form.addRow("SSH target", self.ssh_target)
+            form.addRow("SSH target (optional)", self.ssh_target)
             form.addRow("SSH port", self.ssh_port)
             form.addRow("Coordinator local port", self.local_port)
             form.addRow("Client Agent port", self.agent_port)
-            form.addRow("Enrollment token", self.token)
+            form.addRow("Enrollment token (optional)", self.token)
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
             )
@@ -689,32 +730,129 @@ def run_gui(data_root: Path | None = None) -> int:
 
         def accept(self) -> None:
             values = self.values()
-            if not values["display_name"] or not values["ssh_target"] or not values["enrollment_token"]:
-                QMessageBox.warning(self, APP_TITLE, "Profile name, SSH target and enrollment token are required.")
+            if not values["display_name"]:
+                QMessageBox.warning(self, APP_TITLE, "Profile name is required.")
+                return
+            if values["enrollment_token"] and not values["ssh_target"]:
+                QMessageBox.warning(
+                    self,
+                    APP_TITLE,
+                    "SSH target is required when an enrollment token is provided.",
+                )
                 return
             super().accept()
 
-    class EnrollmentDialog(QDialog):
+    class EditProfileDialog(QDialog):
         def __init__(self, profile: DesktopProfile, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("Enroll Client profile")
-            layout = QVBoxLayout(self)
-            layout.addWidget(QLabel(f"{profile.display_name} is not enrolled. Enter a fresh one-time Host token."))
+            self.setWindowTitle("Edit LegalFedLLM profile")
+            form = QFormLayout(self)
+            self.name = QLineEdit(profile.display_name)
+            self.ssh_target = QLineEdit(profile.ssh_target)
+            self.ssh_target.setPlaceholderText("user@host.example (optional until enrollment)")
+            self.ssh_port = QSpinBox()
+            self.ssh_port.setRange(1, 65535)
+            self.ssh_port.setValue(profile.ssh_port)
             self.token = QLineEdit()
             self.token.setEchoMode(QLineEdit.EchoMode.Password)
-            layout.addWidget(self.token)
+            self.token.setPlaceholderText("one-time Host enrollment token (optional)")
+            form.addRow("Profile name", self.name)
+            form.addRow("Client model", QLabel(_profile_model_label(profile.model_profile_id)))
+            form.addRow("SSH target (optional)", self.ssh_target)
+            form.addRow("SSH port", self.ssh_port)
+            form.addRow("Enrollment token (optional)", self.token)
+            note = QLabel(
+                "Leave the enrollment token blank to keep this profile local-only. "
+                "Supplying a fresh token will restart the Client Agent, open the SSH tunnel, "
+                "and enroll the profile."
+            )
+            note.setWordWrap(True)
+            form.addRow(note)
             buttons = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
             )
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
-            layout.addWidget(buttons)
+            form.addRow(buttons)
+
+        def values(self) -> dict[str, Any]:
+            return {
+                "display_name": self.name.text().strip(),
+                "ssh_target": self.ssh_target.text().strip(),
+                "ssh_port": self.ssh_port.value(),
+                "enrollment_token": self.token.text().strip(),
+            }
 
         def accept(self) -> None:
-            if not self.token.text().strip():
-                QMessageBox.warning(self, APP_TITLE, "Enrollment token is required.")
+            values = self.values()
+            if not values["display_name"]:
+                QMessageBox.warning(self, APP_TITLE, "Profile name is required.")
+                return
+            if values["enrollment_token"] and not values["ssh_target"]:
+                QMessageBox.warning(
+                    self,
+                    APP_TITLE,
+                    "SSH target is required when an enrollment token is provided.",
+                )
                 return
             super().accept()
+
+    class ProviderDetailsDialog(QDialog):
+        def __init__(
+            self,
+            profile: DesktopProfile,
+            *,
+            admin_token: str,
+            local_ai: LocalAiStack,
+            parent=None,
+        ):
+            super().__init__(parent)
+            self.setWindowTitle("AnythingLLM integration details")
+            layout = QVBoxLayout(self)
+            intro = QLabel(
+                "Use these values for AnythingLLM's Generic OpenAI provider. "
+                "Each field can be copied independently."
+            )
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
+
+            form = QFormLayout()
+            for label, value in _provider_detail_fields(
+                profile,
+                admin_token=admin_token,
+                local_ai=local_ai,
+            ):
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                field = QLineEdit(value)
+                field.setReadOnly(True)
+                copy_button = QPushButton("Copy")
+                copy_button.clicked.connect(
+                    lambda checked=False, text=value: QApplication.clipboard().setText(text)
+                )
+                row_layout.addWidget(field, 1)
+                row_layout.addWidget(copy_button)
+                form.addRow(label, row)
+            layout.addLayout(form)
+
+            note_text = (
+                "The API key is the local per-profile Client Agent token, not a Host credential. "
+                "legalfedllm-local stays on the Client. legalfedllm-host requires federation connectivity."
+            )
+            if local_ai.is_windows:
+                note_text += (
+                    " Fresh AnythingLLM Desktop installations are initialized automatically. "
+                    "Use the AnythingLLM model control in LegalFedLLM to switch between Local and Host; "
+                    "these fields are a manual fallback."
+                )
+            note = QLabel(note_text)
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            buttons.rejected.connect(self.reject)
+            buttons.accepted.connect(self.accept)
+            layout.addWidget(buttons)
 
     class LearningDialog(QDialog):
         def __init__(self, suggestion: dict[str, Any], parent=None):
@@ -792,6 +930,8 @@ def run_gui(data_root: Path | None = None) -> int:
             self.local_ai_payload: dict[str, Any] | None = None
             self.local_ai_start_attempted = False
             self.anythingllm_browser_attempted = False
+            self.anythingllm_model_id = LOCAL_MODEL
+            self.anythingllm_model_switch_inflight = False
             self.workers: set[Worker] = set()
             self.poll_worker: Worker | None = None
             self.suggestion_dialog_open = False
@@ -852,6 +992,17 @@ def run_gui(data_root: Path | None = None) -> int:
             form.addRow("Participants", self.participants_label)
             form.addRow("My state", self.my_state_label)
             form.addRow("Local learning queue", self.queue_label)
+            self.anythingllm_model_combo = None
+            if self.local_ai.is_windows:
+                self.anythingllm_model_combo = QComboBox()
+                self.anythingllm_model_combo.addItem("Local", LOCAL_MODEL)
+                self.anythingllm_model_combo.addItem("Host", HOST_MODEL)
+                self.anythingllm_model_combo.setEnabled(False)
+                self.anythingllm_model_combo.setToolTip(
+                    "Choose which LegalFedLLM model AnythingLLM uses. Host requires an active federation connection."
+                )
+                self.anythingllm_model_combo.activated.connect(self._anythingllm_model_selected)
+                form.addRow("AnythingLLM model", self.anythingllm_model_combo)
             layout.addWidget(group)
 
             self.message = QLabel("Starting Client Agent…")
@@ -896,6 +1047,10 @@ def run_gui(data_root: Path | None = None) -> int:
                 menu.addAction(action)
             if menu.actions():
                 menu.addSeparator()
+            if self.profile is not None:
+                edit = QAction("Edit current profile…", menu)
+                edit.triggered.connect(self._edit_profile)
+                menu.addAction(edit)
             create = QAction("Create new profile…", menu)
             create.triggered.connect(self._create_profile)
             menu.addAction(create)
@@ -1055,6 +1210,23 @@ def run_gui(data_root: Path | None = None) -> int:
             self.pending_enrollment_token = token
             self._activate_profile(profile, enrollment_token=token)
 
+        def _edit_profile(self) -> None:
+            if self.profile is None:
+                return
+            dialog = EditProfileDialog(self.profile, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            values = dialog.values()
+            token = values.pop("enrollment_token")
+            try:
+                updated = self.manager.update_connection(self.profile.profile_id, **values)
+            except Exception as exc:
+                QMessageBox.critical(self, APP_TITLE, str(exc))
+                return
+            self.controller.stop()
+            self.profile = None
+            self._activate_profile(updated, enrollment_token=token or None)
+
         def _activate_profile(
             self,
             profile: DesktopProfile,
@@ -1062,12 +1234,10 @@ def run_gui(data_root: Path | None = None) -> int:
         ) -> None:
             if self.profile and self.profile.profile_id == profile.profile_id and self.controller.running():
                 return
-            if not _registration_exists(self.manager, profile) and not enrollment_token:
-                dialog = EnrollmentDialog(profile, self)
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    self.message.setText("This profile requires a one-time enrollment token before it can connect.")
-                    return
-                enrollment_token = dialog.token.text().strip()
+            federation_requested = bool(
+                profile.ssh_target
+                and (_registration_exists(self.manager, profile) or enrollment_token)
+            )
             self.manager.set_active(profile.profile_id)
             self.profile = profile
             self.api = AgentApi(profile, self.manager.admin_token(profile.profile_id))
@@ -1081,6 +1251,11 @@ def run_gui(data_root: Path | None = None) -> int:
             self.local_ai_payload = None
             self.local_ai_start_attempted = False
             self.anythingllm_browser_attempted = False
+            self.anythingllm_model_id = LOCAL_MODEL
+            self.anythingllm_model_switch_inflight = False
+            if self.anythingllm_model_combo is not None:
+                self._set_anythingllm_combo_model(LOCAL_MODEL)
+                self.anythingllm_model_combo.setEnabled(False)
             self.suggestion_resolution_inflight.clear()
             self.previewed_rounds.clear()
             self.host_preview_retry_at.clear()
@@ -1091,14 +1266,21 @@ def run_gui(data_root: Path | None = None) -> int:
             self.model_label.setText(
                 f"{_profile_model_label(profile.model_profile_id)} ({profile.ollama_model})"
             )
-            self.connection_label.setText("Starting…")
+            self.connection_label.setText("Connecting…" if federation_requested else "Local only")
             self.round_label.setText("—")
             self.participants_label.setText("—")
             self.my_state_label.setText("Not connected")
-            self.message.setText(
-                "Connecting to the Host. Enter the SSH password in the launch terminal. "
-                "The Client Agent API will start after the SSH tunnel is established."
-            )
+            if federation_requested:
+                self.message.setText(
+                    "Connecting to the Host. Enter the SSH password in the launch terminal. "
+                    "The Client Agent API will start after the SSH tunnel is established."
+                )
+            else:
+                self.message.setText(
+                    "Starting in local-only mode. The Client model and AnythingLLM can be used "
+                    "without joining the federation. Add a Host target and one-time enrollment "
+                    "token from Edit current profile when you want to connect."
+                )
             try:
                 self.controller.start(profile, enrollment_token=enrollment_token)
             except Exception as exc:
@@ -1117,9 +1299,9 @@ def run_gui(data_root: Path | None = None) -> int:
             profile = self.profile
             admin_token = self.manager.admin_token(profile.profile_id)
             self.message.setText(
-                "SSH connected. Verifying native Ollama…"
+                "Verifying native Ollama and preparing AnythingLLM…"
                 if self.local_ai.is_windows
-                else "SSH connected. Starting local Ollama and AnythingLLM…"
+                else "Starting local Ollama and AnythingLLM…"
             )
             self._run_worker(
                 lambda: self.local_ai.prepare(profile, admin_token),
@@ -1127,11 +1309,116 @@ def run_gui(data_root: Path | None = None) -> int:
                 self._local_ai_failed,
             )
 
+        def _set_anythingllm_combo_model(self, model: str) -> None:
+            combo = self.anythingllm_model_combo
+            if combo is None:
+                return
+            index = combo.findData(model)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
         def _local_ai_ready(self, payload: Any) -> None:
             self.local_ai_payload = dict(payload) if isinstance(payload, dict) else {}
+            if self.local_ai.is_windows and self.anythingllm_model_combo is not None:
+                settings = self.local_ai_payload.get("anythingllm_settings") or {}
+                model = str(settings.get("model") or LOCAL_MODEL)
+                if model not in {LOCAL_MODEL, HOST_MODEL}:
+                    model = LOCAL_MODEL
+                self.anythingllm_model_id = model
+                self._set_anythingllm_combo_model(model)
+                self.anythingllm_model_combo.setEnabled(True)
             self._maybe_open_anythingllm()
             if self.agent_has_been_healthy:
                 self.message.setText(_local_ai_ready_message(self.local_ai_payload))
+
+        def _anythingllm_model_selected(self, index: int) -> None:
+            combo = self.anythingllm_model_combo
+            if (
+                combo is None
+                or self.profile is None
+                or self.local_ai_payload is None
+                or self.anythingllm_model_switch_inflight
+            ):
+                return
+            model = str(combo.itemData(index) or "")
+            if model not in {LOCAL_MODEL, HOST_MODEL}:
+                self._set_anythingllm_combo_model(self.anythingllm_model_id)
+                return
+            if model == HOST_MODEL and not _anythingllm_host_available(
+                self.last_health,
+                self.last_status,
+            ):
+                self._set_anythingllm_combo_model(self.anythingllm_model_id)
+                QMessageBox.warning(
+                    self,
+                    APP_TITLE,
+                    "Host inference requires an enrolled profile with an active Coordinator connection. "
+                    "Connect this profile to the federation before selecting Host for AnythingLLM.",
+                )
+                return
+
+            profile = self.profile
+            admin_token = self.manager.admin_token(profile.profile_id)
+            previous_model = self.anythingllm_model_id
+            self.anythingllm_model_switch_inflight = True
+            combo.setEnabled(False)
+            self.message.setText(
+                "Switching AnythingLLM to the local Client model…"
+                if model == LOCAL_MODEL
+                else "Switching AnythingLLM to Host inference…"
+            )
+            self._run_worker(
+                lambda: self.local_ai.select_windows_anythingllm_model(
+                    profile,
+                    admin_token,
+                    model,
+                ),
+                lambda payload, profile_id=profile.profile_id: self._anythingllm_model_switched(
+                    profile_id, payload
+                ),
+                lambda error, profile_id=profile.profile_id, old=previous_model: self._anythingllm_model_switch_failed(
+                    profile_id, old, error
+                ),
+            )
+
+        def _anythingllm_model_switched(self, profile_id: str, payload: Any) -> None:
+            self.anythingllm_model_switch_inflight = False
+            if self.profile is None or self.profile.profile_id != profile_id:
+                return
+            settings = dict(payload) if isinstance(payload, dict) else {}
+            model = str(settings.get("model") or LOCAL_MODEL)
+            if model not in {LOCAL_MODEL, HOST_MODEL}:
+                model = LOCAL_MODEL
+            self.anythingllm_model_id = model
+            self._set_anythingllm_combo_model(model)
+            if self.anythingllm_model_combo is not None:
+                self.anythingllm_model_combo.setEnabled(True)
+            if self.local_ai_payload is not None:
+                self.local_ai_payload["anythingllm_settings"] = settings
+            self.message.setText(
+                "AnythingLLM is using the local Client model."
+                if model == LOCAL_MODEL
+                else "AnythingLLM is using Host inference through the active federation connection."
+            )
+
+        def _anythingllm_model_switch_failed(
+            self,
+            profile_id: str,
+            previous_model: str,
+            error: str,
+        ) -> None:
+            self.anythingllm_model_switch_inflight = False
+            if self.profile is None or self.profile.profile_id != profile_id:
+                return
+            self._set_anythingllm_combo_model(previous_model)
+            if self.anythingllm_model_combo is not None:
+                self.anythingllm_model_combo.setEnabled(True)
+            self.message.setText(f"AnythingLLM model switch failed: {error}")
+            QMessageBox.warning(
+                self,
+                APP_TITLE,
+                "AnythingLLM could not be switched to the selected LegalFedLLM model.\n\n" + error,
+            )
 
         def _maybe_open_anythingllm(self) -> None:
             if not _browser_launch_ready(
@@ -1216,9 +1503,18 @@ def run_gui(data_root: Path | None = None) -> int:
 
         def _poll_failure(self, error: str) -> None:
             self.participate_button.setEnabled(False)
+            waiting_for_ssh = bool(
+                self.profile
+                and self.profile.ssh_target
+                and (
+                    _registration_exists(self.manager, self.profile)
+                    or self.pending_enrollment_token
+                )
+            )
             connection, message = _poll_failure_state(
                 controller_running=self.controller.running(),
                 agent_has_been_healthy=self.agent_has_been_healthy,
+                waiting_for_ssh=waiting_for_ssh,
             )
             self.connection_label.setText(connection)
             if connection == "Disconnected":
@@ -1248,6 +1544,25 @@ def run_gui(data_root: Path | None = None) -> int:
             self.compatible = bool(compatibility.get("compatible"))
             if not status.get("enrolled"):
                 tunnel = payload["health"].get("tunnel") or {}
+                learning = status.get("learning_queue") or {}
+                self.queue_label.setText(str(learning.get("queued_example_count", 0)))
+                self.round_label.setText("—")
+                self.participants_label.setText("—")
+                self.my_state_label.setText("Local only")
+                self.participate_button.setEnabled(False)
+
+                if not tunnel.get("enabled"):
+                    self.connection_label.setText("Local only")
+                    if not self.compatible:
+                        error = compatibility.get("error") or "Selected Ollama model is not compatible."
+                        self.message.setText(str(error))
+                    elif self.local_ai_payload is not None:
+                        self.message.setText(
+                            "Ready for local use. This profile is not enrolled in the federation. "
+                            "Use Edit current profile when you want to add Host details and enroll."
+                        )
+                    return
+
                 if not tunnel.get("forward_reachable"):
                     self.connection_label.setText("Waiting for SSH authentication")
                     self.message.setText(
@@ -1266,7 +1581,7 @@ def run_gui(data_root: Path | None = None) -> int:
                     self._run_worker(self.api.register, self._registered, self._registration_failed)
                 elif not self.pending_enrollment_token:
                     self.message.setText(
-                        "This profile is not enrolled. Select it from the profile menu to enter a fresh one-time Host token."
+                        "This profile is not enrolled. Use Edit current profile to enter a fresh one-time Host token."
                     )
                 return
             self.pending_enrollment_token = None
@@ -1320,19 +1635,19 @@ def run_gui(data_root: Path | None = None) -> int:
             self.message.setText("Profile enrolled. The enrollment token has been consumed.")
 
         def _registration_failed(self, error: str) -> None:
-            self.connection_label.setText("Enrollment failed")
-            self.message.setText(
-                f"Enrollment failed: {error}. "
-                "The Client Agent has been stopped; select this profile again to retry with a fresh token if needed."
-            )
+            profile = self.profile
             self.pending_enrollment_token = None
             self.controller.stop()
             QMessageBox.warning(
                 self,
                 APP_TITLE,
-                "Enrollment failed. LegalFedLLM will not restart the Agent or ask for another token automatically.\n\n"
-                "Check the SSH/Coordinator connection, then select this profile again when you are ready to retry.",
+                "Enrollment failed. LegalFedLLM will return this profile to local-only mode.\n\n"
+                f"{error}\n\n"
+                "Check the SSH/Coordinator connection and use Edit current profile with a fresh token when you are ready to retry.",
             )
+            if profile is not None:
+                self.profile = None
+                self._activate_profile(profile)
 
         def _participate(self) -> None:
             if self.api is None or self.participation_inflight:
@@ -1487,12 +1802,13 @@ def run_gui(data_root: Path | None = None) -> int:
         def _show_provider_details(self) -> None:
             if self.profile is None:
                 return
-            text = _provider_details_text(
+            dialog = ProviderDetailsDialog(
                 self.profile,
                 admin_token=self.manager.admin_token(self.profile.profile_id),
                 local_ai=self.local_ai,
+                parent=self,
             )
-            QMessageBox.information(self, "AnythingLLM integration details", text)
+            dialog.exec()
 
         def _show_error(self, error: str) -> None:
             self.message.setText(error)
