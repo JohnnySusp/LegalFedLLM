@@ -599,7 +599,7 @@ directory.
 
 ### Requirements
 
-LegalFedLLM v1.0.0 can be run on Linux either from the published **x86_64
+LegalFedLLM can be run on Linux either from the published **x86_64
 AppImage** or directly from source. The AppImage packages the desktop
 GUI/controller, but it deliberately does not install host-level prerequisites
 such as Docker, OpenSSH, or the NVIDIA runtime.
@@ -867,9 +867,7 @@ No host package layering is required.
 
 ### Installation
 
-The **Linux x86_64 AppImage is the recommended end-user installation path** for
-the v1.0.0 release. The source path remains available for development,
-inspection, and direct source execution.
+The **Linux x86_64 AppImage is the recommended end-user installation path**. The source path remains available for development, inspection, and direct source execution.
 
 #### Method 1 — Linux x86_64 AppImage
 
