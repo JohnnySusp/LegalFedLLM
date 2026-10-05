@@ -265,7 +265,7 @@ class LocalAiStack:
                 "Install AnythingLLM Desktop before launching LegalFedLLM."
             )
         self._launch_windows_anythingllm(executable)
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
             if self._anythingllm_setup_available():
                 return executable
